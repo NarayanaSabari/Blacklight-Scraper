@@ -237,24 +237,29 @@ class TechFetchScraper {
         }
     }
 
-    async extractJobDetails(jobLink, retryCount = 0) {
+    async extractJobDetails(jobLink, retryCount = 0, page = null) {
         const maxRetries = 3;
-        const baseTimeout = 15000; // Increased from 3000ms to 15000ms
-        const baseDelay = 2000;
-        
+        const baseTimeout = 15000;
+        // Polite-but-not-glacial delay. Original 2000ms was overkill — TechFetch
+        // never rate-limited at this rate across 463+ historical sessions.
+        const baseDelay = 500;
+        // Allow a per-call page so we can parallelize detail fetches across
+        // multiple Playwright pages within the same browser context (cookies
+        // are shared, login persists).
+        const targetPage = page || this.page;
+
         try {
             logProgress('TechFetch', `   Fetching details for: ${jobLink.split('/').pop().substring(0, 30)}...${retryCount > 0 ? ` (retry ${retryCount}/${maxRetries})` : ''}`);
-            
-            // Add delay before request to avoid rate limiting (exponential backoff on retries)
+
             const delay = baseDelay * Math.pow(1.5, retryCount);
-            await this.page.waitForTimeout(delay);
-            
-            const response = await this.page.goto(jobLink, {
+            await targetPage.waitForTimeout(delay);
+
+            const response = await targetPage.goto(jobLink, {
                 waitUntil: 'domcontentloaded',
                 timeout: baseTimeout
             });
-            
-            await this.page.waitForTimeout(1500);
+
+            await targetPage.waitForTimeout(500);
             const html = await response.text();
             
             const dom = new JSDOM(html);
@@ -453,27 +458,27 @@ class TechFetchScraper {
             // Retry on network errors
             if (this.isNetworkError(error) && retryCount < maxRetries) {
                 logProgress('TechFetch', `   ⚠️  Network error, retrying (${retryCount + 1}/${maxRetries}): ${error.message.split('\n')[0]}`);
-                
+
                 // Try to recover the page/context on network errors
                 try {
                     // Wait before retry with exponential backoff
                     const retryDelay = 3000 * Math.pow(2, retryCount);
                     logProgress('TechFetch', `   ⏳ Waiting ${retryDelay/1000}s before retry...`);
                     await new Promise(resolve => setTimeout(resolve, retryDelay));
-                    
+
                     // Try to navigate to a known page to reset connection
-                    await this.page.goto('https://www.techfetch.com/js/js_s_jobs.aspx', {
+                    await targetPage.goto('https://www.techfetch.com/js/js_s_jobs.aspx', {
                         waitUntil: 'domcontentloaded',
                         timeout: 30000
                     }).catch(() => {}); // Ignore errors on recovery navigation
-                    
-                    await this.page.waitForTimeout(1000);
+
+                    await targetPage.waitForTimeout(1000);
                 } catch (recoveryError) {
                     logProgress('TechFetch', `   ⚠️  Recovery navigation failed: ${recoveryError.message}`);
                 }
-                
-                // Retry the request
-                return this.extractJobDetails(jobLink, retryCount + 1);
+
+                // Retry the request — preserve the per-worker page across retries
+                return this.extractJobDetails(jobLink, retryCount + 1, page);
             }
             
             logProgress('TechFetch', `   ⚠️  Error fetching job details: ${error.message.split('\n')[0]}`);
@@ -662,38 +667,53 @@ class TechFetchScraper {
                 
                 totalScraped += jobs.length;
                 
-                // Fetch additional details for each job if requested
+                // Fetch additional details for each job if requested.
+                // Parallel pool: each worker holds its own Playwright page (cookies
+                // shared via the browser context, so login session persists). 4 is
+                // enough to ~4× detail throughput without spamming TechFetch.
                 if (includeDetails) {
-                    logProgress('TechFetch', `   📋 Fetching details for ${jobs.length} jobs...`);
-                    for (let i = 0; i < jobs.length; i++) {
-                        const job = jobs[i];
-                        const details = await this.extractJobDetails(job.jobLink);
-                        
-                        // Merge details, preferring detail page data over list page data when available
-                        jobs[i] = {
-                            jobTitle: job.jobTitle,
-                            jobLink: job.jobLink,
-                            description: details.fullDescription || job.description,
-                            company: details.company !== 'N/A' ? details.company : job.company,
-                            companyLocation: details.companyLocation,
-                            location: details.location !== 'N/A' ? details.location : job.location,
-                            rate: details.rate !== 'N/A' ? details.rate : job.rate,
-                            postedDate: details.postedDate,
-                            duration: details.duration,
-                            experienceLevel: details.experienceLevel,
-                            experienceRequired: details.experienceRequired,
-                            workAuthorization: details.workAuthorization,
-                            preferredEmployment: details.preferredEmployment,
-                            employmentType: details.employmentType,
-                            requiredSkills: details.requiredSkills,
-                            preferredSkills: details.preferredSkills,
-                            specialArea: details.specialArea,
-                            specialSkills: details.specialSkills,
-                            domain: details.domain
-                        };
-                        
-                        // Delay is now handled in extractJobDetails with exponential backoff
-                    }
+                    logProgress('TechFetch', `   📋 Fetching details for ${jobs.length} jobs (concurrency=4)...`);
+                    const concurrency = Math.min(4, jobs.length);
+                    const queue = jobs.map((job, idx) => ({ job, idx }));
+
+                    const mergeDetails = (job, details) => ({
+                        jobTitle: job.jobTitle,
+                        jobLink: job.jobLink,
+                        description: details.fullDescription || job.description,
+                        company: details.company !== 'N/A' ? details.company : job.company,
+                        companyLocation: details.companyLocation,
+                        location: details.location !== 'N/A' ? details.location : job.location,
+                        rate: details.rate !== 'N/A' ? details.rate : job.rate,
+                        postedDate: details.postedDate,
+                        duration: details.duration,
+                        experienceLevel: details.experienceLevel,
+                        experienceRequired: details.experienceRequired,
+                        workAuthorization: details.workAuthorization,
+                        preferredEmployment: details.preferredEmployment,
+                        employmentType: details.employmentType,
+                        requiredSkills: details.requiredSkills,
+                        preferredSkills: details.preferredSkills,
+                        specialArea: details.specialArea,
+                        specialSkills: details.specialSkills,
+                        domain: details.domain,
+                    });
+
+                    const worker = async () => {
+                        const workerPage = await this.context.newPage();
+                        try {
+                            // eslint-disable-next-line no-constant-condition
+                            while (true) {
+                                const item = queue.shift();
+                                if (!item) break;
+                                const details = await this.extractJobDetails(item.job.jobLink, 0, workerPage);
+                                jobs[item.idx] = mergeDetails(item.job, details);
+                            }
+                        } finally {
+                            await workerPage.close().catch(() => {});
+                        }
+                    };
+
+                    await Promise.all(Array.from({ length: concurrency }, () => worker()));
                 }
                 
                 // Filter jobs by location if specified
