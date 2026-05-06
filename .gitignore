@@ -1,0 +1,16 @@
+node_modules/
+results/
+*.log
+logs/
+
+# Secrets — NEVER commit
+config/credentials.json
+config/*.local.json
+.env
+.env.*
+!.env.example
+
+# Browser + crawler artifacts
+crawlee_storage/
+storage/
+chrome-debug-profile/

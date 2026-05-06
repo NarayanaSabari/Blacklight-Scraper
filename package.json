@@ -1,0 +1,36 @@
+{
+  "name": "unified-job-scraper",
+  "version": "2.0.0",
+  "description": "Unified job scraper API for multiple platforms (Monster, Dice, TechFetch, LinkedIn, Glassdoor, Indeed)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node --watch server.js",
+    "chrome:login": "node scripts/chrome-debug.js"
+  },
+  "keywords": [
+    "job-scraper",
+    "monster",
+    "dice",
+    "techfetch",
+    "linkedin",
+    "glassdoor",
+    "indeed",
+    "api",
+    "web-scraping"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "crawlee": "^3.7.0",
+    "express": "^4.18.2",
+    "jsdom": "^23.0.1",
+    "playwright": "^1.40.0",
+    "playwright-extra": "^4.3.6",
+    "prom-client": "^15.1.3",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "zod": "^3.23.8"
+  }
+}

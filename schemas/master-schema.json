@@ -1,0 +1,282 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Unified Job Posting Schema",
+  "description": "Master schema for unified job data across all platforms (Dice, Monster, TechFetch, LinkedIn, Glassdoor)",
+  "type": "object",
+  "required": ["platform", "title", "company", "url", "extractedAt"],
+  "properties": {
+    "_metadata": {
+      "type": "object",
+      "description": "Metadata about the extraction",
+      "properties": {
+        "platform": {
+          "type": "string",
+          "enum": ["dice", "monster", "techfetch", "linkedin", "glassdoor"],
+          "description": "Source platform of the job posting"
+        },
+        "extractedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp when job was scraped"
+        },
+        "scraperId": {
+          "type": "string",
+          "description": "Unique identifier for the scraper run"
+        }
+      },
+      "required": ["platform", "extractedAt"]
+    },
+    
+    "job": {
+      "type": "object",
+      "description": "Core job information",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Job title/position"
+        },
+        "description": {
+          "type": "string",
+          "description": "Full job description (HTML stripped)"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Direct link to the job posting"
+        },
+        "applyUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "Direct application link (if different from job URL)"
+        },
+        "postedDate": {
+          "type": "string",
+          "description": "When the job was posted (various formats)"
+        }
+      },
+      "required": ["title", "url"]
+    },
+    
+    "company": {
+      "type": "object",
+      "description": "Company/employer information",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Company/employer name"
+        },
+        "rating": {
+          "type": ["string", "number", "null"],
+          "description": "Company rating (Glassdoor)"
+        },
+        "about": {
+          "type": "string",
+          "description": "Company description (Dice)"
+        },
+        "website": {
+          "type": "string",
+          "format": "uri",
+          "description": "Company website (Dice)"
+        },
+        "headquarters": {
+          "type": "string",
+          "description": "Company headquarters location (Dice)"
+        },
+        "employeesCount": {
+          "type": "string",
+          "description": "Number of employees (Dice)"
+        },
+        "foundedYear": {
+          "type": "string",
+          "description": "Year company was founded (Dice)"
+        },
+        "techStacks": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Technologies used by company (Dice)"
+        }
+      },
+      "required": ["name"]
+    },
+    
+    "location": {
+      "type": "object",
+      "description": "Job location information",
+      "properties": {
+        "formatted": {
+          "type": "string",
+          "description": "Full formatted location string"
+        },
+        "city": {
+          "type": "string",
+          "description": "City"
+        },
+        "state": {
+          "type": "string",
+          "description": "State/Province"
+        },
+        "country": {
+          "type": "string",
+          "description": "Country"
+        },
+        "remote": {
+          "type": "boolean",
+          "description": "Whether job is remote"
+        },
+        "companyLocation": {
+          "type": "string",
+          "description": "Recruiter/company location (TechFetch)"
+        }
+      }
+    },
+    
+    "compensation": {
+      "type": "object",
+      "description": "Salary and compensation details",
+      "properties": {
+        "salary": {
+          "type": "string",
+          "description": "Salary or hourly rate"
+        },
+        "salaryMin": {
+          "type": "number",
+          "description": "Minimum salary (parsed)"
+        },
+        "salaryMax": {
+          "type": "number",
+          "description": "Maximum salary (parsed)"
+        },
+        "currency": {
+          "type": "string",
+          "default": "USD",
+          "description": "Currency code"
+        },
+        "period": {
+          "type": "string",
+          "enum": ["hourly", "yearly", "monthly", "contract"],
+          "description": "Pay period"
+        }
+      }
+    },
+    
+    "employment": {
+      "type": "object",
+      "description": "Employment type and work authorization",
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Employment type (Full-time, Contract, etc.)"
+        },
+        "duration": {
+          "type": "string",
+          "description": "Contract duration (TechFetch)"
+        },
+        "workAuthorization": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Accepted work authorizations (TechFetch)"
+        },
+        "preferredEmployment": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Preferred employment types (Corp-Corp, W2, etc.) (TechFetch)"
+        },
+        "easyApply": {
+          "type": "boolean",
+          "description": "Whether job has easy apply option (Glassdoor)"
+        }
+      }
+    },
+    
+    "experience": {
+      "type": "object",
+      "description": "Experience and skills requirements",
+      "properties": {
+        "level": {
+          "type": "string",
+          "description": "Experience level (Senior, Architect, etc.) (TechFetch)"
+        },
+        "yearsRequired": {
+          "type": "string",
+          "description": "Years of experience required (TechFetch)"
+        },
+        "requiredSkills": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Required technical skills"
+        },
+        "preferredSkills": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Preferred/optional skills (TechFetch)"
+        },
+        "specialArea": {
+          "type": "string",
+          "description": "Specialization area (TechFetch)"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Industry/domain (TechFetch)"
+        }
+      }
+    },
+    
+    "recruiter": {
+      "type": "object",
+      "description": "Recruiter information (if applicable)",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Recruiter name (Dice)"
+        },
+        "company": {
+          "type": "string",
+          "description": "Recruiting company"
+        },
+        "contact": {
+          "type": "string",
+          "description": "Recruiter contact info"
+        }
+      }
+    },
+    
+    "social": {
+      "type": "object",
+      "description": "Social media post data (LinkedIn)",
+      "properties": {
+        "postId": {
+          "type": "string",
+          "description": "LinkedIn post ID"
+        },
+        "activityUrn": {
+          "type": "string",
+          "description": "LinkedIn activity URN"
+        },
+        "author": {
+          "type": "string",
+          "description": "Post author name"
+        },
+        "authorProfile": {
+          "type": "string",
+          "description": "Author profile URL"
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Post timestamp"
+        },
+        "engagement": {
+          "type": "object",
+          "properties": {
+            "reactions": {"type": "number"},
+            "comments": {"type": "number"},
+            "shares": {"type": "number"}
+          }
+        },
+        "isJobRelated": {
+          "type": "boolean",
+          "description": "Whether post is job-related"
+        }
+      }
+    }
+  }
+}
