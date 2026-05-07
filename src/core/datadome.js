@@ -54,30 +54,41 @@ const CREDENTIALS_PATH = path.join(process.cwd(), 'config', 'credentials.json');
 let cachedSession = undefined;
 
 function buildSessionFromConfig(monster) {
-    if (!monster || !monster.cookies || !monster.datadomeClientId) return null;
-    const cookieHeader = Object.entries(monster.cookies)
-        .map(([k, v]) => `${k}=${v}`)
-        .join('; ');
+    // Cookies are optional. Tested empirically: appsapi.monster.io accepts
+    // requests without a cookie header as long as `x-datadome-clientid` is
+    // present and the IP/TLS fingerprint matches the cleared session.
+    // monster.com and monster.io are different eTLD+1, so the browser's
+    // own frontend doesn't actually send any cookie cross-origin to the
+    // API. Including a cookie header doesn't hurt; omitting it doesn't
+    // matter. We treat clientid + UA as the only required fields.
+    if (!monster || !monster.datadomeClientId || !monster.userAgent) return null;
+    const headers = {
+        accept: 'application/json',
+        'accept-language': monster.acceptLanguage || 'en-US,en;q=0.9',
+        'content-type': 'application/json; charset=UTF-8',
+        origin: 'https://www.monster.com',
+        priority: 'u=1, i',
+        referer: 'https://www.monster.com/',
+        'sec-ch-ua': monster.secChUa,
+        'sec-ch-ua-mobile': monster.secChUaMobile,
+        'sec-ch-ua-platform': monster.secChUaPlatform,
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'cross-site',
+        'user-agent': monster.userAgent,
+        'x-datadome-clientid': monster.datadomeClientId,
+    };
+    let cookieCount = 0;
+    if (monster.cookies && Object.keys(monster.cookies).length > 0) {
+        headers.cookie = Object.entries(monster.cookies)
+            .map(([k, v]) => `${k}=${v}`)
+            .join('; ');
+        cookieCount = Object.keys(monster.cookies).length;
+    }
     return {
-        headers: {
-            accept: 'application/json',
-            'accept-language': monster.acceptLanguage || 'en-US,en;q=0.9',
-            'content-type': 'application/json; charset=UTF-8',
-            origin: 'https://www.monster.com',
-            priority: 'u=1, i',
-            referer: 'https://www.monster.com/',
-            'sec-ch-ua': monster.secChUa,
-            'sec-ch-ua-mobile': monster.secChUaMobile,
-            'sec-ch-ua-platform': monster.secChUaPlatform,
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'cross-site',
-            'user-agent': monster.userAgent,
-            'x-datadome-clientid': monster.datadomeClientId,
-            cookie: cookieHeader,
-        },
+        headers,
         clientIdPreview: monster.datadomeClientId.slice(0, 16) + '…',
-        cookieCount: Object.keys(monster.cookies).length,
+        cookieCount,
         loadedAt: Date.now(),
     };
 }

@@ -42,6 +42,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import readline from 'node:readline';
 
@@ -56,30 +57,105 @@ function die(msg) {
     process.exit(1);
 }
 
-function startSocksProxy() {
+function probePort(port, timeoutMs) {
+    return new Promise((resolve) => {
+        const socket = net.connect({ port, host: '127.0.0.1' });
+        const timer = setTimeout(() => {
+            socket.destroy();
+            resolve(false);
+        }, timeoutMs);
+        socket.once('connect', () => {
+            clearTimeout(timer);
+            socket.end();
+            resolve(true);
+        });
+        socket.once('error', () => {
+            clearTimeout(timer);
+            resolve(false);
+        });
+    });
+}
+
+async function startSocksProxy() {
     if (!fs.existsSync(VM_KEY)) die(`SSH key not found: ${VM_KEY}`);
+
+    // Refuse to start if something else already binds the port. Prevents
+    // silently reusing a stale tunnel from a previous run with stale state.
+    if (await probePort(SOCKS_PORT, 500)) {
+        die(
+            `port ${SOCKS_PORT} is already in use — kill the leftover process first ` +
+                `(try: pkill -f "ssh.*-D ${SOCKS_PORT}")`,
+        );
+    }
 
     console.log(`→ Opening SSH SOCKS proxy: localhost:${SOCKS_PORT} → ${VM_HOST}`);
     const child = spawn(
         'ssh',
-        ['-i', VM_KEY, '-D', String(SOCKS_PORT), '-N', '-o', 'ServerAliveInterval=30', VM_HOST],
-        { stdio: ['ignore', 'inherit', 'inherit'] },
+        [
+            '-i', VM_KEY,
+            '-D', String(SOCKS_PORT),
+            '-N',
+            // Hardening:
+            // - BatchMode: never prompt for password / passphrase / host-key
+            //   confirmations; fail fast instead.
+            // - ExitOnForwardFailure: if the local port can't be bound on the
+            //   ssh side, exit immediately rather than running a useless
+            //   tunnel.
+            // - ConnectTimeout: bail out on dead network rather than hanging.
+            // - ServerAliveInterval: keep the tunnel up for the whole solve.
+            '-o', 'BatchMode=yes',
+            '-o', 'ExitOnForwardFailure=yes',
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'ConnectTimeout=10',
+            '-o', 'ServerAliveInterval=30',
+            VM_HOST,
+        ],
+        { stdio: ['ignore', 'inherit', 'pipe'] },
     );
     child.on('error', (err) => die(`failed to spawn ssh: ${err.message}`));
 
-    // Give ssh ~2s to establish.
-    return new Promise((resolve) => {
-        setTimeout(() => {
-            // Quick liveness check.
-            const test = spawnSync('nc', ['-z', '-w', '2', 'localhost', String(SOCKS_PORT)]);
-            if (test.status !== 0) {
-                child.kill();
-                die(`SOCKS proxy on :${SOCKS_PORT} not reachable — check ssh access to ${VM_HOST}`);
-            }
-            console.log(`✓ SOCKS proxy live`);
-            resolve(child);
-        }, 2000);
+    // Capture stderr so failures surface (otherwise BatchMode silences them).
+    // Suppress the harmless `channel N: open failed` chatter that any browser
+    // generates when it tries to reach localhost-style internal services
+    // through the SOCKS proxy — those are not real failures and just confuse
+    // the operator. Real ssh errors (auth, connection drop, etc.) are still
+    // surfaced.
+    let sshErr = '';
+    child.stderr.on('data', (chunk) => {
+        const s = chunk.toString();
+        sshErr += s;
+        const filtered = s
+            .split('\n')
+            .filter((line) => !/channel \d+: open failed/.test(line))
+            .join('\n');
+        if (filtered.trim()) process.stderr.write(`[ssh] ${filtered}`);
     });
+    child.on('exit', (code) => {
+        if (code !== null && code !== 0) {
+            // Tunnel died — surface it next tick so the polling loop bails.
+            sshErr += `\nssh exited with code ${code}`;
+        }
+    });
+
+    // Poll the port for up to 10s. Tunnels usually come up in <2s but a slow
+    // network or first-time host-key acceptance can stretch it.
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+        if (child.exitCode !== null) {
+            die(`ssh exited (${child.exitCode}) — ${sshErr.slice(0, 400) || 'no stderr'}`);
+        }
+        if (await probePort(SOCKS_PORT, 500)) {
+            console.log(`✓ SOCKS proxy live on localhost:${SOCKS_PORT}`);
+            return child;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+    }
+
+    child.kill();
+    die(
+        `SOCKS proxy on :${SOCKS_PORT} not reachable after 10s. ` +
+            `Test ssh access manually: ssh -i ${VM_KEY} ${VM_HOST} echo ok`,
+    );
 }
 
 function chromeLaunchHint() {
@@ -98,7 +174,14 @@ async function readPaste() {
     const rl = readline.createInterface({ input: process.stdin, terminal: false });
     const lines = [];
     for await (const line of rl) {
-        if (line.trim() === 'EOF') break;
+        const trimmed = line.trim();
+        if (trimmed === 'EOF') break;
+        // Also accept EOF appended to a content line (common when paste
+        // ends in a quote and the user types EOF without a newline).
+        if (trimmed.endsWith('EOF')) {
+            lines.push(line.replace(/EOF\s*$/, ''));
+            break;
+        }
         lines.push(line);
     }
     return lines.join('\n');
@@ -150,11 +233,15 @@ function parseCookieHeader(cookieStr) {
 }
 
 function buildMonsterBlock(h) {
-    const need = ['cookie', 'x-datadome-clientid', 'user-agent'];
+    // Cookies are optional — tested empirically that appsapi.monster.io
+    // accepts requests with just x-datadome-clientid + matching UA/IP.
+    // monster.com and monster.io are different eTLD+1, so browsers don't
+    // actually send cookies cross-origin to the API anyway.
+    const need = ['x-datadome-clientid', 'user-agent'];
     const missing = need.filter((k) => !h[k]);
     if (missing.length) die(`paste is missing required headers: ${missing.join(', ')}`);
 
-    return {
+    const block = {
         _comment:
             'Manually-cleared DataDome session. Refresh via scripts/refresh-monster-session.js when API starts returning 403.',
         _refreshedAt: new Date().toISOString(),
@@ -164,8 +251,13 @@ function buildMonsterBlock(h) {
         secChUaMobile: h['sec-ch-ua-mobile'] || '?0',
         secChUaPlatform: h['sec-ch-ua-platform'] || '"macOS"',
         acceptLanguage: h['accept-language'] || 'en-US,en;q=0.9',
-        cookies: parseCookieHeader(h['cookie']),
     };
+    // Cookies if present — kept for future-proofing in case Monster ever
+    // changes their CORS policy or starts requiring same-domain cookies.
+    if (h['cookie']) {
+        block.cookies = parseCookieHeader(h['cookie']);
+    }
+    return block;
 }
 
 function writeLocal(monster) {
@@ -234,14 +326,15 @@ async function main() {
 
     const blob = await readPaste();
     const headers = parseHeaders(blob);
-    if (!headers['cookie'] || !headers['x-datadome-clientid']) {
+    if (!headers['x-datadome-clientid']) {
         console.error('!! parsed headers — keys we got:', Object.keys(headers).slice(0, 12));
-        die('could not extract cookie + x-datadome-clientid from paste');
+        die('could not extract x-datadome-clientid from paste');
     }
 
     const monster = buildMonsterBlock(headers);
+    const cookieCount = monster.cookies ? Object.keys(monster.cookies).length : 0;
     console.log(
-        `→ Parsed ${Object.keys(monster.cookies).length} cookies, clientid ${monster.datadomeClientId.slice(0, 16)}…`,
+        `→ Parsed ${cookieCount} cookies, clientid ${monster.datadomeClientId.slice(0, 16)}…`,
     );
 
     writeLocal(monster);

@@ -69,11 +69,17 @@ In that Chrome:
 2. Click any request to `appsapi.monster.io` (POST, returns JSON)
 3. Right-click the request → **Copy** → **Copy all as cURL**
 4. Paste it into the script's stdin
-5. Type `EOF` on its own line and press Enter
+5. Type `EOF` and press Enter (the script accepts `EOF` either on its own line or appended to the final line of the paste)
 
 The script accepts either:
 - The cURL paste (preferred — has everything)
 - The raw "Request Headers" pane from DevTools (alternating name/value lines)
+
+**Note:** the cURL won't include a `cookie:` header, and that's correct.
+`monster.com` and `monster.io` are different eTLD+1 domains, so cookies
+don't cross-flow. The API only needs `x-datadome-clientid` + the matching
+UA + your IP — the cookie is present on monster.com pages but never sent
+to the API.
 
 ### 4. Done
 
