@@ -14,3 +14,4 @@ config/*.local.json
 crawlee_storage/
 storage/
 chrome-debug-profile/
+package-lock.json
