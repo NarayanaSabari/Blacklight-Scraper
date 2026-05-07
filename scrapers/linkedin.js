@@ -470,29 +470,73 @@ async function navigateToSearch(page, query) {
 // security checkpoint, search returned a soft "no results" view, or
 // the page got stuck on a loading state.
 async function dumpDebugSnapshot(page, label) {
+    // Hardened ordering: dump the cheap text artifact (URL/title/body
+    // preview) FIRST. On hung pages, page.screenshot() can stall up to
+    // 30s waiting for fonts and then time out — operator-visible mini
+    // PC log showed exactly this:
+    //   "could not write debug snapshot: page.screenshot: Timeout 30000ms
+    //    exceeded — waiting for fonts to load"
+    // The previous wrapper put both calls in one try-block, so a
+    // screenshot timeout also dropped the text dump. Now they're
+    // independent: text always lands, screenshot is best-effort with
+    // a short timeout.
+    const fs = await import('fs');
+    const path = await import('path');
+    const dir = path.join(process.cwd(), 'results');
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* noop */ }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const png = path.join(dir, `linkedin-debug-${label}-${stamp}.png`);
+    const txt = path.join(dir, `linkedin-debug-${label}-${stamp}.txt`);
+
+    // 1. Text snapshot — almost always succeeds because evaluate() only
+    //    needs the JS context, not a rendered/painted frame. Adds a few
+    //    structured signals so the operator can tell "blank page" from
+    //    "auth wall" from "captcha" without opening the screenshot.
+    let meta = null;
     try {
-        const fs = await import('fs');
-        const path = await import('path');
-        const dir = path.join(process.cwd(), 'results');
-        try { fs.mkdirSync(dir, { recursive: true }); } catch { /* noop */ }
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const png = path.join(dir, `linkedin-debug-${label}-${stamp}.png`);
-        const txt = path.join(dir, `linkedin-debug-${label}-${stamp}.txt`);
-        await page.screenshot({ path: png, fullPage: true });
-        const meta = await page.evaluate(() => ({
+        meta = await page.evaluate(() => ({
             url: location.href,
             title: document.title,
-            bodyPreview: document.body.innerText.slice(0, 800),
+            bodyPreview: (document.body?.innerText || '').slice(0, 1500),
+            articles: document.querySelectorAll('article').length,
+            feedUpdates: document.querySelectorAll('.feed-shared-update-v2').length,
+            authPromptsDetected: /sign in|join now|verify it.s you|something went wrong/i.test(
+                document.body?.innerText || '',
+            ),
         }));
         fs.writeFileSync(
             txt,
-            `url: ${meta.url}\ntitle: ${meta.title}\n\n--- visible text (first 800 chars) ---\n${meta.bodyPreview}\n`,
+            [
+                `url: ${meta.url}`,
+                `title: ${meta.title}`,
+                `articles: ${meta.articles}`,
+                `feedUpdates: ${meta.feedUpdates}`,
+                `authPromptsDetected: ${meta.authPromptsDetected}`,
+                '',
+                '--- visible text (first 1500 chars) ---',
+                meta.bodyPreview,
+            ].join('\n'),
         );
-        logProgress('LinkedIn', `🩺 Debug snapshot: ${png}`);
-        logProgress('LinkedIn', `   page title: ${meta.title}`);
-        logProgress('LinkedIn', `   page URL:   ${meta.url}`);
+        logProgress('LinkedIn', `🩺 Debug text:   ${txt}`);
+        logProgress('LinkedIn', `   url=${meta.url}`);
+        logProgress('LinkedIn', `   title="${meta.title}"`);
+        logProgress('LinkedIn',
+            `   articles=${meta.articles} feedUpdates=${meta.feedUpdates} ` +
+            `authPromptsDetected=${meta.authPromptsDetected}`);
     } catch (err) {
-        logProgress('LinkedIn', `   (could not write debug snapshot: ${err.message})`);
+        logProgress('LinkedIn', `   (text dump failed: ${err.message})`);
+    }
+
+    // 2. Screenshot — best-effort with a short timeout. Default 30s
+    //    waits for fonts and stalls the whole scraper when the page is
+    //    on a hung loading state. Cap at 5s; skip fullPage so we don't
+    //    pay the layout-stable wait either.
+    try {
+        await page.screenshot({ path: png, fullPage: false, timeout: 5000 });
+        logProgress('LinkedIn', `🩺 Debug screenshot: ${png}`);
+    } catch (err) {
+        const firstLine = (err.message || '').split('\n')[0];
+        logProgress('LinkedIn', `   (screenshot skipped: ${firstLine})`);
     }
 }
 
