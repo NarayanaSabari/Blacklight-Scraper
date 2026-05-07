@@ -1,9 +1,10 @@
 // POST /scrape — manual single-shot scraping.
 //
-// Validates input with zod, then runs each requested platform sequentially.
-// Results for each platform are collected and returned in a single response.
-// Incremental per-platform persistence is delegated to a small persistence
-// helper so the route stays HTTP-only.
+// Validates input with zod, then runs each requested platform IN PARALLEL.
+// Wall-clock matches the slowest platform rather than the sum. Each task
+// is fully isolated (its own try/catch + its own results file write), so
+// Promise.allSettled cannot poison sibling platforms. Mirrors the parallel
+// model in src/queue/orchestrator.js — keep them in sync.
 
 import path from 'path';
 import fs from 'fs';
@@ -68,19 +69,22 @@ export function registerScrapeRoute(app) {
             platforms: {},
         };
 
-        for (const platformName of platforms) {
+        const tasks = platforms.map(async (platformName) => {
             const scraper = getScraper(platformName);
             if (!scraper) {
                 log.warn('Unknown platform requested', { platformName });
-                results.platforms[platformName] = { success: false, error: 'Platform not supported' };
-                continue;
+                return {
+                    platformName,
+                    payload: { success: false, error: 'Platform not supported' },
+                };
             }
 
+            let payload;
             try {
                 const jobs = await scraper.execute(jobTitle, location, null);
-                results.platforms[platformName] = { success: true, count: jobs.length, jobs };
+                payload = { success: true, count: jobs.length, jobs };
             } catch (error) {
-                results.platforms[platformName] = {
+                payload = {
                     success: false,
                     platform: platformName,
                     error: error.message,
@@ -88,10 +92,24 @@ export function registerScrapeRoute(app) {
                 };
             }
 
+            let savedFile = null;
             try {
-                savedFiles.push(savePlatformResults(platformName, results.platforms[platformName], jobTitle, location, timestamp));
+                savedFile = savePlatformResults(platformName, payload, jobTitle, location, timestamp);
             } catch (error) {
                 log.error('Failed to persist platform results', { platformName, err: error.message });
+            }
+
+            return { platformName, payload, savedFile };
+        });
+
+        const settled = await Promise.allSettled(tasks);
+        for (const entry of settled) {
+            if (entry.status === 'fulfilled') {
+                const { platformName, payload, savedFile } = entry.value;
+                results.platforms[platformName] = payload;
+                if (savedFile) savedFiles.push(savedFile);
+            } else {
+                log.error('Platform task threw unexpectedly', { err: entry.reason?.message });
             }
         }
 

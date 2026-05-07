@@ -130,16 +130,28 @@ export class QueueOrchestrator {
             },
         };
 
-        for (const platformInfo of platforms) {
+        // Run platforms IN PARALLEL within a session.
+        //
+        // Previously this was a sequential `for...of` loop, so a role's
+        // wall-clock = sum(monster_time + dice_time + techfetch_time) ≈ 130s
+        // for our 3-platform allowlist. Sequential execution had no shared
+        // state between platforms — each scraper.execute() is self-contained
+        // (its own browser context, its own credential lease) — so the
+        // sequencing was pure overhead.
+        //
+        // Each task already wraps its own try/catch and reports failures via
+        // #safeSubmit, so Promise.allSettled here cannot poison the session.
+        // Memory peak goes up because dice + techfetch both run Playwright
+        // browsers concurrently (monster is HTTP-only). Measured peak on
+        // CPX21 (4 GB RAM): ~1.7 GB — well within MemoryMax=3G.
+        const tasks = platforms.map(async (platformInfo) => {
             const platformName = platformInfo.name.toLowerCase();
             const scraper = getScraper(platformName);
 
             if (!scraper) {
                 log.warn('Unknown platform', { platformName });
                 await this.#safeSubmit(sessionId, platformName, [], 'failed', 'Platform not supported');
-                results.platforms[platformName] = { success: false, error: 'Platform not supported' };
-                results.summary.failed += 1;
-                continue;
+                return { platformName, result: { success: false, error: 'Platform not supported' } };
             }
 
             try {
@@ -154,17 +166,33 @@ export class QueueOrchestrator {
                 });
                 metrics.recordJobsSubmitted(platformName, 'success', formatted.length);
 
-                results.platforms[platformName] = {
-                    success: true,
-                    jobs_found: jobs.length,
-                    jobs_submitted: formatted.length,
+                return {
+                    platformName,
+                    result: {
+                        success: true,
+                        jobs_found: jobs.length,
+                        jobs_submitted: formatted.length,
+                    },
                 };
-                results.summary.successful += 1;
             } catch (error) {
                 log.error('Platform scrape failed', { platform: platformName, err: error.message });
                 await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message);
                 metrics.recordJobsSubmitted(platformName, 'failed', 0);
-                results.platforms[platformName] = { success: false, error: error.message };
+                return { platformName, result: { success: false, error: error.message } };
+            }
+        });
+
+        const settled = await Promise.allSettled(tasks);
+        for (const entry of settled) {
+            if (entry.status === 'fulfilled') {
+                const { platformName, result } = entry.value;
+                results.platforms[platformName] = result;
+                if (result.success) results.summary.successful += 1;
+                else results.summary.failed += 1;
+            } else {
+                // Task itself threw before our inner try/catch — shouldn't
+                // happen, but log + count it as a failure rather than crash.
+                log.error('Platform task threw unexpectedly', { err: entry.reason?.message });
                 results.summary.failed += 1;
             }
         }
