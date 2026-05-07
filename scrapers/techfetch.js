@@ -881,9 +881,24 @@ export async function scrapeTechFetch(jobTitle, location, sessionId = null) {
         
     } catch (error) {
         logProgress('TechFetch', `❌ Error: ${error.message}`);
-        
+
         lastError = error;
-        
+
+        // Shutdown race guard: if the process is being terminated (systemctl
+        // restart, SIGTERM, OOM kill), Playwright operations throw
+        // "Target page, context or browser has been closed" or similar. That
+        // is NOT a credential problem — the password is fine, the box is
+        // just shutting down. Don't report ANY failure to the credentials
+        // API; just bubble up so the orchestrator records a session error.
+        // Without this guard a single restart can permanently lock out a
+        // valid credential (observed 2026-05-07 04:59 UTC — credential id=5
+        // got cooldown=0 because page.fill threw mid-restart).
+        const shuttingDown = /target page, context or browser has been closed|browser has disconnected|browser has been closed|context closed|page closed/i.test(error.message || '');
+        if (shuttingDown) {
+            logProgress('TechFetch', '⚠️  Browser closed mid-scrape (shutdown race) — credential held harmless');
+            throw error;
+        }
+
         // Report failure to API.
         // IMPORTANT: only mark a credential as permanently failed (cooldown=0)
         // when we have explicit signal that the password is wrong. The old code
