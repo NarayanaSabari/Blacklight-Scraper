@@ -41,10 +41,26 @@ function getRandomFingerprint() {
     return CONFIG.fingerprints[Math.floor(Math.random() * CONFIG.fingerprints.length)];
 }
 
+// Normalize an expirationDate to Unix seconds. See indeed.js parseExpiry
+// for the full rationale — different cookie-export tools emit numbers
+// vs ISO 8601 strings, and Math.floor on a string yields NaN which
+// Playwright rejects with "Invalid parameters".
+function parseExpiry(raw) {
+    if (raw === null || raw === undefined || raw === '') return undefined;
+    if (typeof raw === 'number' && isFinite(raw)) return Math.floor(raw);
+    if (typeof raw === 'string') {
+        const asNum = Number(raw);
+        if (isFinite(asNum) && asNum > 0) return Math.floor(asNum);
+        const ms = Date.parse(raw);
+        if (!isNaN(ms)) return Math.floor(ms / 1000);
+    }
+    return undefined;
+}
+
 // Load cookies from path or credential object
 function loadCookies(cookiesPathOrCredential) {
     let cookies;
-    
+
     // If it's a credential object from API
     if (typeof cookiesPathOrCredential === 'object' && cookiesPathOrCredential.credentials) {
         // Check if credentials is an array (actual API format)
@@ -62,7 +78,7 @@ function loadCookies(cookiesPathOrCredential) {
                          cookie.sameSite === 'strict' ? 'Strict' :
                          cookie.sameSite === 'lax' ? 'Lax' :
                          cookie.sameSite || 'Lax',
-                expires: cookie.expirationDate ? Math.floor(cookie.expirationDate) : undefined
+                expires: parseExpiry(cookie.expirationDate),
             }));
         } else {
             // Legacy format: cookie string and csrf_token

@@ -51,9 +51,32 @@ function getRandomFingerprint() {
  * @param {Object} credential - Credential object with cookies array
  * @returns {Array} Playwright-compatible cookie array
  */
+// Normalize an expirationDate to Unix seconds.
+// Cookie-export tools differ:
+//   - Brave/Chrome "Cookie Editor" extension exports as Unix seconds (number)
+//   - Some browser tools (and the centralD upload path) export as ISO 8601
+//     strings ("2026-05-07T11:48:47.814Z")
+// Math.floor("2026-...") returns NaN, and Playwright's addCookies rejects
+// NaN expires with the unhelpful "Protocol error (Storage.setCookies):
+// Invalid parameters". Handle both shapes here so a fresh cookie export
+// from any common tool just works.
+function parseExpiry(raw) {
+    if (raw === null || raw === undefined || raw === '') return undefined;
+    if (typeof raw === 'number' && isFinite(raw)) return Math.floor(raw);
+    if (typeof raw === 'string') {
+        // Numeric string ("1806254047.084")
+        const asNum = Number(raw);
+        if (isFinite(asNum) && asNum > 0) return Math.floor(asNum);
+        // ISO 8601 ("2026-05-07T11:48:47.814Z")
+        const ms = Date.parse(raw);
+        if (!isNaN(ms)) return Math.floor(ms / 1000);
+    }
+    return undefined;
+}
+
 function loadCookies(credential) {
     let cookies = [];
-    
+
     if (Array.isArray(credential.credentials)) {
         // API/local format: array of cookie objects
         cookies = credential.credentials.map(cookie => ({
@@ -68,13 +91,13 @@ function loadCookies(credential) {
                      cookie.sameSite === 'strict' ? 'Strict' :
                      cookie.sameSite === 'lax' ? 'Lax' :
                      cookie.sameSite || 'Lax',
-            expires: cookie.expirationDate ? Math.floor(cookie.expirationDate) : undefined
+            expires: parseExpiry(cookie.expirationDate),
         }));
     } else if (credential.cookies) {
         // Alternative format: cookies property
         cookies = credential.cookies;
     }
-    
+
     return cookies;
 }
 
