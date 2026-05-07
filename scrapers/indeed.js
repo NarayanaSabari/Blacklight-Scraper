@@ -534,8 +534,39 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         }
     });
 
-    // Add cookies to context
-    await context.addCookies(cookies);
+    // Add cookies to context. Cookies exported from a real browser
+    // sometimes include shapes Playwright rejects (e.g. partitioned/CHIPS
+    // cookies, empty domains, SameSite=None without Secure, malformed
+    // expirationDate). Playwright's `addCookies` is all-or-nothing — a
+    // single bad entry rejects the whole batch with the unhelpful error
+    // "Invalid parameters", which would put us back to zero auth state.
+    //
+    // Strategy: try the batch first (fast path), and on failure fall
+    // back to one-by-one with a per-cookie try/catch so we end up with
+    // as many valid cookies applied as possible. The session typically
+    // still authenticates as long as the load-bearing auth cookies make
+    // it through.
+    try {
+        await context.addCookies(cookies);
+    } catch (batchErr) {
+        logProgress('Indeed',
+            `⚠️  Batch addCookies rejected (${batchErr.message}) — retrying one-by-one`);
+        let applied = 0;
+        for (const cookie of cookies) {
+            try {
+                await context.addCookies([cookie]);
+                applied++;
+            } catch (singleErr) {
+                logProgress('Indeed',
+                    `   skipped cookie name=${cookie.name} domain=${cookie.domain}: ${singleErr.message}`);
+            }
+        }
+        logProgress('Indeed',
+            `Applied ${applied}/${cookies.length} cookies after per-cookie retry`);
+        if (applied === 0) {
+            throw new Error('All cookies rejected by Playwright');
+        }
+    }
     
     const page = await context.newPage();
     let loginSuccess = false;
