@@ -29,14 +29,18 @@ export class BaseScraper {
      * @param {string} jobTitle
      * @param {string} location
      * @param {string|null} sessionId
+     * @param {{searchQueries?: string[] | null}} [options]
+     *   Optional per-platform extras the orchestrator passes through —
+     *   today only LinkedIn looks at `searchQueries` (AI-generated
+     *   boolean variants from the backend); other scrapers ignore.
      * @returns {Promise<Array<object>>}
      */
-    async execute(jobTitle, location, sessionId = null) {
+    async execute(jobTitle, location, sessionId = null, options = {}) {
         const start = Date.now();
         const metrics = getMetrics();
         this.log.info('Starting scrape', { jobTitle, location, sessionId });
         try {
-            const jobs = await this.scraperFn(jobTitle, location, sessionId);
+            const jobs = await this.scraperFn(jobTitle, location, sessionId, options);
             const durationMs = Date.now() - start;
             const jobCount = jobs?.length ?? 0;
             this.log.info('Scrape complete', { jobCount, durationMs });

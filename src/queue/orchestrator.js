@@ -155,7 +155,14 @@ export class QueueOrchestrator {
             }
 
             try {
-                const jobs = await scraper.execute(role.name, location, sessionId);
+                // Pass the AI-generated LinkedIn search queries (if the
+                // backend populated them) through to the scraper. Only
+                // LinkedIn looks at this today; other scrapers ignore the
+                // extra field. Missing/null = legacy single-template
+                // fallback inside the scraper.
+                const jobs = await scraper.execute(role.name, location, sessionId, {
+                    searchQueries: role.search_queries || null,
+                });
                 const formatted = jobs.map((job) => formatJobForBlacklight(job, platformName));
                 const submitResponse = await this.client.submitJobs(sessionId, platformName, formatted, 'success');
 

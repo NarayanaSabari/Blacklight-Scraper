@@ -57,6 +57,15 @@ export function registerScrapeRoute(app) {
         }
 
         const { platform, jobTitle, location } = params;
+        // Optional: caller can pass `searchQueries: [...]` to override
+        // the default boolean-template behaviour (used by LinkedIn). The
+        // production code path receives this from the backend role
+        // payload via the orchestrator; for ad-hoc /scrape calls,
+        // accept it directly so the manual workflow can mirror the
+        // multi-query flow.
+        const adhocSearchQueries = Array.isArray(req.body?.searchQueries)
+            ? req.body.searchQueries
+            : null;
         const platforms = resolvePlatforms(platform);
         log.info('Scrape request received', { platforms, jobTitle, location });
 
@@ -81,7 +90,9 @@ export function registerScrapeRoute(app) {
 
             let payload;
             try {
-                const jobs = await scraper.execute(jobTitle, location, null);
+                const jobs = await scraper.execute(jobTitle, location, null, {
+                    searchQueries: adhocSearchQueries,
+                });
                 payload = { success: true, count: jobs.length, jobs };
             } catch (error) {
                 payload = {

@@ -5,6 +5,7 @@ import { chromium } from 'playwright';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
+import { getMetrics } from '../src/metrics/registry.js';
 
 const log = createLogger('linkedin');
 const logProgress = (_scope, msg) => log.info(msg);
@@ -998,16 +999,37 @@ async function analyzePosts(posts) {
 
 
 // Export function for UnifiedJobScraper
-export async function scrapeLinkedIn(jobTitle, location, sessionId = null) {
+//
+// `options.searchQueries` (optional) is an array of pre-built LinkedIn
+// boolean search queries — typically 3 AI-generated variants supplied by
+// the backend's AIRoleNormalizationService and shipped through the queue
+// payload. When present, each query is run sequentially against the
+// same Chrome session and results are deduplicated by post id, raising
+// recall on niche roles (the legacy single-template was empirically
+// returning zero on ~43% of niche queries). When absent, falls back
+// to the legacy single-template `"<role>" AND (c2c OR W2 OR 1099)`.
+export async function scrapeLinkedIn(jobTitle, location, sessionId = null, options = {}) {
     logProgress('LinkedIn', '🚀 LinkedIn Post Scraper (CDP Method)\n');
     logProgress('LinkedIn', '='.repeat(50));
-    
+
     // Override CONFIG with parameters (location is ignored, search uses only jobTitle)
     CONFIG.jobTitle = jobTitle;
-    CONFIG.searchQuery = buildBooleanSearchQuery(jobTitle);
-    
+
+    // Build the query list. Prefer caller-supplied AI variants; fall
+    // back to the legacy single boolean template.
+    const aiQueries = Array.isArray(options.searchQueries) && options.searchQueries.length > 0
+        ? options.searchQueries
+        : null;
+    const queriesToRun = aiQueries || [buildBooleanSearchQuery(jobTitle)];
+    CONFIG.searchQuery = queriesToRun[0]; // for downstream compatibility (logs, dumpDebugSnapshot)
+
     logProgress('LinkedIn', `   Job Title: "${jobTitle}"`);
-    logProgress('LinkedIn', `   Boolean Query: ${CONFIG.searchQuery}\n`);
+    if (aiQueries) {
+        logProgress('LinkedIn', `   Using ${queriesToRun.length} AI-generated query variant(s):`);
+        queriesToRun.forEach((q, i) => logProgress('LinkedIn', `      [${i + 1}] ${q}`));
+    } else {
+        logProgress('LinkedIn', `   Boolean Query (legacy template): ${CONFIG.searchQuery}\n`);
+    }
     
     const apiClient = getCredentialsAPIClient();
     const maxAttempts = 3;
@@ -1083,15 +1105,62 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null) {
             logProgress('LinkedIn', '📄 Created new tab');
         }
         
-        // Navigate and search
-        await navigateToSearch(page, CONFIG.searchQuery);
-        
-        // Extract posts
-        const posts = await extractPosts(page, CONFIG.maxPosts);
-        
+        // Run each query sequentially against the same Chrome session,
+        // accumulating posts with cross-query dedup by post id (LinkedIn
+        // activity URN — already unique). Inter-query delay so we don't
+        // burn LinkedIn's rate limit when running 3 searches in a row.
+        const seenIdsAcrossQueries = new Set();
+        const posts = [];
+        const perQueryYield = []; // [{ query, queryIndex, found, added }]
+
+        for (let qi = 0; qi < queriesToRun.length; qi++) {
+            if (posts.length >= CONFIG.maxPosts) {
+                logProgress('LinkedIn',
+                    `🛑 Reached maxPosts=${CONFIG.maxPosts}; skipping remaining ${queriesToRun.length - qi} query(ies).`);
+                break;
+            }
+
+            const q = queriesToRun[qi];
+            CONFIG.searchQuery = q;
+            if (qi > 0) {
+                // 8-12s buffer between queries — empirically enough to
+                // avoid LinkedIn's "you're searching too fast" throttle
+                // on the same logged-in session.
+                logProgress('LinkedIn', `\n⏳ Inter-query delay before query [${qi + 1}/${queriesToRun.length}]...`);
+                await randomDelay(8000, 12000);
+            }
+            logProgress('LinkedIn',
+                `\n🔎 Query [${qi + 1}/${queriesToRun.length}]: ${q}`);
+
+            await navigateToSearch(page, q);
+            const remainingBudget = CONFIG.maxPosts - posts.length;
+            const queryPosts = await extractPosts(page, remainingBudget);
+
+            // Dedup by id — same post can match multiple queries.
+            // Tag with the query that found it for downstream tracing.
+            let added = 0;
+            for (const p of queryPosts) {
+                if (p.id && seenIdsAcrossQueries.has(p.id)) continue;
+                if (p.id) seenIdsAcrossQueries.add(p.id);
+                posts.push({ ...p, queryUsed: q, queryIndex: qi });
+                added++;
+                if (posts.length >= CONFIG.maxPosts) break;
+            }
+            perQueryYield.push({ query: q, queryIndex: qi, found: queryPosts.length, added });
+            logProgress('LinkedIn',
+                `   query [${qi + 1}] → found ${queryPosts.length}, ${added} new (running total: ${posts.length})`);
+        }
+
+        logProgress('LinkedIn', '\n📊 Per-query yield:');
+        const metrics = getMetrics();
+        perQueryYield.forEach(({ queryIndex, found, added }) => {
+            logProgress('LinkedIn', `   [${queryIndex + 1}] found=${found}, added=${added}`);
+            metrics.recordLinkedInQueryYield(queryIndex, added);
+        });
+
         // Analyze posts
         const analyzed = await analyzePosts(posts);
-        
+
         logProgress('LinkedIn', '\n✨ Scraping completed successfully!');
         logProgress('LinkedIn', `📊 Found ${analyzed.jobRelated.length} job-related posts`);
         
@@ -1183,7 +1252,12 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null) {
                 authorProfile: post.authorProfileUrl,
                 timestamp: post.timestamp,
                 engagement: post.engagement,
-                isJobRelated: post.isJobRelated
+                isJobRelated: post.isJobRelated,
+                // Pass through which AI search-query variant produced
+                // this post — useful downstream for measuring per-query
+                // yield and for tuning the prompt.
+                queryUsed: post.queryUsed,
+                queryIndex: post.queryIndex,
             };
             if (postedDate) jobObj.postedDate = postedDate;
             return normalizeJobData(jobObj, 'LinkedIn');

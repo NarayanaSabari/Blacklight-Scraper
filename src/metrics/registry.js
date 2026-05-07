@@ -134,6 +134,19 @@ class MetricsRegistry {
             registers: reg,
         });
 
+        // LinkedIn per-query yield -----------------------------------------
+        // The LinkedIn scraper iterates AI-generated search-query variants
+        // for each role (3 by default) — this counter tracks how many
+        // unique posts each query index contributed. Lets Grafana surface
+        // whether the AI prompt is generating useful variants, and which
+        // index slot is the highest-yield slot in steady state.
+        this.linkedinQueryYieldTotal = new Counter({
+            name: 'scraper_linkedin_query_yield_total',
+            help: 'Posts attributed to each LinkedIn query variant (per role).',
+            labelNames: ['query_index'], // 0|1|2 (or "0" for the legacy single-template)
+            registers: reg,
+        });
+
         // Queue ------------------------------------------------------------
         this.queueChecksTotal = new Counter({
             name: 'scraper_queue_checks_total',
@@ -219,6 +232,13 @@ class MetricsRegistry {
 
     recordFailure(platform, reason) {
         this.#safe(() => this.failuresTotal.labels(platform, reason || 'unknown').inc());
+    }
+
+    recordLinkedInQueryYield(queryIndex, count) {
+        if (!count || count < 0) return;
+        this.#safe(() =>
+            this.linkedinQueryYieldTotal.labels(String(queryIndex)).inc(count),
+        );
     }
 
     recordQueueCheck(result) {
