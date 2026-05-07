@@ -18,7 +18,9 @@ a `platform_allowlist` set in the central dashboard (Dashboard → API
 Keys), and the backend routes each queued role to the right host based
 on the key's allowlist. Adding a new host = registering a new key.
 
-**For Windows-machine setup**, see [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md).
+**Setting up a fresh residential host**:
+- 🪟 [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)
+- 🍎 [docs/MAC_SETUP.md](docs/MAC_SETUP.md)
 
 ## 🚀 What this scraper does
 
@@ -42,9 +44,17 @@ on the key's allowlist. Adding a new host = registering a new key.
 - **Google Chrome** (only on hosts that scrape LinkedIn)
 - **Playwright Chromium** — installed below
 
-## 🔧 Installation (Linux/macOS)
+## 🔧 Installation (Linux dev / VM)
 
-For Windows, follow [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md) instead.
+If you're setting up a fresh **residential** host for production, use
+the OS-specific runbooks instead — they cover dashboard setup,
+launchd/NSSM service wrapping, and the exact troubleshooting we've
+hit:
+- 🪟 [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)
+- 🍎 [docs/MAC_SETUP.md](docs/MAC_SETUP.md)
+
+The instructions below cover the manual / dev-laptop path on
+Linux/macOS.
 
 ### 1. Clone the Repository
 
@@ -532,6 +542,7 @@ MIT License - See LICENSE file for details
 - **Central Dashboard**: https://central.qpeakhire.com
 - **Grafana**: https://grafana.qpeakhire.com
 - **Windows host setup**: [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)
+- **Mac host setup**: [docs/MAC_SETUP.md](docs/MAC_SETUP.md)
 
 ## 💡 Tips
 
