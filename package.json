@@ -7,8 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "NODE_ENV=development node --watch server.js",
-    "chrome:login": "node scripts/chrome-debug.js",
-    "refresh-monster": "node scripts/refresh-monster-session.js"
+    "chrome:login": "node scripts/chrome-debug.js"
   },
   "keywords": [
     "job-scraper",
