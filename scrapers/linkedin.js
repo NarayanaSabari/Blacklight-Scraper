@@ -448,18 +448,60 @@ async function navigateToSearch(page, query) {
     
     logProgress('LinkedIn', `📄 Page title: ${pageInfo.title}`);
     logProgress('LinkedIn', `📊 Has results container: ${pageInfo.hasResults || pageInfo.hasFeed}`);
-    
+
     if (pageInfo.bodyPreview.includes('No results') || pageInfo.bodyPreview.includes('Try searching for')) {
         logProgress('LinkedIn', '⚠️  No results found for this search query');
+    }
+
+    // If we reach here without ANY recognizable container, the browser
+    // is on something we don't understand — captcha challenge, expired
+    // session redirect, partial render, etc. Save a snapshot so the
+    // operator can see "browser is open but I see nothing".
+    if (!pageInfo.hasResults && !pageInfo.hasFeed) {
+        logProgress('LinkedIn',
+            '⚠️  No recognizable LinkedIn container on page — likely a redirect / challenge / login');
+        await dumpDebugSnapshot(page, 'no-container');
+    }
+}
+
+// Save a screenshot + page snapshot of the current LinkedIn state to disk.
+// Operator-facing diagnostic for the "browser is open but I can't see anything"
+// class of issue — e.g. session expired silently, LinkedIn redirected to a
+// security checkpoint, search returned a soft "no results" view, or
+// the page got stuck on a loading state.
+async function dumpDebugSnapshot(page, label) {
+    try {
+        const fs = await import('fs');
+        const path = await import('path');
+        const dir = path.join(process.cwd(), 'results');
+        try { fs.mkdirSync(dir, { recursive: true }); } catch { /* noop */ }
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const png = path.join(dir, `linkedin-debug-${label}-${stamp}.png`);
+        const txt = path.join(dir, `linkedin-debug-${label}-${stamp}.txt`);
+        await page.screenshot({ path: png, fullPage: true });
+        const meta = await page.evaluate(() => ({
+            url: location.href,
+            title: document.title,
+            bodyPreview: document.body.innerText.slice(0, 800),
+        }));
+        fs.writeFileSync(
+            txt,
+            `url: ${meta.url}\ntitle: ${meta.title}\n\n--- visible text (first 800 chars) ---\n${meta.bodyPreview}\n`,
+        );
+        logProgress('LinkedIn', `🩺 Debug snapshot: ${png}`);
+        logProgress('LinkedIn', `   page title: ${meta.title}`);
+        logProgress('LinkedIn', `   page URL:   ${meta.url}`);
+    } catch (err) {
+        logProgress('LinkedIn', `   (could not write debug snapshot: ${err.message})`);
     }
 }
 
 async function extractPosts(page, maxPosts) {
     logProgress('LinkedIn', `📦 Extracting up to ${maxPosts} posts...`);
-    
+
     const isFeedMode = CONFIG.useFeedInsteadOfSearch;
     const keywords = CONFIG.searchQuery.toLowerCase().split(' ');
-    
+
     if (isFeedMode) {
         logProgress('LinkedIn', `   📋 Boolean Query: ${CONFIG.searchQuery}\n`);
     } else {
@@ -835,21 +877,30 @@ async function extractPosts(page, maxPosts) {
             noNewPostsCount++;
             logProgress('LinkedIn', `   ⚠️  No new posts found (${noNewPostsCount} scrolls without new content)`);
         }
-        
-        // Stop if no new posts for 15 consecutive scrolls
-        if (noNewPostsCount >= 15) {
-            logProgress('LinkedIn', '   ℹ️  No new posts for 15 scrolls, stopping...');
+
+        // Stop if no new posts for 5 consecutive scrolls (was 15 — wasted
+        // 30-45s scrolling when LinkedIn had genuinely run out of results
+        // for the boolean query).
+        if (noNewPostsCount >= 5) {
+            logProgress('LinkedIn', '   ℹ️  No new posts for 5 scrolls, stopping...');
             break;
         }
-        
-        // Scroll down
+
+        // Scroll to the BOTTOM of the document, not just down by 500px.
+        // LinkedIn's infinite-scroll observer fires when the user reaches
+        // the bottom of the rendered list. Incremental scrollBy() leaves a
+        // gap below the loaded posts, so the observer never trips and no
+        // new content loads — the symptom user sees is "scrolls forever
+        // without extracting more". scrollHeight grows as new posts load,
+        // so calling this each iteration keeps pushing past whatever's
+        // already rendered.
         await page.evaluate(() => {
-            window.scrollBy(0, 500 + Math.random() * 300);
+            window.scrollTo(0, document.documentElement.scrollHeight);
         });
-        
+
         await randomDelay(CONFIG.scrollDelay, CONFIG.scrollDelay + 1000);
     }
-    
+
     if (allPosts.length === 0) {
         logProgress('LinkedIn', '\n⚠️  WARNING: No posts extracted!');
         logProgress('LinkedIn', '   This could mean:');
@@ -857,8 +908,18 @@ async function extractPosts(page, maxPosts) {
         logProgress('LinkedIn', '   2. LinkedIn changed their HTML structure');
         logProgress('LinkedIn', '   3. No results for this search query');
         logProgress('LinkedIn', '   4. Content is not loading (check browser window)');
+        logProgress('LinkedIn', '   5. Session may have expired silently — re-run npm run chrome:login');
+        // Save what the browser is actually showing so the operator can
+        // see "blank window" vs "captcha challenge" vs "session expired".
+        await dumpDebugSnapshot(page, 'no-posts');
+    } else if (allPosts.length < 5) {
+        // Suspiciously few results — also dump so we can diagnose whether
+        // LinkedIn truly has only a handful matching the query, or whether
+        // we're stuck on a partial render / soft block.
+        logProgress('LinkedIn', `   (only ${allPosts.length} posts — saving debug snapshot for review)`);
+        await dumpDebugSnapshot(page, 'few-posts');
     }
-    
+
     return allPosts;
 }
 
