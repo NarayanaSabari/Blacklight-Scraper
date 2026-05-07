@@ -116,25 +116,33 @@ class TechFetchScraper {
             // Click login button
             logProgress('TechFetch', 'Clicking login...');
             await this.page.click('input[type="submit"], button[type="submit"], #btnLogin, input[id*="Login"]');
-            
-            await this.page.waitForTimeout(5000);
 
-            // Check if logged in
+            // Wait for either: (a) a known post-login URL, or (b) the JSLogin
+            // cookie to appear. The OLD code used a fixed 5s timeout + URL-only
+            // check, which false-positive'd on slow redirects and locked the
+            // credential out. Cookie is the source of truth for auth state.
+            try {
+                await this.page.waitForURL(
+                    /js_(job_list|s_jobs|my_resume)|dashboard/i,
+                    { timeout: 20000 },
+                );
+            } catch {
+                // URL didn't match in 20s — still might be logged in. Check
+                // cookies before declaring failure.
+            }
+
+            this.cookies = await this.context.cookies();
+            const jsLogin = this.cookies.find(c => c.name === 'JSLogin');
+            const sessionId = this.cookies.find(c => c.name === 'ASP.NET_SessionId');
             const currentUrl = this.page.url();
+
             logProgress('TechFetch', `Current URL: ${currentUrl}`);
-            
-            if (currentUrl.includes('js_job_list') || currentUrl.includes('dashboard') || currentUrl.includes('js_s_jobs') || currentUrl.includes('js_my_resume')) {
+            logProgress('TechFetch', `Session cookies: JSLogin=${jsLogin ? '✓' : '✗'} ASP.NET_SessionId=${sessionId ? '✓' : '✗'}`);
+
+            if (jsLogin) {
+                // Cookie present → login worked, regardless of URL.
                 logProgress('TechFetch', 'Login successful!');
-                
-                // Get cookies
-                this.cookies = await this.context.cookies();
-                const jsLogin = this.cookies.find(c => c.name === 'JSLogin');
-                const sessionId = this.cookies.find(c => c.name === 'ASP.NET_SessionId');
-                
-                logProgress('TechFetch', 'Session cookies obtained:');
-                logProgress('TechFetch', `  - JSLogin: ${jsLogin ? '✓' : '✗'}`);
-                logProgress('TechFetch', `  - ASP.NET_SessionId: ${sessionId ? '✓' : '✗'}`);
-                
+
                 // Navigate to js_s_jobs.aspx to initialize search session
                 logProgress('TechFetch', 'Navigating to Fetch Jobs page...');
                 await this.navigateWithRetry('https://www.techfetch.com/js/js_s_jobs.aspx', {
@@ -143,12 +151,28 @@ class TechFetchScraper {
                 });
                 await this.page.waitForTimeout(2000);
                 logProgress('TechFetch', 'Ready to search jobs');
-                
+
                 return true;
-            } else {
-                logProgress('TechFetch', 'Login may have failed');
-                return false;
             }
+
+            // No JSLogin cookie — login genuinely didn't establish a session.
+            // Try to read an explicit error message from the page so the caller
+            // can decide whether this is a permanent (wrong creds) vs transient
+            // (slow page, security challenge) failure.
+            const pageError = await this.page
+                .locator('span[id*="lblError"], div.error, .alert-danger, #errorMsg')
+                .first()
+                .textContent({ timeout: 1000 })
+                .catch(() => null);
+            const errMsg = pageError?.trim()
+                ? `Login failed: ${pageError.trim()}`
+                : 'Login uncertain (no JSLogin cookie, no explicit error on page)';
+            logProgress('TechFetch', `❌ ${errMsg}`);
+            // Throw a typed error so the outer catch can distinguish wrong-creds
+            // (page error visible) from transient (no error visible).
+            const e = new Error(errMsg);
+            e.isExplicitAuthError = Boolean(pageError?.trim());
+            throw e;
         } catch (error) {
             // Retry on network errors
             if (this.isNetworkError(error) && retryCount < maxRetries) {
@@ -860,23 +884,31 @@ export async function scrapeTechFetch(jobTitle, location, sessionId = null) {
         
         lastError = error;
         
-        // Report failure to API
+        // Report failure to API.
+        // IMPORTANT: only mark a credential as permanently failed (cooldown=0)
+        // when we have explicit signal that the password is wrong. The old code
+        // treated ANY login-phase error as permanent, which locked out a valid
+        // credential on every transient slow-page or security challenge.
         if (!loginSuccess) {
-            // Login or authentication failure - try next credential
-            if (error.message.includes('Login') || error.message.includes('credentials')) {
-                logProgress('TechFetch', '🔄 Login failed - will try next credential...');
+            if (error.isExplicitAuthError) {
+                // Login form rendered an error message ("Invalid credentials",
+                // "Account locked", etc.) → password is genuinely bad.
+                logProgress('TechFetch', '🔄 Login rejected by site - will try next credential...');
                 logProgress('TechFetch', '📤 Notifying system: WRONG CREDENTIALS (permanent failure)');
                 await apiClient.reportFailure('techfetch', `Login failed: ${error.message}`, 0);
-            } else if (error.message.includes('rate limit')) {
+            } else if (error.message.includes('rate limit') || error.message.includes('429')) {
                 logProgress('TechFetch', '⏳ Rate limited - will try next credential...');
                 logProgress('TechFetch', '📤 Notifying system: RATE LIMIT (60 min cooldown)');
                 await apiClient.reportFailure('techfetch', `Rate limited: ${error.message}`, 60);
             } else {
-                // Any other error during login/setup phase - treat as credential failure
-                logProgress('TechFetch', '⚠️  Credential error - will try next credential...');
+                // Login uncertain (no JSLogin cookie + no explicit error) OR
+                // any other non-auth setup error. Could be transient: slow page,
+                // security challenge, network blip. Use a 30-min cooldown so the
+                // credential auto-recovers without manual re-enable.
+                logProgress('TechFetch', '⚠️  Login uncertain - will try next credential...');
                 logProgress('TechFetch', `   Error details: ${error.message}`);
-                logProgress('TechFetch', '📤 Notifying system: CREDENTIAL ERROR (permanent failure)');
-                await apiClient.reportFailure('techfetch', `Credential error: ${error.message}`, 0);
+                logProgress('TechFetch', '📤 Notifying system: TRANSIENT (30 min cooldown)');
+                await apiClient.reportFailure('techfetch', `Login uncertain: ${error.message}`, 30);
             }
             // Continue to next credential attempt
             continue;
