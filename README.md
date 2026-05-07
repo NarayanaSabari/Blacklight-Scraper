@@ -1,41 +1,56 @@
 # Unified Job Scraper
 
-A powerful Node.js-based job scraping system that automatically collects job postings from multiple platforms (Monster, Dice, TechFetch, LinkedIn, Glassdoor, Indeed) and integrates with the Blacklight backend for job matching.
+Node.js scraper that pulls job postings from Monster, Dice, TechFetch,
+LinkedIn, Glassdoor, and Indeed and feeds them into the Blacklight
+backend for matching.
 
-## 🚀 Features
+## Deployment topology
 
-- **Multi-Platform Support**: Scrapes jobs from 6 major platforms
-  - Monster
-  - Dice Jobs
-  - TechFetch
-  - LinkedIn
-  - Glassdoor
-  - Indeed
+The six platforms split across two hosts based on what they tolerate:
 
-- **Blacklight Integration**: Seamless integration with Blacklight backend API
-  - Queue-based role+location workflow
-  - Automatic job submission and duplicate detection
-  - Session management and progress tracking
-  - Credential management for authenticated platforms
+| Host | Platforms | Why |
+|---|---|---|
+| **Hetzner VM** (Linux, datacenter IP) | `monster, dice, techfetch` | HTTP-API or cookie-only flows; headless Chromium fine; tolerates datacenter IP |
+| **Windows machine** (residential IP) | `linkedin, glassdoor, indeed` | Need a headed Chrome (LinkedIn CDP, Glassdoor visible window) **and** a clean residential IP — Indeed and Monster are both behind Cloudflare/DataDome anti-bot which 403s the VM IP at the edge |
 
-- **Automated Queue Processing**: Auto-checks queue every 30 seconds
-- **Express API**: REST API for manual scraping and status checks
-- **Credential Management**: Handles authentication for LinkedIn and Glassdoor
-- **Robust Error Handling**: Graceful failure recovery and detailed logging
+Both hosts run the **same code**. Each gets its own scraper API key with
+a `platform_allowlist` set in the central dashboard (Dashboard → API
+Keys), and the backend routes each queued role to the right host based
+on the key's allowlist. Adding a new host = registering a new key.
+
+**For Windows-machine setup**, see [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md).
+
+## 🚀 What this scraper does
+
+- **Queue-driven** — polls the Blacklight backend every 30s, claims a
+  role, scrapes all platforms in its allowlist **in parallel** within a
+  single session, submits jobs back, completes the session
+- **Multi-platform** — Monster (HTTP API behind DataDome), Dice (Crawlee
+  + Cheerio), TechFetch (Playwright + login), LinkedIn (CDP to a real
+  Chrome with persistent profile), Glassdoor (cookie auth + stealth
+  Playwright), Indeed (cookie auth + stealth Playwright)
+- **Express API** for manual scraping (`POST /scrape`)
+- **Credential management** via the backend — credentials live in the
+  central dashboard, scraper fetches them on demand
+- **Observability** — Prometheus metrics + Loki logs ship through the
+  Blacklight API to Grafana
 
 ## 📋 Prerequisites
 
-- **Node.js** v18 or higher
-- **npm** v9 or higher
-- **Playwright** browsers (auto-installed)
+- **Node.js** ≥ 20 LTS
+- **npm** ≥ 10
+- **Google Chrome** (only on hosts that scrape LinkedIn)
+- **Playwright Chromium** — installed below
 
-## 🔧 Installation
+## 🔧 Installation (Linux/macOS)
+
+For Windows, follow [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md) instead.
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/guruvedhanth-s/Scraper.git
-cd Scraper
+git clone https://github.com/NarayanaSabari/Blacklight-Scraper.git
+cd Blacklight-Scraper
 ```
 
 ### 2. Install Dependencies
@@ -61,25 +76,36 @@ This downloads Chromium, Firefox, and WebKit browsers used for scraping.
 
 ### 4. Configure Credentials
 
-Create a `config/credentials.json` file with the following structure:
+Get a scraper API key from the central dashboard
+(central.qpeakhire.com → Dashboard → API Keys → + New API Key) with the
+right `platform_allowlist` for this host's role:
+
+- VM host → `["monster", "dice", "techfetch"]`
+- Windows host → `["linkedin", "glassdoor", "indeed"]`
+- Dev laptop → leave allowlist empty (or set whichever subset you want
+  to test)
+
+Then create `config/credentials.json`:
 
 ```json
 {
   "blacklight": {
-    "apiUrl": "https://blacklight-backend-kko63bb3aa-el.a.run.app",
-    "apiKey": "your-scraper-api-key-here"
+    "apiUrl": "https://api.qpeakhire.com",
+    "apiKey": "<your-scraper-api-key>"
   },
   "scraperCredentials": {
-    "apiUrl": "https://blacklight-backend-kko63bb3aa-el.a.run.app",
-    "apiKey": "your-scraper-api-key-here"
+    "apiUrl": "https://api.qpeakhire.com",
+    "apiKey": "<your-scraper-api-key>"
   }
 }
 ```
 
-**Important**:
-- Replace `your-scraper-api-key-here` with your actual Blacklight API key
-- LinkedIn, Glassdoor, Indeed, and TechFetch credentials can be fetched from the Blacklight backend or loaded from this file in local mode
-- **Never commit this file to version control.** It contains real credentials — add `config/credentials.json` to `.gitignore` before pushing. (This is tracked as a bug in the upcoming security PR.)
+`config/credentials.json` is **gitignored** — never commit it.
+
+Per-platform credentials (LinkedIn email/password, Glassdoor cookies,
+Indeed cookies, TechFetch login) live in the central dashboard
+(Dashboard → Credentials), not in this file. The scraper pulls them on
+demand via the `scraperCredentials` API config above.
 
 ## 🎯 Usage
 
@@ -403,14 +429,27 @@ See `schemas/master-schema.json` for complete schema details.
 
 ## 🔐 Credential Management
 
-### LinkedIn & Glassdoor Credentials
+All per-platform credentials are managed through the central dashboard
+(Dashboard → Credentials). The scraper fetches them on demand via the
+`scraperCredentials` API config in `config/credentials.json` and reports
+success/failure back so the backend can rotate / cool down bad creds.
 
-Both LinkedIn and Glassdoor scraping require authentication. The scraper automatically:
-1. **Fetches credentials** from Blacklight backend API
-2. **Uses credentials** for authenticated scraping
-3. **Reports success/failure** back to API for credential management
+| Platform | Credential type | Where to set it |
+|---|---|---|
+| Monster | None — HTTP API behind DataDome (uses a hardcoded reverse-engineered clientid) | n/a |
+| Dice | None — public scrape | n/a |
+| TechFetch | Email + password | Dashboard → Credentials → TechFetch |
+| LinkedIn | Email + password (one-time interactive login per host, then persistent profile) | Dashboard → Credentials → LinkedIn |
+| Glassdoor | JSON cookie array (export from a cleared browser) | Dashboard → Credentials → Glassdoor |
+| Indeed | JSON cookie array (export from a cleared browser) | Dashboard → Credentials → Indeed |
 
-**No manual credential configuration needed!** All credentials are managed through the Blacklight backend admin panel.
+### IP-binding caveats
+
+Cleared browser sessions (Glassdoor, Indeed cookies; DataDome on Monster)
+are **bound to the IP that solved the captcha**. Cookies exported from a
+laptop won't authenticate when sent from a VM in a different region.
+This is why LinkedIn/Glassdoor/Indeed run on a residential Windows host
+rather than the VM — see the deployment-topology table at the top.
 
 ## 🐛 Troubleshooting
 
@@ -488,9 +527,11 @@ MIT License - See LICENSE file for details
 
 ## 🔗 Links
 
-- **Repository**: https://github.com/guruvedhanth-s/Scraper.git
-- **Blacklight Backend**: https://blacklight-backend-kko63bb3aa-el.a.run.app
-- **Issues**: https://github.com/guruvedhanth-s/Scraper/issues
+- **Repository**: https://github.com/NarayanaSabari/Blacklight-Scraper
+- **Blacklight Backend (production)**: https://api.qpeakhire.com
+- **Central Dashboard**: https://central.qpeakhire.com
+- **Grafana**: https://grafana.qpeakhire.com
+- **Windows host setup**: [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)
 
 ## 💡 Tips
 
