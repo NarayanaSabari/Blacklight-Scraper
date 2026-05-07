@@ -20,7 +20,7 @@ const CONFIG = {
     cdpUrl: 'http://localhost:9222',
     searchQuery: '',   // Will be built as a boolean query dynamically
     jobTitle: '',      // Will be set dynamically
-    maxPosts: 50,
+    maxPosts: 100,
     scrollDelay: 2000,
     // LinkedIn credentials (fetched from API)
     email: null,
