@@ -134,6 +134,21 @@ class MetricsRegistry {
             registers: reg,
         });
 
+        // Monster DataDome path -------------------------------------------
+        // Tracks which DataDome session path Monster scrapes used. `manual`
+        // means the cleared session from credentials.json carried the whole
+        // scrape; `legacy` means we used the hardcoded fallback start-to-end;
+        // `fallback` means we started on manual but degraded mid-scrape after
+        // a 403. `result` is success|failed of the overall scrape.
+        // A rising rate of `fallback` is the signal that the manual session
+        // is decaying and needs a refresh.
+        this.monsterDataDomePathTotal = new Counter({
+            name: 'scraper_monster_datadome_path_total',
+            help: 'Outcomes of Monster scrapes by DataDome session path.',
+            labelNames: ['path', 'result'], // path = manual|legacy|fallback ; result = success|failed
+            registers: reg,
+        });
+
         // Queue ------------------------------------------------------------
         this.queueChecksTotal = new Counter({
             name: 'scraper_queue_checks_total',
@@ -219,6 +234,10 @@ class MetricsRegistry {
 
     recordFailure(platform, reason) {
         this.#safe(() => this.failuresTotal.labels(platform, reason || 'unknown').inc());
+    }
+
+    recordMonsterDataDomePath(path, result) {
+        this.#safe(() => this.monsterDataDomePathTotal.labels(path, result).inc());
     }
 
     recordQueueCheck(result) {
