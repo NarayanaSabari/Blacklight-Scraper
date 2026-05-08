@@ -4,23 +4,18 @@
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import * as cheerio from 'cheerio';
-import path from 'path';
-import os from 'os';
-import { existsSync, mkdirSync, readdirSync } from 'fs';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
 
-// Persistent Playwright profile path. Cloudflare cookies (cf_clearance
-// etc.) and TLS handshake state survive across scrapes here, dodging
-// the fresh-launch fingerprint that Cloudflare flags as a bot.
-//
-// First run: a visible Chrome window opens — solve any Cloudflare
-// challenge once manually. Every subsequent run silently reuses the
-// stored cookies.
-const INDEED_PROFILE_DIR = process.env.INDEED_PROFILE_DIR
-    || path.join(os.homedir(), '.blacklight-indeed-profile');
+// CDP-attach to the user's existing Chrome (started via npm run
+// chrome:login). Indeed piggybacks on the same Chrome that LinkedIn
+// uses — real Chrome binary, real TLS fingerprint, and a session
+// that's already passed Cloudflare via the user's manual browsing.
+// A fresh Playwright/Chromium launch fails Cloudflare's fingerprint
+// check regardless of cookies, so we don't even try.
+const CDP_URL = 'http://localhost:9222';
 
 const log = createLogger('indeed');
 const logProgress = (_scope, msg) => log.info(msg);
@@ -542,76 +537,31 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         throw new Error('No Indeed credentials available from API');
     }
 
-    const fingerprint = getRandomFingerprint();
     const domain = getIndeedDomain(location);
-
     logProgress('Indeed', `Using domain: ${domain}`);
+    logProgress('Indeed', `🔗 Connecting to Chrome on port 9222...`);
 
-    // Detect whether the persistent profile is fresh — if so, we'll
-    // seed it from the DB credential to give it a head start. After
-    // that the profile carries its own cookie state and we leave it
-    // alone (overwriting could clobber a fresh cf_clearance with a
-    // stale DB cookie).
-    const isFreshProfile = !existsSync(INDEED_PROFILE_DIR)
-        || readdirSync(INDEED_PROFILE_DIR).length === 0;
-    if (!existsSync(INDEED_PROFILE_DIR)) {
-        mkdirSync(INDEED_PROFILE_DIR, { recursive: true });
+    let browser;
+    try {
+        browser = await chromium.connectOverCDP(CDP_URL);
+    } catch (err) {
+        throw new Error(
+            `Failed to connect to Chrome on port 9222 — make sure 'npm run chrome:login' is running. ${err.message}`
+        );
     }
-    logProgress('Indeed',
-        `Profile: ${INDEED_PROFILE_DIR} ${isFreshProfile ? '(fresh — will seed cookies)' : '(reusing)'}`);
+    logProgress('Indeed', `✅ Connected to Chrome`);
 
-    const context = await chromium.launchPersistentContext(INDEED_PROFILE_DIR, {
-        headless: false,
-        viewport: fingerprint.viewport,
-        userAgent: fingerprint.userAgent,
-        locale: fingerprint.locale,
-        timezoneId: fingerprint.timezone,
-        extraHTTPHeaders: {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': `${fingerprint.locale};q=0.9,en;q=0.8`,
-            'DNT': '1',
-            'Connection': 'keep-alive'
-        },
-        args: [
-            '--disable-blink-features=AutomationControlled',
-            '--disable-web-security',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage'
-        ]
-    });
-
-    if (isFreshProfile) {
-        const cookies = loadCookies(credential);
-        logProgress('Indeed', `Seeding fresh profile with ${cookies.length} cookies from DB`);
-        // Cookies exported from a real browser sometimes include shapes
-        // Playwright rejects (partitioned/CHIPS, empty domains,
-        // SameSite=None without Secure, malformed expirationDate).
-        // addCookies is all-or-nothing — a single bad entry rejects
-        // the whole batch. Fall back to one-by-one so we land as many
-        // valid cookies as possible.
-        try {
-            await context.addCookies(cookies);
-        } catch (batchErr) {
-            logProgress('Indeed',
-                `⚠️  Batch addCookies rejected (${batchErr.message}) — retrying one-by-one`);
-            let applied = 0;
-            for (const cookie of cookies) {
-                try {
-                    await context.addCookies([cookie]);
-                    applied++;
-                } catch (singleErr) {
-                    logProgress('Indeed',
-                        `   skipped cookie name=${cookie.name} domain=${cookie.domain}: ${singleErr.message}`);
-                }
-            }
-            logProgress('Indeed',
-                `Applied ${applied}/${cookies.length} cookies after per-cookie retry`);
-        }
+    const contexts = browser.contexts();
+    if (contexts.length === 0) {
+        await browser.close();
+        throw new Error('No browser context found — Chrome must have at least one open window.');
     }
+    // Share the existing context with LinkedIn. Cookie state is
+    // partitioned per-domain so the two scrapers don't collide.
+    const context = contexts[0];
 
-    // launchPersistentContext gives us one initial page (about:blank).
-    const page = context.pages()[0] || await context.newPage();
+    // Always open a fresh tab so we never disturb LinkedIn's working tab.
+    const page = await context.newPage();
     let loginSuccess = false;
 
     try {
@@ -711,13 +661,21 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         // Report success to API
         await apiClient.reportSuccess('indeed', `Scraped ${normalizedJobs.length} jobs successfully`);
 
-        await context.close();
+        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
+        // close the context (shared with LinkedIn) or the browser process
+        // (started externally via npm run chrome:login).
+        try { await page.close(); } catch { /* tab already gone */ }
+        try { await browser.close(); } catch { /* already disconnected */ }
         logProgress('Indeed', `Completed! Found ${normalizedJobs.length} jobs with details`);
         
         return normalizedJobs;
 
     } catch (error) {
-        await context.close();
+        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
+        // close the context (shared with LinkedIn) or the browser process
+        // (started externally via npm run chrome:login).
+        try { await page.close(); } catch { /* tab already gone */ }
+        try { await browser.close(); } catch { /* already disconnected */ }
         
         // Report failure to API
         if (!loginSuccess) {
