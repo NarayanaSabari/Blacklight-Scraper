@@ -81,39 +81,69 @@ export class QueueOrchestrator {
         const metrics = getMetrics();
         log.info('Starting queue cycle');
 
-        let sessionCheck;
+        // Per-platform queue model: a single poll can yield multiple
+        // (role, platforms) assignments, since the backend claims one
+        // pending pair per platform across the entire queue. The local
+        // mutex ensures we don't start a new poll while a previous batch
+        // is still in flight; that's enough — no need for the old
+        // server-side "active session" pre-flight check (multi-session
+        // world makes that always-true once any work is in progress).
+        let queueResult;
         try {
-            sessionCheck = await this.client.checkActiveSession();
+            queueResult = await this.client.getNextRole();
         } catch (error) {
             metrics.recordQueueCheck('error');
             throw error;
-        }
-        if (sessionCheck.has_active_session) {
-            log.warn('Active session already exists', {
-                sessionId: sessionCheck.session?.session_id,
-                role: sessionCheck.session?.role_name,
-            });
-            metrics.recordQueueCheck('active_session');
-            return { error: 'Active session already exists. Complete it first.' };
         }
 
-        let queueItem;
-        try {
-            queueItem = await this.client.getNextRole();
-        } catch (error) {
-            metrics.recordQueueCheck('error');
-            throw error;
-        }
-        if (!queueItem) {
+        const assignments = queueResult?.assignments || [];
+        if (assignments.length === 0) {
             log.info('Queue empty');
             metrics.recordQueueCheck('empty');
             return { message: 'Queue is empty' };
         }
         metrics.recordQueueCheck('job_found');
 
-        const { session_id: sessionId, role, platforms } = queueItem;
+        log.info('Batch acquired', {
+            count: assignments.length,
+            roles: assignments.map((a) => a.role.name),
+            totalPlatforms: assignments.reduce((sum, a) => sum + a.platforms.length, 0),
+        });
+
+        // Run each assignment in parallel. Each assignment is one (role,
+        // platforms) unit — its own session_id, its own scraper.execute
+        // calls, its own completeSession at the end. Cross-assignment
+        // failures are isolated by Promise.allSettled.
+        const assignmentResults = await Promise.allSettled(
+            assignments.map((assignment) => this.#runAssignment(assignment, metrics))
+        );
+
+        // Roll up — the user-facing return shape stays per-batch, just
+        // shows multiple roles now if more than one was claimed.
+        const summary = { roles: assignments.length, successful_roles: 0, failed_roles: 0 };
+        const perAssignment = [];
+        for (const r of assignmentResults) {
+            if (r.status === 'fulfilled') {
+                perAssignment.push(r.value);
+                if (r.value.summary?.failed === 0) summary.successful_roles += 1;
+                else summary.failed_roles += 1;
+            } else {
+                log.error('Assignment threw unexpectedly', { err: r.reason?.message });
+                summary.failed_roles += 1;
+                perAssignment.push({ error: r.reason?.message });
+            }
+        }
+        return { summary, assignments: perAssignment };
+    }
+
+    /**
+     * Run one assignment end-to-end: scrape every platform in parallel,
+     * then complete the session. Mirrors the old single-role flow.
+     */
+    async #runAssignment(assignment, metrics) {
+        const { session_id: sessionId, role, platforms } = assignment;
         const location = this.defaultLocation;
-        log.info('Queue item acquired', {
+        log.info('Assignment started', {
             sessionId, role: role.name, location,
             platforms: platforms.map((p) => p.name),
         });
@@ -130,20 +160,10 @@ export class QueueOrchestrator {
             },
         };
 
-        // Run platforms IN PARALLEL within a session.
-        //
-        // Previously this was a sequential `for...of` loop, so a role's
-        // wall-clock = sum(monster_time + dice_time + techfetch_time) ≈ 130s
-        // for our 3-platform allowlist. Sequential execution had no shared
-        // state between platforms — each scraper.execute() is self-contained
-        // (its own browser context, its own credential lease) — so the
-        // sequencing was pure overhead.
-        //
-        // Each task already wraps its own try/catch and reports failures via
-        // #safeSubmit, so Promise.allSettled here cannot poison the session.
-        // Memory peak goes up because dice + techfetch both run Playwright
-        // browsers concurrently (monster is HTTP-only). Measured peak on
-        // CPX21 (4 GB RAM): ~1.7 GB — well within MemoryMax=3G.
+        // Run platforms IN PARALLEL within an assignment. Each scrape
+        // is self-contained (its own browser context, its own credential
+        // lease) so concurrency is safe. Failures are isolated via
+        // Promise.allSettled + per-task try/catch.
         const tasks = platforms.map(async (platformInfo) => {
             const platformName = platformInfo.name.toLowerCase();
             const scraper = getScraper(platformName);
@@ -155,11 +175,9 @@ export class QueueOrchestrator {
             }
 
             try {
-                // Pass the AI-generated LinkedIn search queries (if the
-                // backend populated them) through to the scraper. Only
-                // LinkedIn looks at this today; other scrapers ignore the
-                // extra field. Missing/null = legacy single-template
-                // fallback inside the scraper.
+                // Pass AI-generated LinkedIn search queries (if any)
+                // through to the scraper. Only LinkedIn looks at it
+                // today; others ignore the extra option.
                 const jobs = await scraper.execute(role.name, location, sessionId, {
                     searchQueries: role.search_queries || null,
                 });
@@ -197,8 +215,6 @@ export class QueueOrchestrator {
                 if (result.success) results.summary.successful += 1;
                 else results.summary.failed += 1;
             } else {
-                // Task itself threw before our inner try/catch — shouldn't
-                // happen, but log + count it as a failure rather than crash.
                 log.error('Platform task threw unexpectedly', { err: entry.reason?.message });
                 results.summary.failed += 1;
             }
@@ -209,12 +225,13 @@ export class QueueOrchestrator {
             results.completion = completion;
             log.info('Session completed', {
                 sessionId,
+                role: role.name,
                 durationSec: completion.duration_seconds,
                 imported: completion.jobs?.total_imported,
                 found: completion.jobs?.total_found,
             });
         } catch (error) {
-            log.error('Session completion failed', { err: error.message });
+            log.error('Session completion failed', { sessionId, err: error.message });
             results.completion_error = error.message;
         }
 

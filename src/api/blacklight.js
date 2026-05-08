@@ -65,9 +65,16 @@ export class BlacklightApiClient {
     }
 
     async getNextRole() {
-        // Returns: { session_id, role: { id, name, aliases, category, candidate_count }, platforms: [...] }
-        // The backend filters `platforms` by this key's platform_allowlist (if set),
-        // so the scraper just iterates whatever the response gives back.
+        // Per-platform queue model. Returns:
+        //   { assignments: [
+        //       { session_id, role: {...}, platforms: [...] },
+        //       ...
+        //   ] }
+        // A single poll can yield multiple assignments — the backend
+        // claims one pending pair per platform in this key's allowlist
+        // across the entire queue, possibly spanning multiple roles.
+        // Returns null if the queue has no claimable pairs for this
+        // scraper (HTTP 204 → _empty marker from #request).
         const result = await this.#request('GET', '/api/scraper/queue/next-role');
         return result._empty ? null : result;
     }
