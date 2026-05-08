@@ -172,7 +172,12 @@ function getIndeedDomain(location) {
  * @returns {string} Search URL
  */
 function buildSearchUrl(domain, jobTitle, location, start = 0) {
-    const encodedJobTitle = encodeURIComponent(jobTitle);
+    // Indeed treats parenthesized text as a literal required token, so a
+    // canonical role like "Quantitative Developer (Quant)" forces every
+    // posting to also contain "(Quant)" — collapsing to zero results.
+    // Strip any "(...)" segments before encoding.
+    const cleanedTitle = jobTitle.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    const encodedJobTitle = encodeURIComponent(cleanedTitle);
     const encodedLocation = encodeURIComponent(location);
     
     // fromage=7 = last 7 days, sort=date for most recent
