@@ -40,21 +40,45 @@ export class QueueOrchestrator {
     // ----- public API -------------------------------------------------------
 
     /**
-     * Runs a single queue cycle. Safe to call concurrently — the mutex
-     * ensures only one run is active at a time; extra callers short-circuit
-     * with `{ skipped: true }`.
+     * Runs a single queue cycle. The mutex covers the CLAIM portion only
+     * (poll + receive assignments), not the long-running scrape work.
+     * Assignments are fired in the background so a fast-finishing
+     * platform doesn't sit idle waiting for slow siblings before the
+     * next claim fires. The backend's claim filter excludes platforms
+     * that already have in-flight sessions for this scraper, which
+     * prevents over-claiming when polls overlap with running work.
      */
     async runOnce() {
         if (!this.mutex.tryAcquire()) {
-            log.info('Queue run skipped — already processing');
+            log.info('Queue run skipped — claim already in flight');
             getMetrics().recordQueueCheck('skipped_busy');
             return { skipped: true };
         }
+        let queueResult;
         try {
-            return await this.#doRun();
+            queueResult = await this.#claim();
         } finally {
             this.mutex.release();
         }
+
+        const assignments = queueResult?.assignments || [];
+        if (assignments.length === 0) {
+            return { message: 'Queue is empty for idle platforms' };
+        }
+
+        // Fire each assignment in the background. The mutex is already
+        // released so the next poll (30s tick or manual trigger) can
+        // immediately claim work for any platform that finishes early.
+        for (const assignment of assignments) {
+            this.#runAssignment(assignment, getMetrics()).catch((err) => {
+                log.error('Assignment failed unexpectedly', {
+                    sessionId: assignment.session_id,
+                    role: assignment.role?.name,
+                    err: err.message,
+                });
+            });
+        }
+        return { batched: assignments.length, roles: assignments.map((a) => a.role.name) };
     }
 
     startAutoChecker() {
@@ -77,17 +101,16 @@ export class QueueOrchestrator {
 
     // ----- internals --------------------------------------------------------
 
-    async #doRun() {
+    /**
+     * Claim portion of a queue cycle. Returns the raw queue response
+     * (with `assignments` array) or null/empty result for an empty
+     * queue. The caller (runOnce) is responsible for firing each
+     * assignment fire-and-forget once the mutex is released.
+     */
+    async #claim() {
         const metrics = getMetrics();
         log.info('Starting queue cycle');
 
-        // Per-platform queue model: a single poll can yield multiple
-        // (role, platforms) assignments, since the backend claims one
-        // pending pair per platform across the entire queue. The local
-        // mutex ensures we don't start a new poll while a previous batch
-        // is still in flight; that's enough — no need for the old
-        // server-side "active session" pre-flight check (multi-session
-        // world makes that always-true once any work is in progress).
         let queueResult;
         try {
             queueResult = await this.client.getNextRole();
@@ -100,7 +123,7 @@ export class QueueOrchestrator {
         if (assignments.length === 0) {
             log.info('Queue empty');
             metrics.recordQueueCheck('empty');
-            return { message: 'Queue is empty' };
+            return queueResult;
         }
         metrics.recordQueueCheck('job_found');
 
@@ -109,31 +132,7 @@ export class QueueOrchestrator {
             roles: assignments.map((a) => a.role.name),
             totalPlatforms: assignments.reduce((sum, a) => sum + a.platforms.length, 0),
         });
-
-        // Run each assignment in parallel. Each assignment is one (role,
-        // platforms) unit — its own session_id, its own scraper.execute
-        // calls, its own completeSession at the end. Cross-assignment
-        // failures are isolated by Promise.allSettled.
-        const assignmentResults = await Promise.allSettled(
-            assignments.map((assignment) => this.#runAssignment(assignment, metrics))
-        );
-
-        // Roll up — the user-facing return shape stays per-batch, just
-        // shows multiple roles now if more than one was claimed.
-        const summary = { roles: assignments.length, successful_roles: 0, failed_roles: 0 };
-        const perAssignment = [];
-        for (const r of assignmentResults) {
-            if (r.status === 'fulfilled') {
-                perAssignment.push(r.value);
-                if (r.value.summary?.failed === 0) summary.successful_roles += 1;
-                else summary.failed_roles += 1;
-            } else {
-                log.error('Assignment threw unexpectedly', { err: r.reason?.message });
-                summary.failed_roles += 1;
-                perAssignment.push({ error: r.reason?.message });
-            }
-        }
-        return { summary, assignments: perAssignment };
+        return queueResult;
     }
 
     /**
