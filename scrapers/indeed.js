@@ -538,14 +538,13 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
     logProgress('Indeed', `Using domain: ${domain}`);
 
     const browser = await chromium.launch({
-        headless: true,
+        headless: false,
         args: [
             '--disable-blink-features=AutomationControlled',
             '--disable-web-security',
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu'
+            '--disable-dev-shm-usage'
         ]
     });
 
