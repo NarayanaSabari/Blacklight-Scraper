@@ -163,13 +163,28 @@ export class QueueOrchestrator {
         // is self-contained (its own browser context, its own credential
         // lease) so concurrency is safe. Failures are isolated via
         // Promise.allSettled + per-task try/catch.
+        //
+        // After EACH platform task settles (success or fail), we kick a
+        // fresh poll cycle so that platform's slot doesn't sit idle
+        // waiting for siblings. The mutex short-circuits if a poll is
+        // already in flight, and the backend's in-flight filter excludes
+        // platforms still mid-scrape — so over-claiming is impossible.
         const tasks = platforms.map(async (platformInfo) => {
             const platformName = platformInfo.name.toLowerCase();
             const scraper = getScraper(platformName);
 
+            const triggerNextPoll = () => {
+                setImmediate(() => this.runOnce().catch((err) => {
+                    log.error('Post-platform claim failed', {
+                        platform: platformName, err: err.message,
+                    });
+                }));
+            };
+
             if (!scraper) {
                 log.warn('Unknown platform', { platformName });
                 await this.#safeSubmit(sessionId, platformName, [], 'failed', 'Platform not supported');
+                triggerNextPoll();
                 return { platformName, result: { success: false, error: 'Platform not supported' } };
             }
 
@@ -189,6 +204,7 @@ export class QueueOrchestrator {
                     progress: submitResponse.progress,
                 });
                 metrics.recordJobsSubmitted(platformName, 'success', formatted.length);
+                triggerNextPoll();
 
                 return {
                     platformName,
@@ -202,6 +218,7 @@ export class QueueOrchestrator {
                 log.error('Platform scrape failed', { platform: platformName, err: error.message });
                 await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message);
                 metrics.recordJobsSubmitted(platformName, 'failed', 0);
+                triggerNextPoll();
                 return { platformName, result: { success: false, error: error.message } };
             }
         });
