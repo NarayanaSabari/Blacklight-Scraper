@@ -4,10 +4,23 @@
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import * as cheerio from 'cheerio';
+import path from 'path';
+import os from 'os';
+import { existsSync, mkdirSync, readdirSync } from 'fs';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
+
+// Persistent Playwright profile path. Cloudflare cookies (cf_clearance
+// etc.) and TLS handshake state survive across scrapes here, dodging
+// the fresh-launch fingerprint that Cloudflare flags as a bot.
+//
+// First run: a visible Chrome window opens — solve any Cloudflare
+// challenge once manually. Every subsequent run silently reuses the
+// stored cookies.
+const INDEED_PROFILE_DIR = process.env.INDEED_PROFILE_DIR
+    || path.join(os.homedir(), '.blacklight-indeed-profile');
 
 const log = createLogger('indeed');
 const logProgress = (_scope, msg) => log.info(msg);
@@ -529,26 +542,26 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         throw new Error('No Indeed credentials available from API');
     }
 
-    const cookies = loadCookies(credential);
-    logProgress('Indeed', `Loaded ${cookies.length} cookies`);
-
     const fingerprint = getRandomFingerprint();
     const domain = getIndeedDomain(location);
-    
+
     logProgress('Indeed', `Using domain: ${domain}`);
 
-    const browser = await chromium.launch({
-        headless: false,
-        args: [
-            '--disable-blink-features=AutomationControlled',
-            '--disable-web-security',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage'
-        ]
-    });
+    // Detect whether the persistent profile is fresh — if so, we'll
+    // seed it from the DB credential to give it a head start. After
+    // that the profile carries its own cookie state and we leave it
+    // alone (overwriting could clobber a fresh cf_clearance with a
+    // stale DB cookie).
+    const isFreshProfile = !existsSync(INDEED_PROFILE_DIR)
+        || readdirSync(INDEED_PROFILE_DIR).length === 0;
+    if (!existsSync(INDEED_PROFILE_DIR)) {
+        mkdirSync(INDEED_PROFILE_DIR, { recursive: true });
+    }
+    logProgress('Indeed',
+        `Profile: ${INDEED_PROFILE_DIR} ${isFreshProfile ? '(fresh — will seed cookies)' : '(reusing)'}`);
 
-    const context = await browser.newContext({
+    const context = await chromium.launchPersistentContext(INDEED_PROFILE_DIR, {
+        headless: false,
         viewport: fingerprint.viewport,
         userAgent: fingerprint.userAgent,
         locale: fingerprint.locale,
@@ -558,44 +571,47 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
             'Accept-Language': `${fingerprint.locale};q=0.9,en;q=0.8`,
             'DNT': '1',
             'Connection': 'keep-alive'
-        }
+        },
+        args: [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-web-security',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage'
+        ]
     });
 
-    // Add cookies to context. Cookies exported from a real browser
-    // sometimes include shapes Playwright rejects (e.g. partitioned/CHIPS
-    // cookies, empty domains, SameSite=None without Secure, malformed
-    // expirationDate). Playwright's `addCookies` is all-or-nothing — a
-    // single bad entry rejects the whole batch with the unhelpful error
-    // "Invalid parameters", which would put us back to zero auth state.
-    //
-    // Strategy: try the batch first (fast path), and on failure fall
-    // back to one-by-one with a per-cookie try/catch so we end up with
-    // as many valid cookies applied as possible. The session typically
-    // still authenticates as long as the load-bearing auth cookies make
-    // it through.
-    try {
-        await context.addCookies(cookies);
-    } catch (batchErr) {
-        logProgress('Indeed',
-            `⚠️  Batch addCookies rejected (${batchErr.message}) — retrying one-by-one`);
-        let applied = 0;
-        for (const cookie of cookies) {
-            try {
-                await context.addCookies([cookie]);
-                applied++;
-            } catch (singleErr) {
-                logProgress('Indeed',
-                    `   skipped cookie name=${cookie.name} domain=${cookie.domain}: ${singleErr.message}`);
+    if (isFreshProfile) {
+        const cookies = loadCookies(credential);
+        logProgress('Indeed', `Seeding fresh profile with ${cookies.length} cookies from DB`);
+        // Cookies exported from a real browser sometimes include shapes
+        // Playwright rejects (partitioned/CHIPS, empty domains,
+        // SameSite=None without Secure, malformed expirationDate).
+        // addCookies is all-or-nothing — a single bad entry rejects
+        // the whole batch. Fall back to one-by-one so we land as many
+        // valid cookies as possible.
+        try {
+            await context.addCookies(cookies);
+        } catch (batchErr) {
+            logProgress('Indeed',
+                `⚠️  Batch addCookies rejected (${batchErr.message}) — retrying one-by-one`);
+            let applied = 0;
+            for (const cookie of cookies) {
+                try {
+                    await context.addCookies([cookie]);
+                    applied++;
+                } catch (singleErr) {
+                    logProgress('Indeed',
+                        `   skipped cookie name=${cookie.name} domain=${cookie.domain}: ${singleErr.message}`);
+                }
             }
-        }
-        logProgress('Indeed',
-            `Applied ${applied}/${cookies.length} cookies after per-cookie retry`);
-        if (applied === 0) {
-            throw new Error('All cookies rejected by Playwright');
+            logProgress('Indeed',
+                `Applied ${applied}/${cookies.length} cookies after per-cookie retry`);
         }
     }
-    
-    const page = await context.newPage();
+
+    // launchPersistentContext gives us one initial page (about:blank).
+    const page = context.pages()[0] || await context.newPage();
     let loginSuccess = false;
 
     try {
@@ -695,13 +711,13 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         // Report success to API
         await apiClient.reportSuccess('indeed', `Scraped ${normalizedJobs.length} jobs successfully`);
 
-        await browser.close();
+        await context.close();
         logProgress('Indeed', `Completed! Found ${normalizedJobs.length} jobs with details`);
         
         return normalizedJobs;
 
     } catch (error) {
-        await browser.close();
+        await context.close();
         
         // Report failure to API
         if (!loginSuccess) {
