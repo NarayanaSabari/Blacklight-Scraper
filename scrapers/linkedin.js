@@ -1008,30 +1008,30 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         CONFIG.credentialId = credential.id;
         
         let browser;
+        let page;  // hoisted so the finally block can close OUR tab
         let loginSuccess = false;
-    
+
     try {
         // Connect to existing Chrome
         browser = await connectToChrome();
-        
+
         // Get the default context (user's real browser context)
         const contexts = browser.contexts();
         if (contexts.length === 0) {
             throw new Error('No browser contexts found. Make sure Chrome is running with the debug flag.');
         }
-        
+
         const context = contexts[0];
-        const pages = context.pages();
-        
-        // Use existing page or create new one
-        let page;
-        if (pages.length > 0) {
-            page = pages[0];
-            logProgress('LinkedIn', '📄 Using existing tab');
-        } else {
-            page = await context.newPage();
-            logProgress('LinkedIn', '📄 Created new tab');
-        }
+
+        // Always open OUR OWN tab — never grab pages[0]. Indeed and
+        // Glassdoor also CDP-attach to this same Chrome and open their
+        // own tabs; sharing pages[0] caused a real prod collision where
+        // LinkedIn's page.goto('linkedin.com/feed/') ended up on
+        // indeed.com because the tab indices reshuffled mid-scrape.
+        // Cookies are context-scoped, not tab-scoped, so a fresh tab
+        // still inherits the logged-in LinkedIn session.
+        page = await context.newPage();
+        logProgress('LinkedIn', '📄 Opened dedicated tab');
         
         // Run each query sequentially against the same Chrome session,
         // accumulating posts with cross-query dedup by post id (LinkedIn
@@ -1230,18 +1230,19 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         }
         
     } finally {
+        // CDP cleanup: close OUR tab only, then disconnect from CDP.
+        // We DO NOT close the shared context (other scrapers — Indeed,
+        // Glassdoor — attach to the same context and run their own tabs
+        // concurrently). The previous behaviour, which closed every
+        // context in the browser, was a real prod bug — it killed
+        // sibling scrapers' tabs mid-scrape, then those scrapers
+        // retried into pages[0] (which became LinkedIn's freed tab),
+        // and the whole fleet stomped on each other.
+        if (page) {
+            try { await page.close(); } catch { /* tab already gone */ }
+        }
         if (browser) {
-            logProgress('LinkedIn', '🔌 Closing Chrome browser...');
-            try {
-                // Get all contexts and close all pages before disconnecting
-                const contexts = browser.contexts();
-                for (const context of contexts) {
-                    await context.close();
-                }
-                await browser.close();
-            } catch (closeError) {
-                logProgress('LinkedIn', `⚠️  Error closing browser: ${closeError.message}`);
-            }
+            try { await browser.close(); } catch { /* already disconnected */ }
         }
     }
     } // End of while loop
