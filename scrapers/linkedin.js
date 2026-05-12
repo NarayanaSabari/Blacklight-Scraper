@@ -1,7 +1,24 @@
-// LinkedIn Scraper - CDP Connection Method
-// Connects to your existing Chrome browser (no automation detection!)
+// LinkedIn Scraper — CloakBrowser + cookie auth
+//
+// Was: CDP-attach to a manually-running Chrome (`npm run chrome:login`).
+// Now: CloakBrowser stealth Chromium with cookies injected from the
+// credentials API. Same auth surface, no manual Chrome step, scales to
+// concurrent scrapes from the same machine.
+//
+// Auth strategy:
+//   1. Lease a credential from the API. It carries `credentials`
+//      (cookie array) plus an `email/password` fallback.
+//   2. Inject cookies into a fresh CloakBrowser context.
+//   3. Navigate to feed/search. If we land on the auth wall (cookies
+//      stale), the existing `performLogin()` flow logs in with
+//      email/password — works the same in CloakBrowser as in CDP.
+//
+// Scroll behaviour: LinkedIn A/B tests two DOMs. LEGACY scrolls at the
+// window level; NEW puts the feed inside a scrollable <main> and the
+// document scrollHeight stays pinned. We scroll the inner <main> when
+// it's the actual scroll root, else fall back to window scroll.
 
-import { chromium } from 'playwright';
+import { launch } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
@@ -9,16 +26,9 @@ import { getMetrics } from '../src/metrics/registry.js';
 
 const log = createLogger('linkedin');
 const logProgress = (_scope, msg) => log.info(msg);
-import { spawn } from 'child_process';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 // Configuration
 const CONFIG = {
-    cdpUrl: 'http://localhost:9222',
     searchQuery: '',   // Will be built as a boolean query dynamically
     jobTitle: '',      // Will be set dynamically
     maxPosts: 100,
@@ -30,6 +40,76 @@ const CONFIG = {
     // Use search instead of feed for better job targeting
     useFeedInsteadOfSearch: false  // Set to true to use feed (has URLs but less relevant)
 };
+
+// Cookie-export tools emit `expirationDate` as either Unix seconds
+// (number) or ISO 8601 (string). Math.floor on the string yields NaN
+// which Playwright/CloakBrowser rejects.
+function parseExpiry(raw) {
+    if (raw === null || raw === undefined || raw === '') return undefined;
+    if (typeof raw === 'number' && isFinite(raw)) return Math.floor(raw);
+    if (typeof raw === 'string') {
+        const asNum = Number(raw);
+        if (isFinite(asNum) && asNum > 0) return Math.floor(asNum);
+        const ms = Date.parse(raw);
+        if (!isNaN(ms)) return Math.floor(ms / 1000);
+    }
+    return undefined;
+}
+
+function loadCookies(credential) {
+    const raw = Array.isArray(credential.credentials)
+        ? credential.credentials
+        : Array.isArray(credential.cookies)
+            ? credential.cookies
+            : [];
+    return raw.map(c => {
+        const out = {
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            path: c.path || '/',
+            httpOnly: !!c.httpOnly,
+            secure: !!c.secure,
+            sameSite: c.sameSite === 'no_restriction' ? 'None'
+                : c.sameSite === 'strict' ? 'Strict'
+                : c.sameSite === 'lax' ? 'Lax'
+                : c.sameSite || 'Lax',
+        };
+        const exp = parseExpiry(c.expirationDate);
+        if (exp !== undefined) out.expires = exp;
+        return out;
+    });
+}
+
+// Launch CloakBrowser and create a context with the credential's
+// cookies pre-injected. Per-cookie retry on bulk-add failure so one
+// malformed entry doesn't break the whole batch.
+async function launchWithCookies(credential) {
+    logProgress('LinkedIn', '🚀 Launching CloakBrowser stealth Chromium...');
+    const browser = await launch({ headless: true, humanize: true });
+    const context = await browser.newContext({
+        viewport: { width: 1366, height: 900 },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
+    });
+
+    const cookies = loadCookies(credential);
+    let added = 0;
+    if (cookies.length) {
+        try {
+            await context.addCookies(cookies);
+            added = cookies.length;
+        } catch (bulkErr) {
+            logProgress('LinkedIn',
+                `Bulk addCookies failed (${bulkErr.message}); falling back per-cookie`);
+            for (const c of cookies) {
+                try { await context.addCookies([c]); added++; } catch { /* skip bad */ }
+            }
+        }
+    }
+    logProgress('LinkedIn', `✅ CloakBrowser ready (${added}/${cookies.length} cookies injected)`);
+    return { browser, context };
+}
 
 /**
  * Build a LinkedIn boolean search query.
@@ -62,88 +142,9 @@ const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // Helper: Random delay
 const randomDelay = (min, max) => wait(min + Math.random() * (max - min));
 
-// Helper: Check if Chrome is running on port 9222
-async function isChromeRunning() {
-    try {
-        const response = await fetch('http://localhost:9222/json/version');
-        return response.ok;
-    } catch (error) {
-        return false;
-    }
-}
-
-// Helper: Start Chrome with remote debugging
-async function startChromeWithDebugging() {
-    return new Promise((resolve, reject) => {
-        const chromePath = process.platform === 'win32'
-            ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
-            : (process.env.CHROME_PATH || '/usr/bin/google-chrome');
-        const userDataDir = join(process.env.HOME || process.env.USERPROFILE, 'chrome-debug-profile');
-        
-        logProgress('LinkedIn', '🚀 Starting Chrome with remote debugging...');
-        
-        const chromeProcess = spawn(chromePath, [
-            '--remote-debugging-port=9222',
-            `--user-data-dir=${userDataDir}`,
-            'https://www.linkedin.com/feed/'
-        ], {
-            detached: true,
-            stdio: 'ignore'
-        });
-        
-        chromeProcess.unref();
-        
-        // Wait for Chrome to start and port to be available
-        let attempts = 0;
-        const maxAttempts = 20;
-        
-        const checkInterval = setInterval(async () => {
-            attempts++;
-            const isRunning = await isChromeRunning();
-            
-            if (isRunning) {
-                clearInterval(checkInterval);
-                logProgress('LinkedIn', '✅ Chrome started successfully on port 9222');
-                resolve();
-            } else if (attempts >= maxAttempts) {
-                clearInterval(checkInterval);
-                reject(new Error('Chrome failed to start within 10 seconds'));
-            }
-        }, 500);
-    });
-}
-
-async function connectToChrome() {
-    logProgress('LinkedIn', '🔗 Connecting to Chrome on port 9222...');
-    
-    // Check if Chrome is already running with debugging
-    const isRunning = await isChromeRunning();
-    
-    if (!isRunning) {
-        logProgress('LinkedIn', '⚠️  Chrome not running with debugging, attempting to start...');
-        try {
-            await startChromeWithDebugging();
-            // Give Chrome a moment to fully initialize
-            await wait(2000);
-        } catch (error) {
-            logProgress('LinkedIn', 'ERROR: ❌ Failed to start Chrome automatically');
-            logProgress('LinkedIn', 'ERROR:    Please manually run: start-chrome.bat');
-            throw error;
-        }
-    }
-    
-    try {
-        const browser = await chromium.connectOverCDP(CONFIG.cdpUrl);
-        logProgress('LinkedIn', '✅ Connected to Chrome successfully!');
-        return browser;
-    } catch (error) {
-        logProgress('LinkedIn', 'ERROR: ❌ Failed to connect to Chrome. Make sure:');
-        logProgress('LinkedIn', 'ERROR:    1. Chrome is running with: start-chrome.bat');
-        logProgress('LinkedIn', 'ERROR:    2. You are logged into LinkedIn');
-        logProgress('LinkedIn', 'ERROR:    3. Port 9222 is not blocked');
-        throw error;
-    }
-}
+// (CDP helpers — isChromeRunning, startChromeWithDebugging,
+// connectToChrome — removed when this scraper moved to CloakBrowser.
+// See launchWithCookies() above.)
 
 // Helper: Check if a URL indicates an unauthenticated/login page
 function isLoginPage(url) {
@@ -1004,16 +1005,21 @@ async function extractPosts(page, maxPosts) {
             break;
         }
 
-        // Scroll to the BOTTOM of the document, not just down by 500px.
-        // LinkedIn's infinite-scroll observer fires when the user reaches
-        // the bottom of the rendered list. Incremental scrollBy() leaves a
-        // gap below the loaded posts, so the observer never trips and no
-        // new content loads — the symptom user sees is "scrolls forever
-        // without extracting more". scrollHeight grows as new posts load,
-        // so calling this each iteration keeps pushing past whatever's
-        // already rendered.
+        // Scroll to the bottom — LinkedIn's intersection observer only
+        // fires at the bottom edge of the scroll root. The NEW DOM
+        // (A/B test variant) puts the feed inside a scrollable <main>
+        // and the document.documentElement scrollHeight stays pinned
+        // at viewport height — scrolling the window does nothing in
+        // that case. So we detect the actual scroll root and drive it.
+        // LEGACY DOM has main.scrollHeight ≈ main.clientHeight, so the
+        // window-scroll branch is taken.
         await page.evaluate(() => {
-            window.scrollTo(0, document.documentElement.scrollHeight);
+            const main = document.querySelector('main');
+            if (main && main.scrollHeight > main.clientHeight + 50) {
+                main.scrollTop = main.scrollHeight;
+            } else {
+                window.scrollTo(0, document.documentElement.scrollHeight);
+            }
         });
 
         await randomDelay(CONFIG.scrollDelay, CONFIG.scrollDelay + 1000);
@@ -1026,7 +1032,7 @@ async function extractPosts(page, maxPosts) {
         logProgress('LinkedIn', '   2. LinkedIn changed their HTML structure');
         logProgress('LinkedIn', '   3. No results for this search query');
         logProgress('LinkedIn', '   4. Content is not loading (check browser window)');
-        logProgress('LinkedIn', '   5. Session may have expired silently — re-run npm run chrome:login');
+        logProgress('LinkedIn', '   5. Cookies may have expired — refresh credentials in centralD');
         // Save what the browser is actually showing so the operator can
         // see "blank window" vs "captcha challenge" vs "session expired".
         await dumpDebugSnapshot(page, 'no-posts');
@@ -1153,30 +1159,15 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         CONFIG.credentialId = credential.id;
         
         let browser;
-        let page;  // hoisted so the finally block can close OUR tab
+        let page;  // hoisted so the finally block can close everything
         let loginSuccess = false;
 
     try {
-        // Connect to existing Chrome
-        browser = await connectToChrome();
-
-        // Get the default context (user's real browser context)
-        const contexts = browser.contexts();
-        if (contexts.length === 0) {
-            throw new Error('No browser contexts found. Make sure Chrome is running with the debug flag.');
-        }
-
-        const context = contexts[0];
-
-        // Always open OUR OWN tab — never grab pages[0]. Indeed and
-        // Glassdoor also CDP-attach to this same Chrome and open their
-        // own tabs; sharing pages[0] caused a real prod collision where
-        // LinkedIn's page.goto('linkedin.com/feed/') ended up on
-        // indeed.com because the tab indices reshuffled mid-scrape.
-        // Cookies are context-scoped, not tab-scoped, so a fresh tab
-        // still inherits the logged-in LinkedIn session.
+        // CloakBrowser launch + cookie injection from the leased
+        // credential. No more CDP attach, no manual chrome:login step.
+        const { browser: br, context } = await launchWithCookies(credential);
+        browser = br;
         page = await context.newPage();
-        logProgress('LinkedIn', '📄 Opened dedicated tab');
         
         // Run each query sequentially against the same Chrome session,
         // accumulating posts with cross-query dedup by post id (LinkedIn
@@ -1375,19 +1366,12 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         }
         
     } finally {
-        // CDP cleanup: close OUR tab only, then disconnect from CDP.
-        // We DO NOT close the shared context (other scrapers — Indeed,
-        // Glassdoor — attach to the same context and run their own tabs
-        // concurrently). The previous behaviour, which closed every
-        // context in the browser, was a real prod bug — it killed
-        // sibling scrapers' tabs mid-scrape, then those scrapers
-        // retried into pages[0] (which became LinkedIn's freed tab),
-        // and the whole fleet stomped on each other.
-        if (page) {
-            try { await page.close(); } catch { /* tab already gone */ }
-        }
+        // CloakBrowser instance is per-scrape and isolated — just tear
+        // down the whole browser. The previous CDP-era shared-context
+        // tab-juggling logic is gone (other scrapers each launch their
+        // own CloakBrowser now, so no fleet-collision risk).
         if (browser) {
-            try { await browser.close(); } catch { /* already disconnected */ }
+            try { await browser.close(); } catch { /* already closed */ }
         }
     }
     } // End of while loop
