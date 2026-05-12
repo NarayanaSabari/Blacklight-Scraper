@@ -7,6 +7,14 @@ import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
 
+// CDP-attach to the user's existing Chrome (started via npm run
+// chrome:login). Glassdoor uses Cloudflare Turnstile + behavioral
+// fingerprinting; a fresh Playwright launch fails the check regardless
+// of cookies or stealth, but the real Chrome process where the user
+// already cleared the challenge once carries cf_clearance forward
+// every scrape. Same pattern as LinkedIn and Indeed.
+const CDP_URL = 'http://localhost:9222';
+
 const log = createLogger('glassdoor');
 const logProgress = (_scope, msg) => log.info(msg);
 
@@ -481,46 +489,43 @@ async function extractJobDetailsInParallel(context, jobs, concurrentTabs) {
 export async function scrapeGlassdoor(jobTitle, location, sessionId = null) {
     logProgress('Glassdoor', `Searching for "${jobTitle}" in "${location}"`);
 
-    // Fetch credentials from API
+    // Still call getCredential for usage tracking + admin gate, but
+    // we no longer use the cookies it returns — Chrome (via CDP) brings
+    // its own session state. If you ever want to revert this scraper to
+    // launch-mode, the cookie code path is preserved in git history.
     const apiClient = getCredentialsAPIClient();
     const credential = await apiClient.getCredential('glassdoor', sessionId);
-    
     if (!credential) {
         throw new Error('No Glassdoor credentials available from API');
     }
 
-    const cookies = loadCookies(credential);
-    logProgress('Glassdoor', `Loaded ${cookies.length} cookies from API`);
+    logProgress('Glassdoor', `🔗 Connecting to Chrome on port 9222...`);
+    let browser;
+    try {
+        browser = await chromium.connectOverCDP(CDP_URL);
+    } catch (err) {
+        throw new Error(
+            `Failed to connect to Chrome on port 9222 — make sure 'npm run chrome:login' is running. ${err.message}`
+        );
+    }
+    logProgress('Glassdoor', `✅ Connected to Chrome`);
 
-    const fingerprint = getRandomFingerprint();
-    const browser = await chromium.launch({
-        headless: false,
-        args: [
-            '--disable-blink-features=AutomationControlled',
-            '--disable-web-security',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu'
-        ]
-    });
+    const contexts = browser.contexts();
+    if (contexts.length === 0) {
+        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
+        // close the context (shared with LinkedIn/Indeed) or the
+        // browser process (started externally via npm run chrome:login).
+        try { await page.close(); } catch { /* tab already gone */ }
+        try { await browser.close(); } catch { /* already disconnected */ }
+        throw new Error('No browser context found — Chrome must have at least one open window.');
+    }
+    // Share the existing context with LinkedIn / Indeed. Cookie state is
+    // partitioned per-domain so the scrapers don't collide.
+    const context = contexts[0];
 
-    const context = await browser.newContext({
-        viewport: fingerprint.viewport,
-        userAgent: fingerprint.userAgent,
-        locale: fingerprint.locale,
-        timezoneId: fingerprint.timezone,
-        extraHTTPHeaders: {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': `${fingerprint.locale};q=0.9,en;q=0.8`,
-            'DNT': '1',
-            'Connection': 'keep-alive'
-        }
-    });
-
-    await context.addCookies(cookies);
+    // Always open a fresh tab so we never disturb a sibling scraper's tab.
     const page = await context.newPage();
-    
+
     let loginSuccess = false;
 
     try {
@@ -585,12 +590,20 @@ export async function scrapeGlassdoor(jobTitle, location, sessionId = null) {
         // Report success to API
         await apiClient.reportSuccess('glassdoor', `Scraped ${jobDetails.length} jobs successfully`);
 
-        await browser.close();
+        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
+        // close the context (shared with LinkedIn/Indeed) or the
+        // browser process (started externally via npm run chrome:login).
+        try { await page.close(); } catch { /* tab already gone */ }
+        try { await browser.close(); } catch { /* already disconnected */ }
         logProgress('Glassdoor', `Completed! Found ${jobDetails.length} jobs with details`);
         return jobDetails;
 
     } catch (error) {
-        await browser.close();
+        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
+        // close the context (shared with LinkedIn/Indeed) or the
+        // browser process (started externally via npm run chrome:login).
+        try { await page.close(); } catch { /* tab already gone */ }
+        try { await browser.close(); } catch { /* already disconnected */ }
         
         // Report failure to API
         if (!loginSuccess) {
