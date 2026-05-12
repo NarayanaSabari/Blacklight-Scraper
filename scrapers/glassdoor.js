@@ -1,24 +1,19 @@
-// Glassdoor Job Scraper Module - Advanced Implementation
-import { chromium } from 'playwright-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+// Glassdoor Job Scraper Module
+//
+// Uses CloakBrowser — a stealth Chromium with source-level C++
+// fingerprint patches that passes Cloudflare Turnstile, FingerprintJS,
+// and BrowserScan without warmup or cookies. The previous CDP-attach
+// approach needed a real human-warmed Chrome on port 9222, a stored
+// cf_clearance cookie credential, and constant credential rotation.
+// CloakBrowser eliminates all of that — anonymous fresh launches load
+// search-result pages cleanly.
 import * as cheerio from 'cheerio';
-import fs from 'fs';
+import { launch } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
-import { getCredentialsAPIClient } from '../src/api/credentials.js';
-
-// CDP-attach to the user's existing Chrome (started via npm run
-// chrome:login). Glassdoor uses Cloudflare Turnstile + behavioral
-// fingerprinting; a fresh Playwright launch fails the check regardless
-// of cookies or stealth, but the real Chrome process where the user
-// already cleared the challenge once carries cf_clearance forward
-// every scrape. Same pattern as LinkedIn and Indeed.
-const CDP_URL = 'http://localhost:9222';
 
 const log = createLogger('glassdoor');
 const logProgress = (_scope, msg) => log.info(msg);
-
-chromium.use(StealthPlugin());
 
 // Configuration
 const CONFIG = {
@@ -489,41 +484,25 @@ async function extractJobDetailsInParallel(context, jobs, concurrentTabs) {
 export async function scrapeGlassdoor(jobTitle, location, sessionId = null) {
     logProgress('Glassdoor', `Searching for "${jobTitle}" in "${location}"`);
 
-    // Still call getCredential for usage tracking + admin gate, but
-    // we no longer use the cookies it returns — Chrome (via CDP) brings
-    // its own session state. If you ever want to revert this scraper to
-    // launch-mode, the cookie code path is preserved in git history.
-    const apiClient = getCredentialsAPIClient();
-    const credential = await apiClient.getCredential('glassdoor', sessionId);
-    if (!credential) {
-        throw new Error('No Glassdoor credentials available from API');
-    }
+    // sessionId is kept in the signature for orchestrator compatibility,
+    // but CloakBrowser anonymous-launches don't need credentials — the
+    // stealth Chromium binary itself defeats Cloudflare's bot check.
+    void sessionId;
 
-    logProgress('Glassdoor', `🔗 Connecting to Chrome on port 9222...`);
-    let browser;
-    try {
-        browser = await chromium.connectOverCDP(CDP_URL);
-    } catch (err) {
-        throw new Error(
-            `Failed to connect to Chrome on port 9222 — make sure 'npm run chrome:login' is running. ${err.message}`
-        );
-    }
-    logProgress('Glassdoor', `✅ Connected to Chrome`);
+    logProgress('Glassdoor', `🚀 Launching CloakBrowser stealth Chromium...`);
+    const browser = await launch({
+        headless: true,
+        // humanize: false — we drive page.goto + scrollBy ourselves;
+        // no mouse curves needed since we never click anything where
+        // behavioral detection matters.
+    });
+    logProgress('Glassdoor', `✅ CloakBrowser ready`);
 
-    const contexts = browser.contexts();
-    if (contexts.length === 0) {
-        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
-        // close the context (shared with LinkedIn/Indeed) or the
-        // browser process (started externally via npm run chrome:login).
-        try { await page.close(); } catch { /* tab already gone */ }
-        try { await browser.close(); } catch { /* already disconnected */ }
-        throw new Error('No browser context found — Chrome must have at least one open window.');
-    }
-    // Share the existing context with LinkedIn / Indeed. Cookie state is
-    // partitioned per-domain so the scrapers don't collide.
-    const context = contexts[0];
-
-    // Always open a fresh tab so we never disturb a sibling scraper's tab.
+    const context = await browser.newContext({
+        viewport: { width: 1366, height: 900 },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
+    });
     const page = await context.newPage();
 
     let loginSuccess = false;
@@ -587,36 +566,19 @@ export async function scrapeGlassdoor(jobTitle, location, sessionId = null) {
             easyApply: job.easyApply
         }, 'Glassdoor'));
 
-        // Report success to API
-        await apiClient.reportSuccess('glassdoor', `Scraped ${jobDetails.length} jobs successfully`);
-
-        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
-        // close the context (shared with LinkedIn/Indeed) or the
-        // browser process (started externally via npm run chrome:login).
-        try { await page.close(); } catch { /* tab already gone */ }
-        try { await browser.close(); } catch { /* already disconnected */ }
+        // CloakBrowser cleanup: full close — this browser is dedicated
+        // to this scrape.
+        try { await browser.close(); } catch { /* already closed */ }
         logProgress('Glassdoor', `Completed! Found ${jobDetails.length} jobs with details`);
         return jobDetails;
 
     } catch (error) {
-        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
-        // close the context (shared with LinkedIn/Indeed) or the
-        // browser process (started externally via npm run chrome:login).
-        try { await page.close(); } catch { /* tab already gone */ }
-        try { await browser.close(); } catch { /* already disconnected */ }
-        
-        // Report failure to API
-        if (!loginSuccess) {
-            // Cookie/authentication failure
-            if (error.message.includes('cookie') || error.message.includes('login') || error.message.includes('auth')) {
-                await apiClient.reportFailure('glassdoor', `Authentication failed: ${error.message}`, 0);
-            } else if (error.message.includes('rate limit') || error.message.includes('blocked')) {
-                await apiClient.reportFailure('glassdoor', `Rate limited or blocked: ${error.message}`, 60);
-            } else {
-                await apiClient.reportFailure('glassdoor', `Scraping error: ${error.message}`, 30);
-            }
-        }
-        
+        // No credentials to release — CloakBrowser anonymous launches
+        // have no per-scrape state to clean up. Just close the browser.
+        try { await browser.close(); } catch { /* already closed */ }
+        // loginSuccess is preserved for log clarity (whether the page
+        // loaded vs. failed at navigation); we don't act on it.
+        void loginSuccess;
         throw error;
     }
 }

@@ -1,27 +1,18 @@
 // Indeed Job Scraper Module
-// Uses cookie-based authentication similar to Glassdoor scraper
-
-import { chromium } from 'playwright-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+//
+// Uses CloakBrowser — stealth Chromium with source-level C++ fingerprint
+// patches. Anonymous fresh launches load Indeed's search results without
+// the Cloudflare wall that vanilla Playwright (and even Playwright+
+// stealth) hit. Eliminates the CDP/cookie/credential machinery that the
+// previous CDP-attach approach required.
 import * as cheerio from 'cheerio';
+import { launch } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
-import { getCredentialsAPIClient } from '../src/api/credentials.js';
-
-// CDP-attach to the user's existing Chrome (started via npm run
-// chrome:login). Indeed piggybacks on the same Chrome that LinkedIn
-// uses — real Chrome binary, real TLS fingerprint, and a session
-// that's already passed Cloudflare via the user's manual browsing.
-// A fresh Playwright/Chromium launch fails Cloudflare's fingerprint
-// check regardless of cookies, so we don't even try.
-const CDP_URL = 'http://localhost:9222';
 
 const log = createLogger('indeed');
 const logProgress = (_scope, msg) => log.info(msg);
-
-// Apply stealth plugin to avoid detection
-chromium.use(StealthPlugin());
 
 // Configuration
 const CONFIG = {
@@ -529,38 +520,22 @@ async function extractJobDetailsInParallel(context, jobs, concurrentTabs) {
 export async function scrapeIndeed(jobTitle, location, sessionId = null) {
     logProgress('Indeed', `Searching for "${jobTitle}" in "${location}"`);
 
-    // Fetch credentials from API
-    const apiClient = getCredentialsAPIClient();
-    const credential = await apiClient.getCredential('indeed', sessionId);
-    
-    if (!credential) {
-        throw new Error('No Indeed credentials available from API');
-    }
+    // sessionId is kept for orchestrator compatibility; CloakBrowser
+    // anonymous launches don't need credentials.
+    void sessionId;
 
     const domain = getIndeedDomain(location);
     logProgress('Indeed', `Using domain: ${domain}`);
-    logProgress('Indeed', `🔗 Connecting to Chrome on port 9222...`);
+    logProgress('Indeed', `🚀 Launching CloakBrowser stealth Chromium...`);
 
-    let browser;
-    try {
-        browser = await chromium.connectOverCDP(CDP_URL);
-    } catch (err) {
-        throw new Error(
-            `Failed to connect to Chrome on port 9222 — make sure 'npm run chrome:login' is running. ${err.message}`
-        );
-    }
-    logProgress('Indeed', `✅ Connected to Chrome`);
+    const browser = await launch({ headless: true });
+    logProgress('Indeed', `✅ CloakBrowser ready`);
 
-    const contexts = browser.contexts();
-    if (contexts.length === 0) {
-        await browser.close();
-        throw new Error('No browser context found — Chrome must have at least one open window.');
-    }
-    // Share the existing context with LinkedIn. Cookie state is
-    // partitioned per-domain so the two scrapers don't collide.
-    const context = contexts[0];
-
-    // Always open a fresh tab so we never disturb LinkedIn's working tab.
+    const context = await browser.newContext({
+        viewport: { width: 1366, height: 900 },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
+    });
     const page = await context.newPage();
     let loginSuccess = false;
 
@@ -658,38 +633,16 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
             skills: job.skills
         }, 'Indeed'));
 
-        // Report success to API
-        await apiClient.reportSuccess('indeed', `Scraped ${normalizedJobs.length} jobs successfully`);
-
-        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
-        // close the context (shared with LinkedIn) or the browser process
-        // (started externally via npm run chrome:login).
-        try { await page.close(); } catch { /* tab already gone */ }
-        try { await browser.close(); } catch { /* already disconnected */ }
+        try { await browser.close(); } catch { /* already closed */ }
         logProgress('Indeed', `Completed! Found ${normalizedJobs.length} jobs with details`);
-        
+
         return normalizedJobs;
 
     } catch (error) {
-        // CDP cleanup: close OUR tab only, then disconnect. We do NOT
-        // close the context (shared with LinkedIn) or the browser process
-        // (started externally via npm run chrome:login).
-        try { await page.close(); } catch { /* tab already gone */ }
-        try { await browser.close(); } catch { /* already disconnected */ }
-        
-        // Report failure to API
-        if (!loginSuccess) {
-            if (error.message.includes('cookie') || error.message.includes('login') || error.message.includes('auth')) {
-                await apiClient.reportFailure('indeed', `Authentication failed: ${error.message}`, 0);
-            } else if (error.message.includes('rate limit') || error.message.includes('blocked') || error.message.includes('captcha')) {
-                await apiClient.reportFailure('indeed', `Rate limited or blocked: ${error.message}`, 60);
-            } else {
-                await apiClient.reportFailure('indeed', `Scraping error: ${error.message}`, 30);
-            }
-        } else {
-            await apiClient.reportFailure('indeed', `Scraping error after login: ${error.message}`, 30);
-        }
-        
+        // No credentials to release — CloakBrowser anonymous launches
+        // are stateless. Just close the browser and re-throw.
+        try { await browser.close(); } catch { /* already closed */ }
+        void loginSuccess;
         throw error;
     }
 }
