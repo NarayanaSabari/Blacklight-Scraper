@@ -553,24 +553,35 @@ async function extractPosts(page, maxPosts) {
         logProgress('LinkedIn', '   Note: Only extracting CONTENT posts (not people/jobs/companies)\n');
     }
     
-    // Debug: Check what's on the page
+    // Debug: probe the new LinkedIn structure (May 2026+). The legacy
+    // class-based selectors (.feed-shared-update-v2, .reusable-search__*,
+    // .entity-result) all return 0 on the current DOM. We now key off
+    // componentkey attributes — keep the legacy probes here for
+    // observability so a future regression jumps out in the logs.
     const debugInfo = await page.evaluate(() => {
         const selectors = {
+            // NEW (May 2026+) — what we actually use:
+            'main div[componentkey^="expanded"][componentkey$="FLAGSHIP_SEARCH"]':
+                document.querySelectorAll('main div[componentkey^="expanded"][componentkey$="FLAGSHIP_SEARCH"]').length,
+            'main div[componentkey^="expanded"]':
+                document.querySelectorAll('main div[componentkey^="expanded"]').length,
+            'main div[componentkey]':
+                document.querySelectorAll('main div[componentkey]').length,
+            // LEGACY — expected to be 0 now; non-zero means LinkedIn rolled back:
             '.feed-shared-update-v2': document.querySelectorAll('.feed-shared-update-v2').length,
-            '.occludable-update': document.querySelectorAll('.occludable-update').length,
             '[data-urn*="activity:"]': document.querySelectorAll('[data-urn*="activity:"]').length,
-            'div[data-id*="activity:"]': document.querySelectorAll('div[data-id*="activity:"]').length,
-            '.search-results__list li': document.querySelectorAll('.search-results__list li').length,
             '.reusable-search__result-container': document.querySelectorAll('.reusable-search__result-container').length,
-            'li.reusable-search__result-container': document.querySelectorAll('li.reusable-search__result-container').length,
-            'div.search-results-container': document.querySelectorAll('div.search-results-container').length,
-            '.entity-result': document.querySelectorAll('.entity-result').length
         };
-        
-        // Get sample HTML from first few elements
-        const sampleElement = document.querySelector('.search-results__list li, .reusable-search__result-container, li');
-        const sampleHTML = sampleElement ? sampleElement.outerHTML.substring(0, 500) : 'No elements found';
-        
+
+        // Sample HTML from a post container (new selector first, legacy fallback).
+        const sampleElement =
+            document.querySelector('main div[componentkey^="expanded"][componentkey$="FLAGSHIP_SEARCH"]')
+            || document.querySelector('main div[componentkey^="expanded"]')
+            || document.querySelector('.feed-shared-update-v2, .reusable-search__result-container');
+        const sampleHTML = sampleElement
+            ? sampleElement.outerHTML.substring(0, 500)
+            : 'No elements found';
+
         return { selectors, sampleHTML };
     });
     
@@ -620,259 +631,176 @@ async function extractPosts(page, maxPosts) {
         await randomDelay(500, 800);
         
         // THEN: Extract posts from current viewport
+        //
+        // LinkedIn rewrote their content-search DOM (verified May 2026):
+        //   - `data-urn` / `data-id` attributes: gone
+        //   - All `.feed-shared-update-v2` / `.update-components-*` /
+        //     `.reusable-search__result-container` class names: gone
+        //   - CSS classes are now hashed CSS-module garbage (`_8284c9ef …`)
+        //
+        // What survives — what we now key off of:
+        //   - Post containers are `main div[componentkey^="expanded"]...` —
+        //     for content search, each post wrapper carries
+        //     componentkey="expanded<HASH>FeedType_FLAGSHIP_SEARCH".
+        //     (Confirmed 24 elements / 12 unique posts on a real page.)
+        //   - Each post renders TWICE (virtual-scroll buffer), so we
+        //     dedupe by the hash inside this evaluate() pass.
+        //   - Author profile link: `a[href*="/in/"]` (appears 3× per post).
+        //   - Author name: split that link's innerText on " • " (drops the
+        //     "• 3rd+" connection-degree suffix).
+        //   - Post body text: the full innerText is shaped like
+        //       "Feed post {Author} • 3rd+ {tagline} {age} • Follow {body}…"
+        //     so a `split(' • Follow ')[1]` gives us a clean body.
+        //   - Time-ago is now plain text ("5d", "3h"); no `<time>` element.
+        //   - Permalink: not in the card. Selectors targeting
+        //     /feed/update/, /posts/, urn:li:activity all return 0. We
+        //     leave postUrl empty; downstream code already tolerates it.
         const posts = await page.evaluate((config) => {
-            // For search results, use different selectors
             const isSearchPage = window.location.href.includes('/search/results/content/');
-            
-            let postElements;
-            if (isSearchPage) {
-                // Search results use different structure
-                postElements = document.querySelectorAll('.reusable-search__result-container, .feed-shared-update-v2');
-            } else {
-                // Feed page structure
-                postElements = document.querySelectorAll('.feed-shared-update-v2');
+
+            // Primary post-container selector (search page).
+            // For non-search pages, fall back to any expanded-prefixed
+            // componentkey under <main> (the structure pattern is the
+            // same; only the FeedType suffix differs).
+            const SEARCH_SELECTOR = 'main div[componentkey^="expanded"][componentkey$="FLAGSHIP_SEARCH"]';
+            const FALLBACK_SELECTOR = 'main div[componentkey^="expanded"]';
+
+            let postElements = document.querySelectorAll(
+                isSearchPage ? SEARCH_SELECTOR : FALLBACK_SELECTOR
+            );
+            if (postElements.length === 0) {
+                postElements = document.querySelectorAll(FALLBACK_SELECTOR);
             }
-            
+
             const results = [];
             const debugInfo = { sampleLinks: [], foundIds: [] };
-            const keywords = config.searchQuery.toLowerCase().split(' ');
-            
+            const seenInRun = new Set(); // per-page dedup (each post renders 2x)
+
             postElements.forEach((element, index) => {
                 try {
-                    // Skip if this is a job card
-                    const isJobCard = element.querySelector('a[href*="/jobs/view/"]') !== null;
-                    if (isJobCard) {
-                        return;
-                    }
-                    
-                    // DEBUG: Collect sample link hrefs for first element only
+                    // Skip job cards (different componentkey naming on those,
+                    // but defensive check in case any leak through).
+                    if (element.querySelector('a[href*="/jobs/view/"]')) return;
+
+                    // Extract post id from the componentkey attribute.
+                    //   expanded<HASH>FeedType_FLAGSHIP_SEARCH  →  <HASH>
+                    const compKey = element.getAttribute('componentkey') || '';
+                    const postId = compKey
+                        .replace(/^expanded/, '')
+                        .replace(/FeedType_[A-Z_]+$/, '');
+                    if (!postId || seenInRun.has(postId)) return;
+                    seenInRun.add(postId);
+
+                    // Debug capture (first hit only)
                     if (index === 0 && results.length === 0) {
-                        const sampleLinks = Array.from(element.querySelectorAll('a[href]')).slice(0, 10);
-                        debugInfo.sampleLinks = sampleLinks.map(link => link.getAttribute('href'));
-                        
-                        // Also get the element's data attributes
+                        const sampleLinks = Array.from(element.querySelectorAll('a[href]')).slice(0, 8);
+                        debugInfo.sampleLinks = sampleLinks.map(l => l.getAttribute('href'));
                         debugInfo.elementInfo = {
-                            className: element.className,
-                            dataUrn: element.getAttribute('data-urn'),
-                            dataId: element.getAttribute('data-id'),
-                            id: element.id,
-                            hasTimestampLink: !!element.querySelector('.feed-shared-actor__sub-description a, time a')
+                            componentkey: compKey.slice(0, 100),
+                            extractedPostId: postId.slice(0, 40),
                         };
                     }
-                    
-                    // Get post ID from URN or data attributes - try multiple approaches
-                    let postId = null;
-                    let activityUrn = null;
-                    
-                    // Method 1: Check parent container data-urn
-                    const containerUrn = element.getAttribute('data-urn');
-                    if (containerUrn && containerUrn.includes('activity:')) {
-                        const match = containerUrn.match(/activity:([^:,\s)]+)/);
-                        if (match) {
-                            postId = match[1];
-                            activityUrn = containerUrn;
-                        }
-                    }
-                    
-                    // Method 2: Check child elements for activity URNs
-                    if (!postId) {
-                        const urnElements = element.querySelectorAll('[data-urn], [data-id], [id]');
-                        for (const el of urnElements) {
-                            const urn = el.getAttribute('data-urn') || el.getAttribute('data-id') || el.id;
-                            if (urn && urn.includes('activity:')) {
-                                const match = urn.match(/activity:([^:,\s)]+)/);
-                                if (match) {
-                                    postId = match[1];
-                                    activityUrn = urn;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Method 3: Check all links in the post for activity IDs in URLs
-                    if (!postId) {
-                        const allLinks = element.querySelectorAll('a[href]');
-                        for (const link of allLinks) {
-                            const href = link.getAttribute('href');
-                            // Look for patterns like /feed/update/urn:li:activity:XXXXXXX or activity-XXXXXXX
-                            const activityMatch = href?.match(/(?:activity[:-])(\d{19})/);
-                            if (activityMatch) {
-                                postId = activityMatch[1];
-                                activityUrn = `urn:li:activity:${postId}`;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    // Fallback: generate ID from content hash
-                    if (!postId) {
-                        postId = 'post_' + Math.random().toString(36).substr(2, 9);
-                    }
-                    
-                    // Get author name - try multiple selectors
-                    const authorNameSelectors = [
-                        '.update-components-actor__name',
-                        '.feed-shared-actor__name', 
-                        '.update-components-actor__title',
-                        'span.update-components-actor__name span[aria-hidden="true"]',
-                        '.feed-shared-actor__title',
-                        'span[dir="ltr"]'
-                    ];
-                    
+
+                    // Author profile link
+                    const authorEl = element.querySelector('a[href*="/in/"]');
+                    const authorProfileUrl = authorEl ? authorEl.href.split('?')[0] : '';
+
+                    // Author name: prefer the link's text (split off the
+                    // "• 3rd+" suffix). If that's empty, fall back to the
+                    // "Open control menu for post by X" button's aria-label.
                     let authorName = '';
-                    for (const selector of authorNameSelectors) {
-                        const el = element.querySelector(selector);
-                        if (el?.textContent?.trim() && el.textContent.trim().length > 2) {
-                            authorName = el.textContent.trim();
-                            break;
+                    if (authorEl) {
+                        const linkText = (authorEl.innerText || '').trim();
+                        authorName = linkText.split('•')[0].trim();
+                    }
+                    if (!authorName) {
+                        const ctlBtn = element.querySelector('button[aria-label^="Open control menu for post by"]');
+                        if (ctlBtn) {
+                            authorName = (ctlBtn.getAttribute('aria-label') || '')
+                                .replace(/^Open control menu for post by\s+/i, '')
+                                .trim();
                         }
                     }
-                    
-                    // Get author profile URL
-                    const authorLinkSelectors = [
-                        '.update-components-actor__container a[href*="/in/"]',
-                        '.feed-shared-actor a[href*="/in/"]',
-                        'a.update-components-actor__meta-link[href*="/in/"]',
-                        'a[data-control-name="actor"][href*="/in/"]',
-                        '.update-components-actor__image-link[href*="/in/"]',
-                        'a.app-aware-link[href*="/in/"]'
-                    ];
-                    
-                    let authorProfileUrl = '';
-                    for (const selector of authorLinkSelectors) {
-                        const linkEl = element.querySelector(selector);
-                        if (linkEl?.href && linkEl.href.includes('/in/')) {
-                            // Clean URL - remove query parameters
-                            authorProfileUrl = linkEl.href.split('?')[0];
-                            break;
-                        }
-                    }
-                    
-                    // Get post content
-                    const contentSelectors = [
-                        '.feed-shared-update-v2__description',
-                        '.update-components-text',
-                        '.feed-shared-text',
-                        '.update-components-update-v2__commentary',
-                        '.feed-shared-update-v2__commentary',
-                        '[data-test-id="main-feed-activity-card__commentary"]',
-                        '.feed-shared-inline-show-more-text',
-                        'div[dir="ltr"]' // Generic text content
-                    ];
-                    
+
+                    // Body text — split on " • Follow " (the boundary
+                    // between the header strip and the user-authored
+                    // body). If that pattern's absent, scan for the
+                    // longest <span dir="ltr"> / <p> / <div lang> child.
+                    const fullText = (element.innerText || '').trim();
                     let postContent = '';
-                    for (const selector of contentSelectors) {
-                        const contentEl = element.querySelector(selector);
-                        if (contentEl?.textContent?.trim() && contentEl.textContent.trim().length > 20) {
-                            postContent = contentEl.textContent.trim();
-                            break;
+                    const followSplit = fullText.split(/\s+•\s+Follow\s+/);
+                    if (followSplit.length > 1) {
+                        postContent = followSplit.slice(1).join(' • Follow ').trim();
+                    } else {
+                        const candidates = element.querySelectorAll('span[dir="ltr"], p, div[lang]');
+                        let best = '';
+                        for (const c of candidates) {
+                            const t = (c.innerText || '').trim();
+                            if (t.length > best.length) best = t;
                         }
+                        postContent = best;
                     }
-                    
-                    // Get timestamp
-                    const timestampSelectors = [
-                        '.update-components-actor__sub-description',
-                        '.feed-shared-actor__sub-description',
-                        '.update-components-actor__supplementary-actor-info',
-                        'time',
-                        '[datetime]'
-                    ];
-                    
+                    // Trim trailing engagement noise that follows the body
+                    // (likes/comments counters appear after the body in
+                    // innerText). Cut at the first " · " separator that's
+                    // followed by digits or "Like"/"Comment"/"Repost".
+                    postContent = postContent.replace(
+                        /\s+(?:Like|Comment|Repost|Send)\s+.*$/s, ''
+                    ).trim();
+
+                    // Time-ago: ends the header strip just before " • Follow".
+                    // Pattern: "...{tagline} 5d • Follow {body}". Pull the
+                    // last \d+[smhdwy] token before the " • Follow " split.
                     let timestamp = '';
-                    for (const selector of timestampSelectors) {
-                        const timeEl = element.querySelector(selector);
-                        if (timeEl) {
-                            timestamp = timeEl.getAttribute('datetime') || timeEl.textContent?.trim() || '';
-                            if (timestamp) {
-                                break;
-                            }
-                        }
+                    const headerStrip = followSplit[0] || fullText;
+                    const timeMatch = headerStrip.match(/(\d+[smhdwy])\s*$/);
+                    if (timeMatch) {
+                        timestamp = timeMatch[1];
                     }
-                    
-                    // Get post URL - improved extraction
+
+                    // Permalink: usually absent in search results, but
+                    // try the few selectors that still might catch it.
                     let postUrl = '';
-                    
-                    // Method 1: Look for timestamp link (most reliable)
-                    const timestampLink = element.querySelector('.update-components-actor__sub-description a, .feed-shared-actor__sub-description a, time a, a.app-aware-link[href*="activity"]');
-                    if (timestampLink?.href && timestampLink.href.includes('activity')) {
-                        postUrl = timestampLink.href.split('?')[0];
+                    const updateLink = element.querySelector(
+                        'a[href*="/feed/update/"], a[href*="/posts/"], a[href*="urn:li:activity"]'
+                    );
+                    if (updateLink?.href) {
+                        postUrl = updateLink.href.split('?')[0];
                     }
-                    
-                    // Method 2: Try standard post link selectors
-                    if (!postUrl) {
-                        const postLinkSelectors = [
-                            'a[href*="/feed/update/urn:li:activity:"]',
-                            'a[href*="/posts/activity-"]',
-                            'a.update-components-actor__supplementary-actor-info',
-                            '[data-urn*="activity:"] a[href*="activity"]',
-                            'a[data-control-name*="like_post"] ~ a[href*="activity"]'
-                        ];
-                        
-                        for (const selector of postLinkSelectors) {
-                            const linkEl = element.querySelector(selector);
-                            if (linkEl?.href && (linkEl.href.includes('/posts/') || linkEl.href.includes('/feed/update/'))) {
-                                postUrl = linkEl.href.split('?')[0];
-                                break;
-                            }
-                        }
+
+                    // Track for debug on first successful extraction
+                    if (debugInfo.foundIds.length === 0) {
+                        debugInfo.foundIds.push({
+                            postId: postId.slice(0, 30),
+                            hasUrl: !!postUrl,
+                            author: authorName,
+                            contentLen: postContent.length,
+                        });
                     }
-                    
-                    // Method 3: Search all links in the element
-                    if (!postUrl) {
-                        const allLinks = element.querySelectorAll('a[href]');
-                        for (const link of allLinks) {
-                            const href = link.getAttribute('href');
-                            if (href && (href.includes('/feed/update/urn:li:activity:') || href.match(/\/posts\/.*activity-\d{19}/))) {
-                                postUrl = href.split('?')[0];
-                                break;
-                            }
-                        }
-                    }
-                    
-                    // Fallback: construct post URL from activity URN if we have a real activity ID
-                    if (!postUrl && postId && !postId.startsWith('post_')) {
-                        postUrl = `https://www.linkedin.com/feed/update/urn:li:activity:${postId}`;
-                    }
-                    
-                    // NOTE: LinkedIn content search results don't include direct post URLs
-                    // Post URLs are only available if we can extract activity IDs from data attributes
-                    // If no URL found, users will need to search based on author + content
-                    if (!postUrl) {
-                        postUrl = ''; // Explicitly set empty rather than undefined
-                    }
-                    
-                    // DEBUG: Track found IDs
-                    if (index === 0 && results.length === 0) {
-                        debugInfo.foundIds.push({ postId, postUrl, hasRealId: !postId.startsWith('post_') });
-                    }
-                    
-                    // Create a content hash for deduplication
+
+                    // Content hash for cross-cycle dedup (the outer scroll
+                    // loop dedupes across scroll iterations).
                     const contentHash = postContent.substring(0, 100) + authorName;
-                    
-                    // Note: Filtering is done by LinkedIn search, not client-side
-                    // Search page already filters by keywords in the URL
-                    
-                    // Only include if we have at least author and some content
+
                     if (authorName && postContent && postContent.length > 20) {
                         results.push({
                             id: postId,
                             author: authorName,
-                            authorProfileUrl: authorProfileUrl,
+                            authorProfileUrl,
                             content: postContent,
-                            timestamp: timestamp,
-                            postUrl: postUrl,
+                            timestamp,
+                            postUrl,
                             contentLength: postContent.length,
-                            contentHash: contentHash // Add hash for deduplication
+                            contentHash,
                         });
                     }
                 } catch (e) {
                     // Skip invalid posts
                 }
             });
-            
+
             return { results, debugInfo };
-        }, CONFIG); // Pass CONFIG to page.evaluate
+        }, CONFIG);
         
         // Log debug info for first scroll
         if (scrollAttempts === 1 && posts.debugInfo) {
