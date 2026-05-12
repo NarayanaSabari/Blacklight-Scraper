@@ -1,223 +1,159 @@
 // Monster Job Scraper Module
+//
+// Switched from raw-HTTP-against-Monster's-internal-API to browser-DOM
+// scraping via CloakBrowser. Reason: Monster's API (appsapi.monster.io)
+// is fronted by DataDome which flags any non-browser request within
+// ~12-24h, requiring constant cookie + clientid rotation. CloakBrowser's
+// stealth Chromium passes DataDome cleanly — the only thing we need is
+// a homepage warmup, then the search URL renders normally.
+//
+// Trade-off: scrape is slower (multi-second page navigation per page vs
+// sub-second API call) but stable. The 100-jobs-per-role ceiling we had
+// from the API is roughly the same as the DOM ceiling, just paginated
+// via &page=N.
+
+import { launch } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
-import { humanDelay } from '../src/core/delays.js';
-import { stripHtmlTags } from '../src/core/html.js';
-import { getCredentialsAPIClient } from '../src/api/credentials.js';
 
 const log = createLogger('monster');
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// Public Monster.com web-app constants — reverse-engineered from the
-// browser frontend. Inlined so the scraper needs zero config.
-const MONSTER_API_KEY = 'hkp1igv13sjt7ltv5kfdhjpj';
+// First-touch on /jobs/search returns 403 from DataDome on a brand-new
+// session. A brief visit to monster.com first establishes cookies and
+// lets the subsequent search-page navigation through.
+async function warmup(page) {
+    log.info('Warmup: visiting monster.com homepage');
+    const resp = await page.goto('https://www.monster.com/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000,
+    });
+    await sleep(3000 + Math.random() * 2000);
+    log.info(`Warmup complete (status ${resp?.status() ?? '?'})`);
+}
 
-// Static fallback clientid header, used when the credential doesn't
-// supply a fresh one. DataDome accepts a request if EITHER the
-// clientid header is in a validated state OR the `datadome` cookie
-// (from the credential's cookies array) is fresh. Once both go stale
-// the API starts returning 403 + redirect to captcha-delivery.com —
-// fix is to refresh the cookies in the DB credential, no redeploy needed.
-const MONSTER_DATADOME_CLIENT_ID_FALLBACK = 'jcq2Bhd0iT8Ca3HzJ1r21Z_reNQ3HUjjnRSB7lKP2LuvVcLndhl3yFVrADzdIyMCeOkSQ0uvT1DThly2wkEJZAWZYjvAP480CIP8LYqtI9z9fEtKaiIEkm1LbnGycdM6';
+async function extractJobsFromCurrentPage(page) {
+    return page.evaluate(() => {
+        // Monster job cards anchor to /job-openings/<id>. The anchor's
+        // ancestor <article> (or fallback container) carries the
+        // displayed title, company, location, and time-posted info.
+        const cards = Array.from(document.querySelectorAll('a[href*="/job-openings/"]'));
+        const seen = new Set();
+        const results = [];
+        for (const a of cards) {
+            const href = a.href;
+            if (!href || seen.has(href)) continue;
+            seen.add(href);
 
-/**
- * Convert a credential's stored cookies (array of {name, value, …})
- * into a "name=value; name=value; …" Cookie HTTP header string.
- */
-function buildCookieHeader(credential) {
-    if (!credential) return '';
-    const cookies = Array.isArray(credential.credentials)
-        ? credential.credentials
-        : Array.isArray(credential.cookies)
-            ? credential.cookies
-            : [];
-    return cookies
-        .filter((c) => c?.name && c?.value)
-        .map((c) => `${c.name}=${c.value}`)
-        .join('; ');
+            const container = a.closest('article, [data-test*="JobCard"], li, div[role="article"]') || a.parentElement || a;
+            const fullText = (container.innerText || '').trim();
+            const lines = fullText.split('\n').map((l) => l.trim()).filter(Boolean);
+
+            // Most Monster cards lay out as:
+            //   line 0: <Job Title>
+            //   line 1: <Company Name>
+            //   line 2: <Location>  (sometimes plus "Remote" tag)
+            //   line 3: <Time posted, e.g. "2 days ago">
+            // Plus extra noise (save button labels, salary banners).
+            const title = lines[0] || a.getAttribute('aria-label') || a.innerText.trim();
+            const company = lines[1] || '';
+            const locationStr = lines[2] || '';
+            const datePosted = lines.find((l) => /\b(day|hour|week|min)/i.test(l)) || '';
+
+            results.push({
+                title,
+                company,
+                location: locationStr,
+                url: href,
+                datePosted,
+                description: fullText.slice(0, 1000),
+            });
+        }
+        return results;
+    });
 }
 
 export async function scrapeMonster(jobTitle, location, sessionId = null) {
+    void sessionId; // CloakBrowser anonymous launches don't need credentials.
     log.info(`Searching for "${jobTitle}" in "${location}"`);
 
-    // Fetch credential from API. Required — the static fallback alone
-    // is no longer enough for DataDome; we need the matching datadome
-    // cookie + clientid from a real recent browser session.
-    const apiClient = getCredentialsAPIClient();
-    const credential = await apiClient.getCredential('monster', sessionId);
-    if (!credential) {
-        throw new Error('No Monster credentials available from API');
-    }
-
-    const cookieHeader = buildCookieHeader(credential);
-    // Credential can carry a fresh clientid in `credential.clientid`
-    // (set when the cookie set was scraped from a browser). If absent,
-    // fall back to the static one — works while DataDome hasn't flagged it.
-    const clientid = credential.clientid || MONSTER_DATADOME_CLIENT_ID_FALLBACK;
-    log.info(`Loaded credential ${credential.id} (${cookieHeader.split('; ').length} cookies)`);
-
-    const apiUrl = `https://appsapi.monster.io/jobs-svx-service/v2/monster/search-jobs/samsearch/en-US?apikey=${MONSTER_API_KEY}`;
-
-    const headers = {
-        'accept': 'application/json',
-        'accept-language': 'en-US,en;q=0.9,en-IN;q=0.8',
-        'content-type': 'application/json; charset=UTF-8',
-        'origin': 'https://www.monster.com',
-        'priority': 'u=1, i',
-        'referer': `https://www.monster.com/jobs/search?q=${encodeURIComponent(jobTitle)}&where=${encodeURIComponent(location)}&page=1&recency=last+week&so=m.s.sh`,
-        'request-starttime': Date.now().toString(),
-        'sec-ch-ua': '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
-        'sec-ch-ua-mobile': '?1',
-        'sec-ch-ua-platform': '"Android"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'cross-site',
-        'user-agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36 Edg/143.0.0.0',
-        'x-datadome-clientid': clientid,
-    };
-    if (cookieHeader) {
-        headers['cookie'] = cookieHeader;
-    }
-
-    let country = 'us';
-    let address = location;
-    
-    if (location.includes(',')) {
-        const parts = location.split(',').map(p => p.trim());
-        address = parts[0];
-        if (parts[1] && parts[1].length === 2) {
-            country = parts[1].toLowerCase();
-        }
-    }
-
-    const baseData = {
-        "jobQuery": {
-            "query": jobTitle,
-            "locations": [{"country": country, "address": address, "radius": {"unit": "mi", "value": 30}}],
-            "datePosted": "last week"
-        },
-        "jobAdsRequest": {
-            "position": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18],
-            "placement": {
-                "channel": "WEB",
-                "location": "JobSearchPage",
-                "property": "monster.com",
-                "type": "JOB_SEARCH",
-                "view": "SPLIT"
-            }
-        },
-        "fingerprintId": "z5155923fe9543392e709bd648773ebf5",
-        "pageSize": 18,
-        "includeJobs": [],
-        "freeJobsOnly": true,
-        "siteId": "monster.com"
-    };
-
-    const allJobs = [];
-    const seenUrls = new Set(); // Track unique job URLs
-    let offset = 0;
-    let searchId = null; // Store searchId from first response
-    const maxJobs = 100;
-    let consecutiveEmptyPages = 0;
+    log.info('🚀 Launching CloakBrowser stealth Chromium...');
+    // humanize: true is REQUIRED for monster — DataDome scores the
+    // behavioral signals (timing, mouse curves, scroll patterns) in
+    // addition to fingerprints. headless without humanize returns 403
+    // on monster.com's homepage too. Confirmed via warmup probe.
+    const browser = await launch({ headless: true, humanize: true });
 
     try {
-    while (allJobs.length < maxJobs) {
-        const data = { ...baseData, offset };
-        
-        // Add searchId to subsequent requests (after first request)
-        if (searchId) {
-            data.searchId = searchId;
-            delete data.includeJobs; // Not needed after first request
-        }
-        
-        // Update request-starttime for each request
-        headers['request-starttime'] = Date.now().toString();
-        
-        await humanDelay();
-
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: headers,
-            body: JSON.stringify(data)
+        const context = await browser.newContext({
+            viewport: { width: 1366, height: 900 },
+            locale: 'en-US',
+            timezoneId: 'America/New_York',
         });
+        const page = await context.newPage();
 
-        if (!response.ok) {
-            const errorText = await response.text().catch(() => 'No error details');
-            log.info(`API returned ${response.status}: ${errorText.substring(0, 200)}`);
-            throw new Error(`API call failed: ${response.status} - ${response.statusText}`);
-        }
+        await warmup(page);
 
-        const json = await response.json();
-        
-        // Capture searchId from first response
-        if (!searchId && json.searchId) {
-            searchId = json.searchId;
-            log.info(`Search ID captured: ${searchId}`);
-        }
-        
-        const jobs = json.jobResults || [];
+        const maxJobs = 100;
+        const maxPages = 5;
+        const seenUrls = new Set();
+        const allJobs = [];
+        let consecutiveEmptyPages = 0;
 
-        if (jobs.length === 0) break;
+        for (let pageNum = 1; pageNum <= maxPages && allJobs.length < maxJobs; pageNum++) {
+            const searchUrl =
+                `https://www.monster.com/jobs/search` +
+                `?q=${encodeURIComponent(jobTitle)}` +
+                `&where=${encodeURIComponent(location)}` +
+                `&page=${pageNum}` +
+                `&recency=last+week` +
+                `&so=m.s.sh`;
+            log.info(`Fetching page ${pageNum}: ${searchUrl}`);
 
-        const extractedJobs = jobs.map(job => normalizeJobData({
-            title: job.jobPosting?.title,
-            url: job.canonicalUrl || job.jobPosting?.url,
-            description: stripHtmlTags(job.jobPosting?.description),
-            datePosted: job.jobPosting?.datePosted,
-            employmentType: job.jobPosting?.employmentType?.join(', '),
-            hiringOrganization: job.jobPosting?.hiringOrganization?.name,
-            jobLocation: job.jobPosting?.jobLocation?.map(loc => 
-                `${loc.address?.addressLocality}, ${loc.address?.addressRegion}`
-            ).join('; '),
-            applyUrl: job.apply?.applyUrl
-        }, 'Monster'));
+            const resp = await page.goto(searchUrl, {
+                waitUntil: 'domcontentloaded',
+                timeout: 45000,
+            });
+            await sleep(4000 + Math.random() * 2000);
 
-        // Filter out duplicates based on URL
-        let newJobsCount = 0;
-        for (const job of extractedJobs) {
-            const jobUrl = job.job?.url || '';
-            if (!seenUrls.has(jobUrl) && jobUrl !== 'N/A' && jobUrl !== '') {
-                seenUrls.add(jobUrl);
-                allJobs.push(job);
-                newJobsCount++;
-                
+            if (resp && resp.status() >= 400) {
+                throw new Error(`Search page returned ${resp.status()} on page ${pageNum}`);
+            }
+
+            const rawJobs = await extractJobsFromCurrentPage(page);
+            let newCount = 0;
+            for (const j of rawJobs) {
+                if (!j.url || seenUrls.has(j.url)) continue;
+                seenUrls.add(j.url);
+
+                allJobs.push(normalizeJobData({
+                    title: j.title,
+                    url: j.url,
+                    description: j.description,
+                    datePosted: j.datePosted,
+                    hiringOrganization: j.company,
+                    jobLocation: j.location,
+                }, 'Monster'));
+                newCount++;
                 if (allJobs.length >= maxJobs) break;
             }
-        }
+            log.info(`Page ${pageNum}: ${rawJobs.length} cards on page, ${newCount} new unique, total: ${allJobs.length}`);
 
-        offset += 18;
-
-        log.info(`Fetched ${jobs.length} jobs, ${newJobsCount} new unique jobs, total unique: ${allJobs.length}`);
-
-        // If we got no new jobs, increment counter
-        if (newJobsCount === 0) {
-            consecutiveEmptyPages++;
-            // Stop if we've seen 3 consecutive pages with no new jobs
-            if (consecutiveEmptyPages >= 3) {
-                log.info('No new unique jobs found in last 3 pages. Stopping...');
-                break;
+            if (newCount === 0) {
+                consecutiveEmptyPages++;
+                if (consecutiveEmptyPages >= 2) {
+                    log.info('No new jobs across 2 consecutive pages — search exhausted.');
+                    break;
+                }
+            } else {
+                consecutiveEmptyPages = 0;
             }
-        } else {
-            consecutiveEmptyPages = 0;
         }
 
-        if (allJobs.length >= maxJobs) break;
-    }
-
-    const jobsToReturn = allJobs.slice(0, maxJobs);
-    log.info(`Completed! Found ${jobsToReturn.length} unique jobs`);
-
-    await apiClient.reportSuccess('monster', `Scraped ${jobsToReturn.length} jobs successfully`);
-    return jobsToReturn;
-    } catch (error) {
-        // 403 + DataDome captcha redirect means the credential is burned.
-        // Cool it down 30 min so we don't keep hammering with a known-bad
-        // cookie set; another credential (if uploaded) gets a chance.
-        const msg = String(error?.message || error);
-        if (msg.includes('403') || msg.toLowerCase().includes('captcha') || msg.includes('Forbidden')) {
-            await apiClient.reportFailure('monster', `DataDome block: ${msg}`, 30);
-        } else {
-            await apiClient.reportFailure('monster', `Scrape error: ${msg}`, 0);
-        }
-        throw error;
+        const jobsToReturn = allJobs.slice(0, maxJobs);
+        log.info(`Completed! Found ${jobsToReturn.length} unique jobs`);
+        return jobsToReturn;
+    } finally {
+        try { await browser.close(); } catch { /* already closed */ }
     }
 }
