@@ -106,14 +106,52 @@ export class QueueOrchestrator {
      * (with `assignments` array) or null/empty result for an empty
      * queue. The caller (runOnce) is responsible for firing each
      * assignment fire-and-forget once the mutex is released.
+     *
+     * Pre-flight: ask the backend which platforms have leasable
+     * credentials RIGHT NOW. Pass that as a runtime filter on the
+     * claim, so we don't claim work for platforms whose creds are out
+     * of stock. Without this, a starved platform causes the orchestrator
+     * to claim → fail-on-null-lease → submit failed → re-poll → claim
+     * again, spamming thousands of failed sessions (observed 36k in 2h
+     * with 1 starved Indeed cred).
      */
     async #claim() {
         const metrics = getMetrics();
         log.info('Starting queue cycle');
 
+        let usablePlatforms = null;
+        try {
+            const availability = await this.client.checkCredentialAvailability();
+            // Platforms with > 0 leasable creds (999 marks public/no-auth).
+            usablePlatforms = Object.entries(availability)
+                .filter(([, n]) => n > 0)
+                .map(([p]) => p);
+            if (usablePlatforms.length === 0) {
+                log.info('No credentials available for any platform — skipping claim', {
+                    availability,
+                });
+                metrics.recordQueueCheck('no_creds');
+                return { assignments: [] };
+            }
+            const starved = Object.entries(availability)
+                .filter(([, n]) => n === 0)
+                .map(([p]) => p);
+            if (starved.length > 0) {
+                log.info('Platforms starved this cycle — excluded from claim', { starved });
+            }
+        } catch (error) {
+            // Don't block the claim if the availability check fails —
+            // fall back to old behaviour (let the backend filter only
+            // by static allowlist). Log so it's visible.
+            log.warn('Credential availability pre-flight failed; falling back to static allowlist', {
+                err: error.message,
+            });
+            usablePlatforms = null;
+        }
+
         let queueResult;
         try {
-            queueResult = await this.client.getNextRole();
+            queueResult = await this.client.getNextRole({ platforms: usablePlatforms });
         } catch (error) {
             metrics.recordQueueCheck('error');
             throw error;
@@ -215,9 +253,22 @@ export class QueueOrchestrator {
                     },
                 };
             } catch (error) {
-                log.error('Platform scrape failed', { platform: platformName, err: error.message });
-                await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message);
-                metrics.recordJobsSubmitted(platformName, 'failed', 0);
+                // Race-window: scraper acquired no credential between
+                // orchestrator pre-flight and acquire(). Distinct from a
+                // real scrape failure — log at info, tag the metric so
+                // dashboards don't conflate it with real platform
+                // failures (e.g. captcha, timeout).
+                if (error.skipNoCreds) {
+                    log.info('Platform skipped — no credentials (race with pre-flight)', {
+                        platform: platformName,
+                    });
+                    await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message);
+                    metrics.recordJobsSubmitted(platformName, 'no_creds', 0);
+                } else {
+                    log.error('Platform scrape failed', { platform: platformName, err: error.message });
+                    await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message);
+                    metrics.recordJobsSubmitted(platformName, 'failed', 0);
+                }
                 triggerNextPoll();
                 return { platformName, result: { success: false, error: error.message } };
             }

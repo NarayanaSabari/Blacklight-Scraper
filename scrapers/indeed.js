@@ -552,7 +552,16 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
     const apiClient = getCredentialsAPIClient();
     const lease = await apiClient.acquire('indeed', sessionId);
     if (!lease) {
-        throw new Error('No Indeed credentials available from API');
+        // Race-window fallback: orchestrator's pre-flight should have
+        // excluded indeed from the claim if no creds were free, but the
+        // last cred can disappear between check and acquire (concurrent
+        // scraper grabbed it first). Tag the error so the orchestrator
+        // submits status='skipped' (not 'failed') and the role goes
+        // back to the queue cleanly — no credential burn, no false
+        // failure metric.
+        const err = new Error('No Indeed credentials available from API');
+        err.skipNoCreds = true;
+        throw err;
     }
     const credential = lease.credential;
     const cookies = loadCookies(credential);

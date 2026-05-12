@@ -64,7 +64,7 @@ export class BlacklightApiClient {
         return this.#request('GET', '/api/scraper/queue/current-session');
     }
 
-    async getNextRole() {
+    async getNextRole({ platforms = null } = {}) {
         // Per-platform queue model. Returns:
         //   { assignments: [
         //       { session_id, role: {...}, platforms: [...] },
@@ -75,8 +75,41 @@ export class BlacklightApiClient {
         // across the entire queue, possibly spanning multiple roles.
         // Returns null if the queue has no claimable pairs for this
         // scraper (HTTP 204 → _empty marker from #request).
-        const result = await this.#request('GET', '/api/scraper/queue/next-role');
+        //
+        // `platforms` is an optional runtime filter from the
+        // orchestrator's credential-availability pre-flight. When set,
+        // the backend takes static_allowlist ∩ this list as the
+        // effective allowlist for THIS claim only. Skips platforms
+        // whose creds are out of stock without backend-config changes.
+        let path = '/api/scraper/queue/next-role';
+        if (Array.isArray(platforms) && platforms.length > 0) {
+            path += `?platforms=${encodeURIComponent(platforms.join(','))}`;
+        }
+        const result = await this.#request('GET', path);
         return result._empty ? null : result;
+    }
+
+    async checkCredentialAvailability() {
+        // Pre-flight before claiming a role. Returns leasable-credential
+        // counts per active platform:
+        //   { indeed: 2, linkedin: 1, glassdoor: 999, ... }
+        // 999 means "no auth required for this platform". 0 means
+        // exclude it from the next claim. See the backend's
+        // /api/scraper-credentials/queue/availability docstring for
+        // why this exists (spam-prevention on credential-starved
+        // platforms).
+        const url = `${this.apiUrl}/api/scraper-credentials/queue/availability`;
+        const response = await requestWithRetry(url, {
+            method: 'GET',
+            headers: this.headers,
+        });
+        if (!response.ok) {
+            throw new NetworkError(
+                `Credential availability check → ${response.status} ${response.statusText}`,
+                { statusCode: response.status },
+            );
+        }
+        return response.json();
     }
 
     async submitJobs(sessionId, platform, jobs, status = 'success', errorMessage = null) {
