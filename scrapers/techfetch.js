@@ -229,36 +229,59 @@ class TechFetchScraper {
         return this.cookies.map(c => `${c.name}=${c.value}`).join('; ');
     }
 
-    async fetchPageWithBrowser(pageNum, retryCount = 0) {
-        const maxRetries = 3;
-        
-        try {
-            logProgress('TechFetch', `Fetching page ${pageNum}...${retryCount > 0 ? ` (retry ${retryCount}/${maxRetries})` : ''}`);
-            
-            const url = `https://www.techfetch.com/js/ajs_job_list.aspx?From=${pageNum}`;
-            logProgress('TechFetch', `URL: ${url}`);
-            
-            // Add delay before retry attempts
-            if (retryCount > 0) {
-                const delay = 3000 * Math.pow(2, retryCount - 1);
-                await new Promise(resolve => setTimeout(resolve, delay));
-            }
-            
-            const response = await this.page.goto(url, {
-                waitUntil: 'domcontentloaded',
-                timeout: 60000
-            });
+    // Fetch the rendered HTML for a given pagination page.
+    //
+    // Previously navigated directly to ajs_job_list.aspx?From=N which
+    // is an AJAX fragment endpoint, not a standalone page. Direct
+    // navigation lost the session state, so pages 2+ flaked out 2/3 of
+    // the time ("No more jobs found" in <200ms even when results
+    // existed). The page itself paginates via an in-place AJAX call:
+    //   href="javascript:LoadJobs('/js/ajs_job_list.aspx?From=2')"
+    // so we replay the SAME call via page.evaluate while staying on
+    // js_job_list.aspx — session state intact, results consistent.
+    async fetchPageWithBrowser(pageNum) {
+        logProgress('TechFetch', `Fetching page ${pageNum}...`);
 
-            const html = await response.text();
-            
-            return html;
-        } catch (error) {
-            if (this.isNetworkError(error) && retryCount < maxRetries) {
-                logProgress('TechFetch', `   ⚠️  Network error fetching page ${pageNum}, retrying (${retryCount + 1}/${maxRetries}): ${error.message.split('\n')[0]}`);
-                return this.fetchPageWithBrowser(pageNum, retryCount + 1);
+        if (pageNum === 1) {
+            // search() already submitted the form, which loaded
+            // js_job_list.aspx + auto-fired the initial LoadJobs AJAX.
+            // Wait for the first job div to render, then snapshot.
+            try {
+                await this.page.waitForSelector('[id*="_divJob"]', { timeout: 15000 });
+            } catch {
+                // No jobs at all — let extractJobs report 0 below.
             }
-            throw error;
+            return await this.page.content();
         }
+
+        // The ASP.NET-generated container ids (ctl09_divJob...) stay
+        // stable across paginations — only the inner content changes.
+        // So we snapshot the FIRST JOB'S TITLE LINK href instead, and
+        // wait for that to flip. Every job links to a unique URL so a
+        // change there is a reliable "content swapped" signal.
+        const previousFirstHref = await this.page.evaluate(() => {
+            const titleA = document.querySelector('[id*="_divJob"] [id*="_lblTitle"] a');
+            return titleA ? titleA.href : null;
+        });
+
+        // Call the page's own pagination function. It internally
+        // fetches ajs_job_list.aspx and swaps the job-list DOM.
+        await this.page.evaluate((n) => {
+            if (typeof window.LoadJobs === 'function') {
+                window.LoadJobs(`/js/ajs_job_list.aspx?From=${n}`);
+            }
+        }, pageNum);
+
+        try {
+            await this.page.waitForFunction((prev) => {
+                const titleA = document.querySelector('[id*="_divJob"] [id*="_lblTitle"] a');
+                return titleA && titleA.href !== prev;
+            }, previousFirstHref, { timeout: 12000 });
+        } catch {
+            logProgress('TechFetch', `   ⚠️  Page ${pageNum}: content didn't swap within 12s — likely end of results`);
+        }
+
+        return await this.page.content();
     }
 
     async extractJobDetails(jobLink, retryCount = 0, page = null) {
@@ -619,17 +642,29 @@ class TechFetchScraper {
         const allJobs = [];
         const maxJobs = 50;
         let totalScraped = 0;
+        // jobLink is unique per posting; track across pages so we can
+        // detect a stale-page response (LoadJobs() returned the same
+        // results) and break out instead of detail-fetching duplicates.
+        const seenLinks = new Set();
 
         for (let page = 1; page <= maxPages; page++) {
             try {
                 const html = await this.fetchPageWithBrowser(page);
-                const jobs = this.extractJobs(html);
-                
+                const allExtracted = this.extractJobs(html);
+
+                // Dedup against pages we've already processed.
+                const jobs = allExtracted.filter(j => {
+                    if (!j.jobLink || seenLinks.has(j.jobLink)) return false;
+                    seenLinks.add(j.jobLink);
+                    return true;
+                });
+
                 if (jobs.length === 0) {
-                    logProgress('TechFetch', `⚠️  No more jobs found on page ${page}`);
+                    logProgress('TechFetch',
+                        `⚠️  No new jobs on page ${page} (${allExtracted.length} extracted, all duplicates) — end of results`);
                     break;
                 }
-                
+
                 totalScraped += jobs.length;
                 
                 // Fetch additional details for each job if requested.
