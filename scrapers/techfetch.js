@@ -599,70 +599,12 @@ class TechFetchScraper {
         return jobs;
     }
 
-    // Helper method to check if job location matches the search location
-    matchesLocation(jobLocation, searchLocation) {
-        if (!searchLocation || searchLocation.trim() === '') {
-            return true; // No location filter, all jobs match
-        }
-        
-        if (!jobLocation || jobLocation === 'N/A') {
-            return true; // Include jobs with unknown location (might be remote)
-        }
-        
-        const searchLower = searchLocation.toLowerCase().trim();
-        const jobLower = jobLocation.toLowerCase().trim();
-        
-        // State name to abbreviation mapping
-        const stateMap = {
-            'alabama': 'al', 'alaska': 'ak', 'arizona': 'az', 'arkansas': 'ar',
-            'california': 'ca', 'colorado': 'co', 'connecticut': 'ct', 'delaware': 'de',
-            'florida': 'fl', 'georgia': 'ga', 'hawaii': 'hi', 'idaho': 'id',
-            'illinois': 'il', 'indiana': 'in', 'iowa': 'ia', 'kansas': 'ks',
-            'kentucky': 'ky', 'louisiana': 'la', 'maine': 'me', 'maryland': 'md',
-            'massachusetts': 'ma', 'michigan': 'mi', 'minnesota': 'mn', 'mississippi': 'ms',
-            'missouri': 'mo', 'montana': 'mt', 'nebraska': 'ne', 'nevada': 'nv',
-            'new hampshire': 'nh', 'new jersey': 'nj', 'new mexico': 'nm', 'new york': 'ny',
-            'north carolina': 'nc', 'north dakota': 'nd', 'ohio': 'oh', 'oklahoma': 'ok',
-            'oregon': 'or', 'pennsylvania': 'pa', 'rhode island': 'ri', 'south carolina': 'sc',
-            'south dakota': 'sd', 'tennessee': 'tn', 'texas': 'tx', 'utah': 'ut',
-            'vermont': 'vt', 'virginia': 'va', 'washington': 'wa', 'west virginia': 'wv',
-            'wisconsin': 'wi', 'wyoming': 'wy', 'district of columbia': 'dc'
-        };
-        
-        // Reverse mapping (abbreviation to full name)
-        const abbrevToState = Object.fromEntries(
-            Object.entries(stateMap).map(([k, v]) => [v, k])
-        );
-        
-        // Check for "remote" jobs - always include them
-        if (jobLower.includes('remote') || jobLower.includes('work from home')) {
-            return true;
-        }
-        
-        // Direct match
-        if (jobLower.includes(searchLower)) {
-            return true;
-        }
-        
-        // Check if search is a state name, match against abbreviation
-        if (stateMap[searchLower]) {
-            const abbrev = stateMap[searchLower];
-            // Match patterns like "City, CA" or "CA" at end
-            if (jobLower.includes(`, ${abbrev}`) || jobLower.endsWith(` ${abbrev}`)) {
-                return true;
-            }
-        }
-        
-        // Check if search is a state abbreviation, match against full name
-        if (abbrevToState[searchLower]) {
-            const fullName = abbrevToState[searchLower];
-            if (jobLower.includes(fullName)) {
-                return true;
-            }
-        }
-        
-        return false;
-    }
+    // matchesLocation() and the location filter on the result set have
+    // been removed — TechFetch is a US-focused board so every posting
+    // is implicitly US-based. The previous client-side filter was
+    // throwing away ~77% of search results (e.g. "Senior Java Dev / US"
+    // returned 100 results, filter kept only 23), wasting detail-page
+    // bandwidth on jobs we'd discard. Now we keep them all.
 
     async scrapeJobs(keywords, location, maxPages = 2, includeDetails = true) {
         await this.initialize();
@@ -677,8 +619,7 @@ class TechFetchScraper {
         const allJobs = [];
         const maxJobs = 30;
         let totalScraped = 0;
-        let totalFiltered = 0;
-        
+
         for (let page = 1; page <= maxPages; page++) {
             try {
                 const html = await this.fetchPageWithBrowser(page);
@@ -740,20 +681,8 @@ class TechFetchScraper {
                     await Promise.all(Array.from({ length: concurrency }, () => worker()));
                 }
                 
-                // Filter jobs by location if specified
-                const filteredJobs = location 
-                    ? jobs.filter(job => this.matchesLocation(job.location, location))
-                    : jobs;
-                
-                const filteredOut = jobs.length - filteredJobs.length;
-                totalFiltered += filteredOut;
-                
-                if (location && filteredOut > 0) {
-                    logProgress('TechFetch', `   📍 Location filter: ${filteredJobs.length}/${jobs.length} jobs match "${location}"`);
-                }
-                
-                allJobs.push(...filteredJobs);
-                logProgress('TechFetch', `✅ Extracted ${filteredJobs.length} jobs from page ${page} (Total: ${allJobs.length})`);
+                allJobs.push(...jobs);
+                logProgress('TechFetch', `✅ Extracted ${jobs.length} jobs from page ${page} (Total: ${allJobs.length})`);
                 
                 // Stop if we've reached the job limit
                 if (allJobs.length >= maxJobs) {
@@ -773,10 +702,7 @@ class TechFetchScraper {
             }
         }
 
-        logProgress('TechFetch', '🎉 Scraping complete!');
-        if (location && totalFiltered > 0) {
-            logProgress('TechFetch', `📊 Summary: ${allJobs.length} jobs match "${location}" (filtered out ${totalFiltered} from ${totalScraped} total)`);
-        }
+        logProgress('TechFetch', `🎉 Scraping complete! Total ${allJobs.length} jobs (${totalScraped} scraped pre-cap)`);
         logProgress('TechFetch', '🔄 Closing browser...');
         await this.browser.close();
         
