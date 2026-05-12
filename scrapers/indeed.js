@@ -1,15 +1,37 @@
 // Indeed Job Scraper Module
 //
 // Uses CloakBrowser — stealth Chromium with source-level C++ fingerprint
-// patches. Anonymous fresh launches load Indeed's search results without
-// the Cloudflare wall that vanilla Playwright (and even Playwright+
-// stealth) hit. Eliminates the CDP/cookie/credential machinery that the
-// previous CDP-attach approach required.
+// patches — combined with cookie-based auth from the credentials API.
+//
+// Why auth: anonymous Indeed caps at page 1 (~16 cards per role). Any
+// pagination attempt — direct &start=10 or clicking "Next page" —
+// bounces to the Sign-In page. Logged-in sessions get the full 5-page
+// /50-job pagination. Confirmed via cloak-indeed-paginate probes.
+//
+// Why CloakBrowser (not CDP+Playwright): the previous CDP-attach
+// approach reused a manually-logged-in real Chrome to pass Cloudflare,
+// but was fragile (manual `chrome:login`, single-browser bottleneck
+// with LinkedIn, broke whenever the user closed Chrome). CloakBrowser's
+// stealth Chromium + injected cookies passes Cloudflare from a fresh
+// headless launch, restoring scalability.
+//
+// Three combination knobs matter for getting past Cloudflare:
+//   1. humanize:true at launch — Cloudflare scores behavioral signals
+//      (timing, mouse curves) in addition to fingerprints. Without it
+//      we get "Additional Verification Required" / Ray ID page.
+//   2. NO homepage warmup — visiting https://www.indeed.com first
+//      causes a regional redirect (in.indeed.com from Indian IPs)
+//      which then makes the navigation back to www.indeed.com look
+//      suspicious to Cloudflare. Go directly to the search URL.
+//   3. waitUntil:'load' + ~10s post-nav wait — Cloudflare's challenge
+//      JS needs time to run and post the clearance token. Without it
+//      the page resolves while still on the challenge page.
 import * as cheerio from 'cheerio';
 import { launch } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
+import { getCredentialsAPIClient } from '../src/api/credentials.js';
 
 const log = createLogger('indeed');
 const logProgress = (_scope, msg) => log.info(msg);
@@ -520,15 +542,22 @@ async function extractJobDetailsInParallel(context, jobs, concurrentTabs) {
 export async function scrapeIndeed(jobTitle, location, sessionId = null) {
     logProgress('Indeed', `Searching for "${jobTitle}" in "${location}"`);
 
-    // sessionId is kept for orchestrator compatibility; CloakBrowser
-    // anonymous launches don't need credentials.
-    void sessionId;
+    // Lease an Indeed credential — required for pagination beyond page 1.
+    const apiClient = getCredentialsAPIClient();
+    const credential = await apiClient.getCredential('indeed', sessionId);
+    if (!credential) {
+        throw new Error('No Indeed credentials available from API');
+    }
+    const cookies = loadCookies(credential);
+    logProgress('Indeed', `Acquired credential (${cookies.length} cookies)`);
 
     const domain = getIndeedDomain(location);
     logProgress('Indeed', `Using domain: ${domain}`);
     logProgress('Indeed', `🚀 Launching CloakBrowser stealth Chromium...`);
 
-    const browser = await launch({ headless: true });
+    // humanize:true is required — Cloudflare/Akamai score behavioral
+    // signals separately from fingerprints. See module header.
+    const browser = await launch({ headless: true, humanize: true });
     logProgress('Indeed', `✅ CloakBrowser ready`);
 
     const context = await browser.newContext({
@@ -536,21 +565,30 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         locale: 'en-US',
         timezoneId: 'America/New_York',
     });
+
+    // Inject cookies before opening any page. Per-cookie retry: a single
+    // malformed entry from a cookie export shouldn't take down the whole
+    // batch (seen with `expirationDate` shape drift in older exports).
+    let cookiesAdded = 0;
+    try {
+        await context.addCookies(cookies);
+        cookiesAdded = cookies.length;
+    } catch (bulkErr) {
+        logProgress('Indeed', `Bulk addCookies failed (${bulkErr.message}) — falling back to per-cookie`);
+        for (const c of cookies) {
+            try { await context.addCookies([c]); cookiesAdded++; } catch { /* skip bad cookie */ }
+        }
+    }
+    logProgress('Indeed', `Cookies injected: ${cookiesAdded}/${cookies.length}`);
+
     const page = await context.newPage();
     let loginSuccess = false;
 
     try {
-        // Navigate to Indeed homepage first to establish session
-        logProgress('Indeed', 'Establishing session...');
-        await page.goto(`https://${domain}`, { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 60000 
-        });
-        await page.waitForTimeout(humanDelay(2000, 4000));
-        
-        // Close any initial popups
-        await closePopups(page);
-        
+        // No homepage warmup — visiting https://www.indeed.com triggers
+        // a regional redirect (e.g. in.indeed.com from Indian IPs), which
+        // then makes the navigation back to www.indeed.com look bot-like
+        // to Cloudflare. Probe confirmed direct-to-search returns 200.
         loginSuccess = true;
 
         const allJobs = [];
@@ -562,12 +600,15 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
             const searchUrl = buildSearchUrl(domain, jobTitle, location, start);
             
             logProgress('Indeed', `Fetching page ${pageNum + 1}: ${searchUrl}`);
-            
-            await page.goto(searchUrl, { 
-                waitUntil: 'domcontentloaded', 
-                timeout: 60000 
+
+            // waitUntil:'load' gives Cloudflare's JS challenge time to run.
+            // domcontentloaded fires while still on the challenge page and
+            // we end up parsing the "Additional Verification Required" page.
+            await page.goto(searchUrl, {
+                waitUntil: 'load',
+                timeout: 60000
             });
-            await page.waitForTimeout(humanDelay(3000, 5000));
+            await page.waitForTimeout(humanDelay(8000, 12000));
             
             // Close any popups
             await closePopups(page);
@@ -636,13 +677,29 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         try { await browser.close(); } catch { /* already closed */ }
         logProgress('Indeed', `Completed! Found ${normalizedJobs.length} jobs with details`);
 
+        await apiClient.reportSuccess('indeed', `Scraped ${normalizedJobs.length} jobs successfully`);
+
         return normalizedJobs;
 
     } catch (error) {
-        // No credentials to release — CloakBrowser anonymous launches
-        // are stateless. Just close the browser and re-throw.
         try { await browser.close(); } catch { /* already closed */ }
-        void loginSuccess;
+
+        // Map error to a cooldown so a flaky cookie doesn't keep getting
+        // handed out to fresh scrape sessions. Cooldowns from prior CDP-
+        // path: auth=0min (cookie immediately re-checked next acquire),
+        // rate-limit=60min (back off this IP/cookie pair), other=30min.
+        const msg = error.message || '';
+        if (!loginSuccess) {
+            if (/cookie|login|auth|sign in/i.test(msg)) {
+                await apiClient.reportFailure('indeed', `Authentication failed: ${msg}`, 0);
+            } else if (/rate limit|blocked|captcha|cloudflare|verification/i.test(msg)) {
+                await apiClient.reportFailure('indeed', `Rate limited or blocked: ${msg}`, 60);
+            } else {
+                await apiClient.reportFailure('indeed', `Scraping error: ${msg}`, 30);
+            }
+        } else {
+            await apiClient.reportFailure('indeed', `Scraping error after login: ${msg}`, 30);
+        }
         throw error;
     }
 }
