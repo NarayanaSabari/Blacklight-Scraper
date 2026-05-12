@@ -3,17 +3,57 @@ import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { humanDelay } from '../src/core/delays.js';
 import { stripHtmlTags } from '../src/core/html.js';
+import { getCredentialsAPIClient } from '../src/api/credentials.js';
 
 const log = createLogger('monster');
 
 // Public Monster.com web-app constants — reverse-engineered from the
-// browser frontend. These aren't secrets; they're the same values every
-// monster.com visitor sends. Inlined so the scraper needs zero config.
+// browser frontend. Inlined so the scraper needs zero config.
 const MONSTER_API_KEY = 'hkp1igv13sjt7ltv5kfdhjpj';
-const MONSTER_DATADOME_CLIENT_ID = 'jcq2Bhd0iT8Ca3HzJ1r21Z_reNQ3HUjjnRSB7lKP2LuvVcLndhl3yFVrADzdIyMCeOkSQ0uvT1DThly2wkEJZAWZYjvAP480CIP8LYqtI9z9fEtKaiIEkm1LbnGycdM6';
 
-export async function scrapeMonster(jobTitle, location) {
+// Static fallback clientid header, used when the credential doesn't
+// supply a fresh one. DataDome accepts a request if EITHER the
+// clientid header is in a validated state OR the `datadome` cookie
+// (from the credential's cookies array) is fresh. Once both go stale
+// the API starts returning 403 + redirect to captcha-delivery.com —
+// fix is to refresh the cookies in the DB credential, no redeploy needed.
+const MONSTER_DATADOME_CLIENT_ID_FALLBACK = 'jcq2Bhd0iT8Ca3HzJ1r21Z_reNQ3HUjjnRSB7lKP2LuvVcLndhl3yFVrADzdIyMCeOkSQ0uvT1DThly2wkEJZAWZYjvAP480CIP8LYqtI9z9fEtKaiIEkm1LbnGycdM6';
+
+/**
+ * Convert a credential's stored cookies (array of {name, value, …})
+ * into a "name=value; name=value; …" Cookie HTTP header string.
+ */
+function buildCookieHeader(credential) {
+    if (!credential) return '';
+    const cookies = Array.isArray(credential.credentials)
+        ? credential.credentials
+        : Array.isArray(credential.cookies)
+            ? credential.cookies
+            : [];
+    return cookies
+        .filter((c) => c?.name && c?.value)
+        .map((c) => `${c.name}=${c.value}`)
+        .join('; ');
+}
+
+export async function scrapeMonster(jobTitle, location, sessionId = null) {
     log.info(`Searching for "${jobTitle}" in "${location}"`);
+
+    // Fetch credential from API. Required — the static fallback alone
+    // is no longer enough for DataDome; we need the matching datadome
+    // cookie + clientid from a real recent browser session.
+    const apiClient = getCredentialsAPIClient();
+    const credential = await apiClient.getCredential('monster', sessionId);
+    if (!credential) {
+        throw new Error('No Monster credentials available from API');
+    }
+
+    const cookieHeader = buildCookieHeader(credential);
+    // Credential can carry a fresh clientid in `credential.clientid`
+    // (set when the cookie set was scraped from a browser). If absent,
+    // fall back to the static one — works while DataDome hasn't flagged it.
+    const clientid = credential.clientid || MONSTER_DATADOME_CLIENT_ID_FALLBACK;
+    log.info(`Loaded credential ${credential.id} (${cookieHeader.split('; ').length} cookies)`);
 
     const apiUrl = `https://appsapi.monster.io/jobs-svx-service/v2/monster/search-jobs/samsearch/en-US?apikey=${MONSTER_API_KEY}`;
 
@@ -32,8 +72,11 @@ export async function scrapeMonster(jobTitle, location) {
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'cross-site',
         'user-agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36 Edg/143.0.0.0',
-        'x-datadome-clientid': MONSTER_DATADOME_CLIENT_ID,
+        'x-datadome-clientid': clientid,
     };
+    if (cookieHeader) {
+        headers['cookie'] = cookieHeader;
+    }
 
     let country = 'us';
     let address = location;
@@ -76,6 +119,7 @@ export async function scrapeMonster(jobTitle, location) {
     const maxJobs = 100;
     let consecutiveEmptyPages = 0;
 
+    try {
     while (allJobs.length < maxJobs) {
         const data = { ...baseData, offset };
         
@@ -161,6 +205,19 @@ export async function scrapeMonster(jobTitle, location) {
 
     const jobsToReturn = allJobs.slice(0, maxJobs);
     log.info(`Completed! Found ${jobsToReturn.length} unique jobs`);
-    
+
+    await apiClient.reportSuccess('monster', `Scraped ${jobsToReturn.length} jobs successfully`);
     return jobsToReturn;
+    } catch (error) {
+        // 403 + DataDome captcha redirect means the credential is burned.
+        // Cool it down 30 min so we don't keep hammering with a known-bad
+        // cookie set; another credential (if uploaded) gets a chance.
+        const msg = String(error?.message || error);
+        if (msg.includes('403') || msg.toLowerCase().includes('captcha') || msg.includes('Forbidden')) {
+            await apiClient.reportFailure('monster', `DataDome block: ${msg}`, 30);
+        } else {
+            await apiClient.reportFailure('monster', `Scrape error: ${msg}`, 0);
+        }
+        throw error;
+    }
 }
