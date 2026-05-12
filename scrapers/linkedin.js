@@ -658,12 +658,15 @@ async function extractPosts(page, maxPosts) {
         const posts = await page.evaluate((config) => {
             const isSearchPage = window.location.href.includes('/search/results/content/');
 
-            // Primary post-container selector (search page).
-            // For non-search pages, fall back to any expanded-prefixed
-            // componentkey under <main> (the structure pattern is the
-            // same; only the FeedType suffix differs).
+            // LinkedIn A/B-tests two DOM layouts. Some accounts see the
+            // NEW DOM (componentkey-based, May 2026), others still see
+            // the LEGACY DOM (class-based: .feed-shared-update-v2 etc.).
+            // We try the new selector first; if it returns 0 elements
+            // we fall back to extracting from the legacy DOM.
             const SEARCH_SELECTOR = 'main div[componentkey^="expanded"][componentkey$="FLAGSHIP_SEARCH"]';
             const FALLBACK_SELECTOR = 'main div[componentkey^="expanded"]';
+            const LEGACY_SEARCH_SELECTOR = '.reusable-search__result-container, .feed-shared-update-v2';
+            const LEGACY_FEED_SELECTOR = '.feed-shared-update-v2';
 
             let postElements = document.querySelectorAll(
                 isSearchPage ? SEARCH_SELECTOR : FALLBACK_SELECTOR
@@ -671,10 +674,152 @@ async function extractPosts(page, maxPosts) {
             if (postElements.length === 0) {
                 postElements = document.querySelectorAll(FALLBACK_SELECTOR);
             }
+            let useLegacyDOM = postElements.length === 0;
+            if (useLegacyDOM) {
+                postElements = document.querySelectorAll(
+                    isSearchPage ? LEGACY_SEARCH_SELECTOR : LEGACY_FEED_SELECTOR
+                );
+            }
 
             const results = [];
-            const debugInfo = { sampleLinks: [], foundIds: [] };
+            const debugInfo = { sampleLinks: [], foundIds: [], dom: useLegacyDOM ? 'legacy' : 'new' };
             const seenInRun = new Set(); // per-page dedup (each post renders 2x)
+
+            // ─── LEGACY DOM extractor (pre-May 2026 class-based layout) ───
+            // Runs when componentkey selectors find nothing — typically when
+            // the user's LinkedIn account is on the old A/B-test branch.
+            if (useLegacyDOM) {
+                postElements.forEach((element, index) => {
+                    try {
+                        if (element.querySelector('a[href*="/jobs/view/"]')) return;
+
+                        // Post ID: prefer data-urn (activity:NNN), else hash from links
+                        let postId = null;
+                        const containerUrn = element.getAttribute('data-urn');
+                        if (containerUrn && containerUrn.includes('activity:')) {
+                            const m = containerUrn.match(/activity:([^:,\s)]+)/);
+                            if (m) postId = m[1];
+                        }
+                        if (!postId) {
+                            const inner = element.querySelectorAll('[data-urn], [data-id]');
+                            for (const el of inner) {
+                                const urn = el.getAttribute('data-urn') || el.getAttribute('data-id');
+                                if (urn && urn.includes('activity:')) {
+                                    const m = urn.match(/activity:([^:,\s)]+)/);
+                                    if (m) { postId = m[1]; break; }
+                                }
+                            }
+                        }
+                        if (!postId) {
+                            const links = element.querySelectorAll('a[href]');
+                            for (const link of links) {
+                                const href = link.getAttribute('href') || '';
+                                const m = href.match(/(?:activity[:-])(\d{19})/);
+                                if (m) { postId = m[1]; break; }
+                            }
+                        }
+                        if (!postId) postId = 'post_' + Math.random().toString(36).slice(2, 11);
+                        if (seenInRun.has(postId)) return;
+                        seenInRun.add(postId);
+
+                        // Author name (try several legacy selectors)
+                        let authorName = '';
+                        for (const sel of [
+                            '.update-components-actor__name',
+                            '.feed-shared-actor__name',
+                            '.update-components-actor__title',
+                            'span.update-components-actor__name span[aria-hidden="true"]',
+                            'span[dir="ltr"]',
+                        ]) {
+                            const el = element.querySelector(sel);
+                            const t = el?.textContent?.trim();
+                            if (t && t.length > 2) { authorName = t; break; }
+                        }
+
+                        // Author profile URL
+                        let authorProfileUrl = '';
+                        for (const sel of [
+                            '.update-components-actor__container a[href*="/in/"]',
+                            '.feed-shared-actor a[href*="/in/"]',
+                            'a.app-aware-link[href*="/in/"]',
+                        ]) {
+                            const a = element.querySelector(sel);
+                            if (a?.href?.includes('/in/')) { authorProfileUrl = a.href.split('?')[0]; break; }
+                        }
+
+                        // Post content
+                        let postContent = '';
+                        for (const sel of [
+                            '.feed-shared-update-v2__description',
+                            '.update-components-text',
+                            '.feed-shared-text',
+                            '.update-components-update-v2__commentary',
+                            '.feed-shared-update-v2__commentary',
+                            '.feed-shared-inline-show-more-text',
+                            'div[dir="ltr"]',
+                        ]) {
+                            const el = element.querySelector(sel);
+                            const t = el?.textContent?.trim();
+                            if (t && t.length > 20) { postContent = t; break; }
+                        }
+
+                        // Timestamp
+                        let timestamp = '';
+                        for (const sel of [
+                            '.update-components-actor__sub-description',
+                            '.feed-shared-actor__sub-description',
+                            'time',
+                            '[datetime]',
+                        ]) {
+                            const el = element.querySelector(sel);
+                            if (el) {
+                                timestamp = el.getAttribute('datetime') || el.textContent?.trim() || '';
+                                if (timestamp) break;
+                            }
+                        }
+
+                        // Post URL — try timestamp link, then dedicated selectors
+                        let postUrl = '';
+                        const tsLink = element.querySelector(
+                            '.update-components-actor__sub-description a, ' +
+                            '.feed-shared-actor__sub-description a, ' +
+                            'time a, ' +
+                            'a.app-aware-link[href*="activity"]'
+                        );
+                        if (tsLink?.href?.includes('activity')) {
+                            postUrl = tsLink.href.split('?')[0];
+                        }
+                        if (!postUrl && postId && !postId.startsWith('post_')) {
+                            postUrl = `https://www.linkedin.com/feed/update/urn:li:activity:${postId}`;
+                        }
+
+                        if (debugInfo.foundIds.length === 0) {
+                            debugInfo.foundIds.push({
+                                postId: postId.slice(0, 30),
+                                hasUrl: !!postUrl,
+                                author: authorName,
+                                contentLen: postContent.length,
+                            });
+                        }
+
+                        const contentHash = postContent.substring(0, 100) + authorName;
+                        if (authorName && postContent && postContent.length > 20) {
+                            results.push({
+                                id: postId,
+                                author: authorName,
+                                authorProfileUrl,
+                                content: postContent,
+                                timestamp,
+                                postUrl,
+                                contentLength: postContent.length,
+                                contentHash,
+                            });
+                        }
+                    } catch (e) { /* skip */ }
+                });
+                return { results, debugInfo };
+            }
+            // ─── NEW DOM extractor (componentkey-based, May 2026+) ───
 
             postElements.forEach((element, index) => {
                 try {
