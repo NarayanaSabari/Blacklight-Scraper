@@ -617,7 +617,7 @@ class TechFetchScraper {
         await this.search(keywords, location);
 
         const allJobs = [];
-        const maxJobs = 30;
+        const maxJobs = 50;
         let totalScraped = 0;
 
         for (let page = 1; page <= maxPages; page++) {
