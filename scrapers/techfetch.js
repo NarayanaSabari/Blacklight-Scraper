@@ -761,32 +761,37 @@ export async function scrapeTechFetch(jobTitle, location, sessionId = null) {
         // Fetch credentials from API with wait-and-retry logic
         logProgress('TechFetch', `\n🔑 Attempting to fetch credential (attempt ${attemptCount}/${maxAttempts})...`);
         
-        let credential = null;
+        // Acquire a lease (not legacy getCredential) so reportSuccess /
+        // reportFailure target THIS lease specifically — not whichever
+        // techfetch lease was issued most recently. Without this, two
+        // concurrent techfetch scrapes would release each other's
+        // leases via latestByPlatform overwrite.
+        let lease = null;
         const maxCredentialRetries = 10; // Wait for credentials up to 10 times
         const credentialRetryDelay = 60000; // 60 seconds between retries
-        
+
         for (let credRetry = 0; credRetry < maxCredentialRetries; credRetry++) {
-            credential = await apiClient.getCredential('techfetch', sessionId);
-            
-            if (credential) {
-                // Got a credential, break out of retry loop
+            lease = await apiClient.acquire('techfetch', sessionId);
+
+            if (lease) {
                 break;
             }
-            
+
             if (credRetry < maxCredentialRetries - 1) {
                 logProgress('TechFetch', `⏳ No credentials available, waiting ${credentialRetryDelay/1000}s before retry ${credRetry + 1}/${maxCredentialRetries}...`);
                 await new Promise(resolve => setTimeout(resolve, credentialRetryDelay));
             }
         }
-        
-        if (!credential) {
+
+        if (!lease) {
             logProgress('TechFetch', `⚠️  No TechFetch credentials available after ${maxCredentialRetries} retries`);
             if (lastError) {
                 throw lastError;
             }
             throw new Error('No TechFetch credentials available from API');
         }
-        
+
+        const credential = lease.credential;
         // Print credential info (mask password)
         logProgress('TechFetch', `✅ Credential fetched:`);
         logProgress('TechFetch', `   📧 Email: ${credential.email}`);
@@ -834,9 +839,9 @@ export async function scrapeTechFetch(jobTitle, location, sessionId = null) {
             companyLocation: job.companyLocation
         }, 'techfetch'));
         
-        // Report success to API
-        await apiClient.reportSuccess('techfetch', `Scraped ${normalizedJobs.length} jobs successfully`);
-        
+        // Report success against THIS lease (not the platform name).
+        await lease.reportSuccess(`Scraped ${normalizedJobs.length} jobs successfully`);
+
         logProgress('TechFetch', `✅ Successfully scraped ${normalizedJobs.length} jobs from TechFetch`);
         return normalizedJobs;
         
@@ -871,11 +876,11 @@ export async function scrapeTechFetch(jobTitle, location, sessionId = null) {
                 // "Account locked", etc.) → password is genuinely bad.
                 logProgress('TechFetch', '🔄 Login rejected by site - will try next credential...');
                 logProgress('TechFetch', '📤 Notifying system: WRONG CREDENTIALS (permanent failure)');
-                await apiClient.reportFailure('techfetch', `Login failed: ${error.message}`, 0);
+                await lease.reportFailure(`Login failed: ${error.message}`, 0);
             } else if (error.message.includes('rate limit') || error.message.includes('429')) {
                 logProgress('TechFetch', '⏳ Rate limited - will try next credential...');
                 logProgress('TechFetch', '📤 Notifying system: RATE LIMIT (60 min cooldown)');
-                await apiClient.reportFailure('techfetch', `Rate limited: ${error.message}`, 60);
+                await lease.reportFailure(`Rate limited: ${error.message}`, 60);
             } else {
                 // Login uncertain (no JSLogin cookie + no explicit error) OR
                 // any other non-auth setup error. Could be transient: slow page,
@@ -884,7 +889,7 @@ export async function scrapeTechFetch(jobTitle, location, sessionId = null) {
                 logProgress('TechFetch', '⚠️  Login uncertain - will try next credential...');
                 logProgress('TechFetch', `   Error details: ${error.message}`);
                 logProgress('TechFetch', '📤 Notifying system: TRANSIENT (30 min cooldown)');
-                await apiClient.reportFailure('techfetch', `Login uncertain: ${error.message}`, 30);
+                await lease.reportFailure(`Login uncertain: ${error.message}`, 30);
             }
             // Continue to next credential attempt
             continue;
@@ -892,7 +897,7 @@ export async function scrapeTechFetch(jobTitle, location, sessionId = null) {
             // If login was successful but scraping failed, still try next credential
             logProgress('TechFetch', '⚠️  Scraping error after login - will try next credential...');
             logProgress('TechFetch', '📤 Notifying system: SCRAPING ERROR (30 min cooldown)');
-            await apiClient.reportFailure('techfetch', `Scraping error: ${error.message}`, 30);
+            await lease.reportFailure(`Scraping error: ${error.message}`, 30);
             continue;
         }
     }

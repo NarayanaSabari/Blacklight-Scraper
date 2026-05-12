@@ -543,11 +543,18 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
     logProgress('Indeed', `Searching for "${jobTitle}" in "${location}"`);
 
     // Lease an Indeed credential — required for pagination beyond page 1.
+    //
+    // Uses the lease-based API (`acquire` → `lease.reportSuccess/Failure`)
+    // NOT the legacy platform-keyed API. The legacy `reportSuccess('indeed')`
+    // resolves through latestByPlatform which is overwritten by any later
+    // concurrent acquire — so two parallel indeed scrapes would release
+    // each other's leases. Lease-keyed reports always target the right lease.
     const apiClient = getCredentialsAPIClient();
-    const credential = await apiClient.getCredential('indeed', sessionId);
-    if (!credential) {
+    const lease = await apiClient.acquire('indeed', sessionId);
+    if (!lease) {
         throw new Error('No Indeed credentials available from API');
     }
+    const credential = lease.credential;
     const cookies = loadCookies(credential);
     logProgress('Indeed', `Acquired credential (${cookies.length} cookies)`);
 
@@ -677,7 +684,7 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         try { await browser.close(); } catch { /* already closed */ }
         logProgress('Indeed', `Completed! Found ${normalizedJobs.length} jobs with details`);
 
-        await apiClient.reportSuccess('indeed', `Scraped ${normalizedJobs.length} jobs successfully`);
+        await lease.reportSuccess(`Scraped ${normalizedJobs.length} jobs successfully`);
 
         return normalizedJobs;
 
@@ -691,14 +698,14 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         const msg = error.message || '';
         if (!loginSuccess) {
             if (/cookie|login|auth|sign in/i.test(msg)) {
-                await apiClient.reportFailure('indeed', `Authentication failed: ${msg}`, 0);
+                await lease.reportFailure(`Authentication failed: ${msg}`, 0);
             } else if (/rate limit|blocked|captcha|cloudflare|verification/i.test(msg)) {
-                await apiClient.reportFailure('indeed', `Rate limited or blocked: ${msg}`, 60);
+                await lease.reportFailure(`Rate limited or blocked: ${msg}`, 60);
             } else {
-                await apiClient.reportFailure('indeed', `Scraping error: ${msg}`, 30);
+                await lease.reportFailure(`Scraping error: ${msg}`, 30);
             }
         } else {
-            await apiClient.reportFailure('indeed', `Scraping error after login: ${msg}`, 30);
+            await lease.reportFailure(`Scraping error after login: ${msg}`, 30);
         }
         throw error;
     }

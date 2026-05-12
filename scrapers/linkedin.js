@@ -1122,38 +1122,44 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         // Fetch credentials from API with wait-and-retry logic
         logProgress('LinkedIn', `\n🔑 Attempting to fetch credential (attempt ${attemptCount}/${maxAttempts})...`);
         
-        let credential = null;
+        // Acquire a LEASE (not legacy getCredential) so reportSuccess /
+        // reportFailure target this specific lease. The legacy
+        // platform-keyed API resolves through latestByPlatform which is
+        // overwritten by any concurrent acquire — without lease-keyed
+        // reports, two parallel linkedin scrapes release each other's
+        // leases and credential state in the backend drifts.
+        let lease = null;
         const maxCredentialRetries = 10; // Wait for credentials up to 10 times
         const credentialRetryDelay = 60000; // 60 seconds between retries
-        
+
         for (let credRetry = 0; credRetry < maxCredentialRetries; credRetry++) {
-            credential = await apiClient.getCredential('linkedin', sessionId);
-            
-            if (credential) {
-                // Got a credential, break out of retry loop
+            lease = await apiClient.acquire('linkedin', sessionId);
+
+            if (lease) {
                 break;
             }
-            
+
             if (credRetry < maxCredentialRetries - 1) {
                 logProgress('LinkedIn', `⏳ No credentials available, waiting ${credentialRetryDelay/1000}s before retry ${credRetry + 1}/${maxCredentialRetries}...`);
                 await new Promise(resolve => setTimeout(resolve, credentialRetryDelay));
             }
         }
-        
-        if (!credential) {
+
+        if (!lease) {
             logProgress('LinkedIn', `⚠️  No LinkedIn credentials available after ${maxCredentialRetries} retries`);
             if (lastError) {
                 throw lastError;
             }
             throw new Error('No LinkedIn credentials available from API');
         }
-        
+
+        const credential = lease.credential;
         // Print credential info (mask password)
         logProgress('LinkedIn', `✅ Credential fetched:`);
         logProgress('LinkedIn', `   📧 Email: ${credential.email}`);
         logProgress('LinkedIn', `   🔒 Password: ${'*'.repeat(credential.password?.length || 8)}`);
         logProgress('LinkedIn', `   🆔 Credential ID: ${credential.id}`);
-        
+
         CONFIG.email = credential.email;
         CONFIG.password = credential.password;
         CONFIG.credentialId = credential.id;
@@ -1327,42 +1333,42 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
             return normalizeJobData(jobObj, 'LinkedIn');
         });
 
-        // Report success to API
+        // Report success against THIS lease (not the platform name).
         loginSuccess = true;
-        await apiClient.reportSuccess('linkedin', `Scraped ${normalizedPosts.length} posts successfully`);
+        await lease.reportSuccess(`Scraped ${normalizedPosts.length} posts successfully`);
 
         return normalizedPosts;
-        
+
     } catch (error) {
         logProgress('LinkedIn', '\n❌ Error: ' + error.message);
         logProgress('LinkedIn', 'Stack trace: ' + error.stack);
-        
+
         lastError = error;
-        
-        // Report failure to API
+
+        // Report failure against THIS lease (not the platform name).
         if (!loginSuccess) {
             // Login or authentication failure - try next credential
             if (error.message.includes('Login failed') || error.message.includes('credentials') || error.message.includes('waitForSelector')) {
                 logProgress('LinkedIn', '🔄 Login/navigation failed - will try next credential...');
                 logProgress('LinkedIn', '📤 Notifying system: WRONG CREDENTIALS (permanent failure)');
-                await apiClient.reportFailure('linkedin', `Login failed: ${error.message}`, 0);
+                await lease.reportFailure(`Login failed: ${error.message}`, 0);
             } else if (error.message.includes('rate limit') || error.message.includes('challenge')) {
                 logProgress('LinkedIn', '⏳ Rate limited - will try next credential...');
                 logProgress('LinkedIn', '📤 Notifying system: RATE LIMIT (60 min cooldown)');
-                await apiClient.reportFailure('linkedin', `Rate limited or challenge: ${error.message}`, 60);
+                await lease.reportFailure(`Rate limited or challenge: ${error.message}`, 60);
             } else {
                 // Any other error during login/setup phase - treat as credential failure
                 logProgress('LinkedIn', '⚠️  Credential error - will try next credential...');
                 logProgress('LinkedIn', `   Error details: ${error.message}`);
                 logProgress('LinkedIn', '📤 Notifying system: CREDENTIAL ERROR (permanent failure)');
-                await apiClient.reportFailure('linkedin', `Credential error: ${error.message}`, 0);
+                await lease.reportFailure(`Credential error: ${error.message}`, 0);
             }
             // Continue to next credential attempt - no throw, let loop continue
         } else {
             // If login was successful but scraping failed, still try next credential
             logProgress('LinkedIn', '⚠️  Scraping error after login - will try next credential...');
             logProgress('LinkedIn', '📤 Notifying system: SCRAPING ERROR (30 min cooldown)');
-            await apiClient.reportFailure('linkedin', `Scraping error: ${error.message}`, 30);
+            await lease.reportFailure(`Scraping error: ${error.message}`, 30);
         }
         
     } finally {

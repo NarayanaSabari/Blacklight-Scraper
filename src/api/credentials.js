@@ -2,31 +2,25 @@
 //
 // Two APIs are exposed:
 //
-//  1. Legacy (platform-keyed) — for existing scrapers that call:
+//  1. Legacy (platform-keyed) — DEPRECATED, kept only for callers
+//     outside scrapers/ that haven't migrated yet:
 //       const api = getCredentialsClient();
 //       const cred = await api.getCredential('linkedin');
 //       await api.reportSuccess('linkedin');
 //
-//  2. Lease-based (race-safe) — new code should use:
+//  2. Lease-based (race-safe) — REQUIRED for production scrapers:
+//       const api = getCredentialsClient();
 //       const lease = await api.acquire('linkedin', sessionId);
-//       try { ... lease.credential ... }
-//       finally { await lease.reportSuccess('...msg...') }
+//       try { ... lease.credential ... await lease.reportSuccess('...') }
+//       catch (e) { await lease.reportFailure(e.message, cooldownMin) }
 //
-// Internally both APIs share the same lease map. Each acquire() issues a
-// unique lease id, so two concurrent scrapes on the same platform can no
-// longer stomp each other's credential state.
-//
-// ⚠️  KNOWN LIMITATION (latent — does not trigger today):
-//   The legacy platform-keyed API resolves leases via `latestByPlatform`.
-//   If two concurrent `acquire('linkedin')` calls happen, the second
-//   overwrites the pointer. A subsequent `reportSuccess('linkedin')`
-//   from the first caller will release the SECOND caller's lease,
-//   orphaning it.
-//
-//   The current scraper orchestration runs platforms sequentially via
-//   QueueOrchestrator, so this race cannot fire in practice. If anyone
-//   parallelizes platform scrapes in the future, migrate ALL callers to
-//   the lease-based API (`lease.reportSuccess()`) before doing so.
+// All scrapers in scrapers/ (indeed, linkedin, techfetch) use the
+// lease-based API. The QueueOrchestrator runs platforms in PARALLEL
+// within an assignment AND fires multiple assignments concurrently, so
+// the legacy `reportSuccess('linkedin')` path is unsafe — its
+// latestByPlatform resolution gets overwritten by the second of any
+// pair of concurrent acquires for the same platform, causing
+// scrape-1's success report to release scrape-2's lease.
 
 import { requestWithRetry } from '../http/client.js';
 import { getConfig } from '../config/env.js';
