@@ -39,3 +39,21 @@ Required next (do NOT enable strictEmpty in prod until BOTH land):
   timing (I13), Indeed page-1 pagination (I2), Glassdoor early-abort
   (I14), LinkedIn mid-scrape detection (L2). THEN enable
   SCRAPER_STRICT_EMPTY per host.
+
+Final whole-increment review advisories (non-blocking for 1A — these
+are pre-1B/1C action items; detectBlock is unused in prod until 1C):
+- M1: `/authwall` in BLOCK_URL_FRAGMENTS has no trailing-slash anchor
+  (unlike /challenge/ /captcha/ /checkpoint/). Tighten to a segment-
+  safe form before 1C wires detectBlock into LinkedIn, or a job URL
+  containing the substring could false-positive.
+- M2: HTTP 401 path (kind 'http_forbidden') has no dedicated test —
+  add a one-line test in 1B/1C (behaviour is correct, just untested).
+- M3: classify.js header comment ("Reasons must match the label set
+  in registry.js") is slightly misleading — prom-client does NOT
+  enforce label values; the real coupling is Grafana dashboards/alerts
+  (Plan 1B). Reword when 1B touches registry.
+- M4: add `SCRAPER_STRICT_EMPTY` (default false, with a comment) to
+  `.env.example` as part of 1B/1C so operators can discover the flag.
+- M5: `/security check/i` title regex matches the phrase anywhere —
+  safe ONLY because 1C must pass detectBlock a block-page title, never
+  a scraped job-listing title. Enforce that contract in 1C wiring.
