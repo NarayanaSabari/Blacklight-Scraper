@@ -556,44 +556,53 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 (`assertNotBlocked` was implemented in Task 3; this task adds its tests so the throwing contract is locked.)
 
-- [ ] **Step 1: Append failing tests**
+- [ ] **Step 1: Add `assertNotBlocked` contract tests**
 
-Append to `test/core/block-detection.test.js`:
+In `test/core/block-detection.test.js`, extend the **top** import block (do NOT add imports mid-file — keep all imports at the top) so it reads exactly:
 
 ```js
-import { assertNotBlocked } from '../../src/core/block-detection.js';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { detectBlock, assertNotBlocked } from '../../src/core/block-detection.js';
 import { BlockedError } from '../../src/core/errors.js';
+```
 
+Then append these two tests at the end of the file:
+
+```js
 test('assertNotBlocked is a no-op on a clean page', () => {
-    assert.doesNotThrow(() => assertNotBlocked({
+    assertNotBlocked({
         status: 200,
         finalUrl: 'https://www.indeed.com/jobs?q=node',
         title: 'node jobs | Indeed.com',
-    }));
+    });
 });
 
 test('assertNotBlocked throws BlockedError with kind + platform', () => {
-    try {
-        assertNotBlocked({
+    assert.throws(
+        () => assertNotBlocked({
             status: 403,
             finalUrl: 'https://www.indeed.com/jobs',
             title: '',
             platform: 'indeed',
-        });
-        assert.fail('expected assertNotBlocked to throw');
-    } catch (err) {
-        assert.ok(err instanceof BlockedError);
-        assert.equal(err.code, 'BLOCKED');
-        assert.equal(err.kind, 'http_forbidden');
-        assert.equal(err.platform, 'indeed');
-    }
+        }),
+        (err) => {
+            assert.ok(err instanceof BlockedError);
+            assert.equal(err.code, 'BLOCKED');
+            assert.equal(err.kind, 'http_forbidden');
+            assert.equal(err.platform, 'indeed');
+            return true;
+        },
+    );
 });
 ```
+
+> **Idiom note:** Node's `assert.throws()` returns `undefined` (NOT the thrown error) — a `const err = assert.throws(...)` form is a bug. The correct way to assert *that it throws* AND inspect error properties is the validation-function second argument shown above; it also avoids the `try/catch + assert.fail` hazard (where `assert.fail`'s own `AssertionError` is caught by the same `catch`).
 
 - [ ] **Step 2: Run test to verify it passes (implementation already exists from Task 3)**
 
 Run: `node --test test/core/block-detection.test.js`
-Expected: `# pass 10`, `# fail 0`. (If the two new tests fail, fix `assertNotBlocked` in `src/core/block-detection.js` to match Task 3 Step 3 — do not weaken the tests.)
+Expected: all tests in the file pass, 0 fail (the 2 new `assertNotBlocked` tests pass immediately — the implementation already exists from Task 3). If a new test fails, the contract is mismatched: STOP and escalate; do not weaken the test or hand-edit `src/core/block-detection.js`.
 
 - [ ] **Step 3: Commit**
 
