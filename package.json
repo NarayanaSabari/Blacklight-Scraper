@@ -8,7 +8,8 @@
     "start": "node server.js",
     "dev": "NODE_ENV=development node --watch server.js",
     "chrome:login": "node scripts/chrome-debug.js",
-    "test": "node --test 'test/**/*.test.js'"
+    "test": "node --test 'test/**/*.test.js'",
+    "setup": "node server.js --setup"
   },
   "keywords": [
     "job-scraper",
