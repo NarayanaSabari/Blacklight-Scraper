@@ -71,7 +71,7 @@ class MetricsRegistry {
         // Liveness ---------------------------------------------------------
         this.up = new Gauge({
             name: 'scraper_up',
-            help: 'Whether the scraper process is up (1) or down (0). Always 1 while pushing.',
+            help: 'Process liveness ONLY — 1 while the push loop runs; never 0 in practice. NOT scrape health: a 100%-blocked scraper still reports 1. Use scraper_last_nonzero_scrape_timestamp_seconds for scrape health.',
             registers: reg,
         });
         this.up.set(1);
@@ -117,6 +117,38 @@ class MetricsRegistry {
             name: 'scraper_jobs_scraped_total',
             help: 'Total jobs successfully scraped per platform.',
             labelNames: ['platform'],
+            registers: reg,
+        });
+
+        // Silent-block visibility (spec O1/O3) ----------------------------
+        // jobsScrapedTotal is a monotonic counter — it simply STOPS
+        // incrementing when a scraper is blocked, which is invisible on a
+        // rate() panel and identical to "no jobs matched". These three
+        // make the silent case loud:
+        this.jobsLastScraped = new Gauge({
+            name: 'scraper_jobs_last_scraped',
+            help: 'Jobs from the most recent scrape per platform, set on EVERY session including 0. A flatline at 0 is the silent-block / DOM-change signal.',
+            labelNames: ['platform'],
+            registers: reg,
+        });
+
+        this.lastNonzeroScrapeTimestamp = new Gauge({
+            name: 'scraper_last_nonzero_scrape_timestamp_seconds',
+            help: 'Unix seconds of the last scrape that returned > 0 jobs, per platform. Staleness here = blocked/broken even while scraper_up=1.',
+            labelNames: ['platform'],
+            registers: reg,
+        });
+
+        this.zeroResultSessionsTotal = new Counter({
+            name: 'scraper_zero_result_sessions_total',
+            help: 'Sessions that did not throw but yielded 0 jobs and were NOT positively confirmed-empty (suspected silent block / DOM change).',
+            labelNames: ['platform'],
+            registers: reg,
+        });
+
+        this.sessionsAllFailedTotal = new Counter({
+            name: 'scraper_sessions_all_failed_total',
+            help: 'Assignments where every platform failed or yielded zero. Completed anyway (backend coordination) but flagged for alerting.',
             registers: reg,
         });
 
@@ -221,8 +253,32 @@ class MetricsRegistry {
     }
 
     recordJobsScraped(platform, count) {
-        if (!count || count < 0) return;
-        this.#safe(() => this.jobsScrapedTotal.labels(platform).inc(count));
+        const n = Number.isFinite(count) && count > 0 ? count : 0;
+        this.#safe(() => {
+            // Gauge is set on EVERY session, including 0 — that is the
+            // whole point: a flatline at 0 is the silent-block signal.
+            this.jobsLastScraped.labels(platform).set(n);
+            if (n > 0) {
+                this.jobsScrapedTotal.labels(platform).inc(n);
+                this.lastNonzeroScrapeTimestamp
+                    .labels(platform)
+                    .set(Math.floor(Date.now() / 1000));
+            }
+        });
+    }
+
+    // Called by BaseScraper when a scrape returned 0 jobs WITHOUT a
+    // positive confirmed-empty signal (the Plan 1A `noteZeroJobs?.()`
+    // seam). This is the metric an operator alerts on for silent blocks.
+    noteZeroJobs(platform) {
+        this.#safe(() => this.zeroResultSessionsTotal.labels(platform).inc());
+    }
+
+    // Called (in Plan 1B-pipeline) when an entire assignment had zero
+    // successful platforms. Defined here so the metric exists and is
+    // testable now; the call site lands with the orchestrator work.
+    recordSessionAllFailed() {
+        this.#safe(() => this.sessionsAllFailedTotal.inc());
     }
 
     recordJobsSubmitted(platform, status, count) {
