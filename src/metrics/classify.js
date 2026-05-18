@@ -7,11 +7,13 @@
 // Reasons must match the label set declared in src/metrics/registry.js
 // (see scraper_failures_total) or Grafana alert rules will miss them.
 
-import { AuthError, NetworkError, TimeoutError, ParseError, BrowserError } from '../core/errors.js';
+import { AuthError, NetworkError, TimeoutError, ParseError, BrowserError, BlockedError, DomChangedError } from '../core/errors.js';
 
 const REASONS = Object.freeze({
     AUTH_REQUIRED: 'auth_required',
     CAPTCHA: 'captcha',
+    BLOCKED: 'blocked',
+    DOM_CHANGED: 'dom_changed',
     NETWORK: 'network',
     TIMEOUT: 'timeout',
     PARSE_ERROR: 'parse_error',
@@ -35,6 +37,8 @@ const PATTERNS = [
 export function classifyError(error) {
     if (!error) return REASONS.UNKNOWN;
 
+    if (error instanceof BlockedError) return REASONS.BLOCKED;
+    if (error instanceof DomChangedError) return REASONS.DOM_CHANGED;
     if (error instanceof AuthError) return REASONS.AUTH_REQUIRED;
     if (error instanceof TimeoutError) return REASONS.TIMEOUT;
     if (error instanceof ParseError) return REASONS.PARSE_ERROR;
