@@ -1,0 +1,46 @@
+{
+  "title": "Blacklight Scraper — Anti-Bot Durability",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Jobs from last scrape (per platform) — flatline at 0 = silent block",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "scraper_jobs_last_scraped" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Hours since last >0 scrape (per platform)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "(time() - max by (platform) (scraper_last_nonzero_scrape_timestamp_seconds)) / 3600" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Zero-result session rate (per platform)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (platform) (rate(scraper_zero_result_sessions_total[1h]))" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Categorized failures (per platform/reason)",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (platform, reason) (rate(scraper_failures_total[1h]))" }
+      ]
+    }
+  ]
+}
