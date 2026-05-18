@@ -53,3 +53,25 @@ export class ValidationError extends ScraperError {
         this.name = 'ValidationError';
     }
 }
+
+export class BlockedError extends ScraperError {
+    // Anti-bot block / challenge / interstitial (Cloudflare, DataDome,
+    // auth-wall, 403/429). `kind` records which signal tripped, for
+    // metrics + triage. Distinct from AuthError: the remediation is
+    // IP/fingerprint/backoff, NOT credential rotation.
+    constructor(message, { kind = null, ...rest } = {}) {
+        super(message, { code: 'BLOCKED', ...rest });
+        this.name = 'BlockedError';
+        this.kind = kind;
+    }
+}
+
+export class DomChangedError extends ScraperError {
+    // Page loaded fine and was NOT blocked, but the expected result
+    // containers/fields were absent — the site changed its DOM. Loud
+    // by design: must never be reported as a successful empty scrape.
+    constructor(message, opts = {}) {
+        super(message, { code: 'DOM_CHANGED', ...opts });
+        this.name = 'DomChangedError';
+    }
+}
