@@ -212,6 +212,20 @@ function buildSearchUrl(domain, jobTitle, location, start = 0) {
 }
 
 /**
+ * Positively detect Indeed's "no results" page so a genuine empty search
+ * is distinguishable from a silent block / DOM change. Pure + safe on
+ * junk input. Indeed renders a `jobsearch-NoResult` container and/or the
+ * phrase "did not match any jobs".
+ * @param {string} html
+ * @returns {boolean}
+ */
+export function indeedNoResults(html) {
+    if (!html || typeof html !== 'string') return false;
+    if (html.includes('jobsearch-NoResult')) return true;
+    return /did not match any jobs/i.test(html);
+}
+
+/**
  * Extract job listings from search results page
  * @param {string} html - HTML content of search results
  * @param {string} domain - Indeed domain for building full URLs
