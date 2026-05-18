@@ -75,6 +75,10 @@ function bootTelemetry(config) {
 }
 
 async function main() {
+    if (process.argv.slice(2).includes('--setup')) {
+        const { runSetupWizard } = await import('./src/setup/wizard.js');
+        process.exit(await runSetupWizard());
+    }
     const config = getConfig();
 
     log.info('Starting Unified Job Scraper API', {
