@@ -23,7 +23,18 @@ groups:
           description: "Over 80% of {{ $labels.platform }} successful sessions in the last hour yielded 0 jobs. This is the audit's dominant silent-failure signature."
 
       - alert: ScraperNoNonzeroScrape
-        expr: time() - max by (platform) (scraper_last_nonzero_scrape_timestamp_seconds) > 21600
+        # The `> 0` guard prevents a cold-start false positive: a brand-new
+        # platform / fresh deploy initializes the gauge at 0, which would
+        # otherwise make `time() - 0` enormous and fire instantly. Only
+        # alert once the platform has had at least one real >0 scrape.
+        expr: |
+          (
+            time() - max by (platform) (scraper_last_nonzero_scrape_timestamp_seconds) > 21600
+          )
+          and
+          (
+            max by (platform) (scraper_last_nonzero_scrape_timestamp_seconds) > 0
+          )
         for: 15m
         labels:
           severity: critical
