@@ -146,6 +146,29 @@ const randomDelay = (min, max) => wait(min + Math.random() * (max - min));
 // connectToChrome — removed when this scraper moved to CloakBrowser.
 // See launchWithCookies() above.)
 
+// Pure page-state classifier — distinguishes a real results page from a
+// genuine empty search vs an auth-wall / challenge, so a block can be
+// made loud instead of silently reported as a successful 0-post scrape.
+// Uses the LIVE May-2026 componentkey signal (the old container check
+// in navigateToSearch keyed off pre-2026 selectors and false-alarmed on
+// every healthy run). Pure + junk-safe. Order: challenge → auth_wall →
+// results → no_results → unknown.
+export function linkedinPageState(html, url, title) {
+    const h = typeof html === 'string' ? html : '';
+    const u = typeof url === 'string' ? url : '';
+    const t = typeof title === 'string' ? title : '';
+    const hay = (h + ' ' + t).toLowerCase();
+    if (h.includes('challenge-platform') || h.includes('cf-chl-')
+        || /just a moment|attention required/i.test(t)) return 'challenge';
+    if (/\/login|\/uas\/login|\/checkpoint|\/authwall|session_redirect/.test(u)) return 'auth_wall';
+    if (h.includes('componentkey="expanded')
+        || h.includes('feed-shared-update-v2')
+        || h.includes('reusable-search__result-container')
+        || h.includes('scaffold-finite-scroll')) return 'results';
+    if (/no results found|try searching for|we couldn.t find|no results for/i.test(hay)) return 'no_results';
+    return 'unknown';
+}
+
 // Helper: Check if a URL indicates an unauthenticated/login page
 function isLoginPage(url) {
     return url.includes('/login') || 
