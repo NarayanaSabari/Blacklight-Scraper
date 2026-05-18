@@ -21,11 +21,11 @@ import { getMetrics } from '../metrics/registry.js';
 const log = createLogger('orchestrator');
 
 export class QueueOrchestrator {
-    constructor({ blacklightConfig, queueConfig, defaultLocation }) {
-        if (!blacklightConfig) {
+    constructor({ blacklightConfig, queueConfig, defaultLocation, client = null, metrics = null, scraperResolver = null }) {
+        if (!client && !blacklightConfig) {
             throw new Error('QueueOrchestrator requires blacklightConfig');
         }
-        this.client = new BlacklightApiClient(blacklightConfig.apiUrl, blacklightConfig.apiKey);
+        this.client = client ?? new BlacklightApiClient(blacklightConfig.apiUrl, blacklightConfig.apiKey);
         this.queueConfig = queueConfig;
         // Per-platform scrapers still need a location string for their search
         // URL (e.g. LinkedIn's `&location=`). The backend no longer drives
@@ -35,6 +35,17 @@ export class QueueOrchestrator {
         this.defaultLocation = defaultLocation || 'United States';
         this.mutex = new Mutex();
         this.autoInterval = null;
+        // Injection seams (default to the production singletons). Behavior-
+        // neutral: server.js passes none of these, so construction is
+        // identical to before. Tests inject fakes to exercise the workflow
+        // without live HTTP / the real scraper registry.
+        this._metrics = metrics;
+        this._resolveScraper = scraperResolver ?? getScraper;
+    }
+
+    // Resolve the metrics sink: injected fake in tests, global registry in prod.
+    #metrics() {
+        return this._metrics ?? getMetrics();
     }
 
     // ----- public API -------------------------------------------------------
@@ -51,7 +62,7 @@ export class QueueOrchestrator {
     async runOnce() {
         if (!this.mutex.tryAcquire()) {
             log.info('Queue run skipped — claim already in flight');
-            getMetrics().recordQueueCheck('skipped_busy');
+            this.#metrics().recordQueueCheck('skipped_busy');
             return { skipped: true };
         }
         let queueResult;
@@ -70,7 +81,7 @@ export class QueueOrchestrator {
         // released so the next poll (30s tick or manual trigger) can
         // immediately claim work for any platform that finishes early.
         for (const assignment of assignments) {
-            this.#runAssignment(assignment, getMetrics()).catch((err) => {
+            this.#runAssignment(assignment, this.#metrics()).catch((err) => {
                 log.error('Assignment failed unexpectedly', {
                     sessionId: assignment.session_id,
                     role: assignment.role?.name,
@@ -116,7 +127,7 @@ export class QueueOrchestrator {
      * with 1 starved Indeed cred).
      */
     async #claim() {
-        const metrics = getMetrics();
+        const metrics = this.#metrics();
         log.info('Starting queue cycle');
 
         let usablePlatforms = null;
@@ -209,7 +220,7 @@ export class QueueOrchestrator {
         // platforms still mid-scrape — so over-claiming is impossible.
         const tasks = platforms.map(async (platformInfo) => {
             const platformName = platformInfo.name.toLowerCase();
-            const scraper = getScraper(platformName);
+            const scraper = this._resolveScraper(platformName);
 
             const triggerNextPoll = () => {
                 setImmediate(() => this.runOnce().catch((err) => {
