@@ -298,6 +298,22 @@ export class QueueOrchestrator {
             }
         }
 
+        // C3 (spec): an assignment where every platform failed must NOT be
+        // silently treated as a normal completion. We still call
+        // completeSession (the backend coordinates sibling sessions for the
+        // same role and must receive it), but we flag it loudly + on a
+        // dedicated metric so a dashboard/alert can distinguish "role done,
+        // 0 jobs because all platforms broke" from "role done normally".
+        if (results.summary.total_platforms > 0 && results.summary.successful === 0) {
+            log.error('All platforms failed for assignment — completing session anyway (backend coordination)', {
+                sessionId,
+                role: role.name,
+                totalPlatforms: results.summary.total_platforms,
+                scraper_alert: 'session_all_failed',
+            });
+            metrics.recordSessionAllFailed();
+        }
+
         try {
             const completion = await this.client.completeSession(sessionId);
             results.completion = completion;

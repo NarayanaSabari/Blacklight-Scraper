@@ -50,3 +50,59 @@ test('legacy constructor still requires blacklightConfig when no client injected
         /requires blacklightConfig/,
     );
 });
+
+function assignmentClient(extra = {}) {
+    let served = false;
+    return fakeClient({
+        checkCredentialAvailability: async () => ({ indeed: 1, dice: 1 }),
+        getNextRole: async () => {
+            if (served) return { assignments: [] };
+            served = true;
+            return {
+                assignments: [{
+                    session_id: 'sess-AF',
+                    role: { name: 'Backend Engineer', search_queries: null },
+                    platforms: [{ name: 'indeed' }, { name: 'dice' }],
+                }],
+            };
+        },
+        ...extra,
+    });
+}
+
+const allThrowResolver = () => ({
+    execute: async () => { throw new Error('boom'); },
+});
+
+test('C3: when every platform fails, recordSessionAllFailed fires and completeSession is still called', async () => {
+    const m = fakeMetrics();
+    const c = assignmentClient();
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: m,
+        scraperResolver: allThrowResolver,
+    });
+    await o.runOnce();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(m.calls.allFailed, 1, 'recordSessionAllFailed should fire exactly once for an all-failed assignment');
+    assert.deepEqual(c.calls.completeSession, ['sess-AF'], 'completeSession must still be called (backend coordination)');
+});
+
+test('C3: when at least one platform succeeds, recordSessionAllFailed does NOT fire', async () => {
+    const m = fakeMetrics();
+    const c = assignmentClient();
+    const mixedResolver = (name) => ({
+        execute: async () => (name === 'indeed' ? [{ id: 1 }] : (() => { throw new Error('boom'); })()),
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: m,
+        scraperResolver: mixedResolver,
+    });
+    await o.runOnce();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(m.calls.allFailed, 0, 'recordSessionAllFailed must not fire when a platform succeeded');
+    assert.deepEqual(c.calls.completeSession, ['sess-AF']);
+});
