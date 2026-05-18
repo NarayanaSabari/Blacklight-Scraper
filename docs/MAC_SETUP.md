@@ -232,6 +232,8 @@ cat > ~/Library/LaunchAgents/com.qpeakhire.scraper.plist <<'PLIST'
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>SCRAPER_MODE</key>
+        <string>daemon</string>
         <key>NODE_ENV</key>
         <string>production</string>
         <key>PATH</key>

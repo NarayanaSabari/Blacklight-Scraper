@@ -208,7 +208,7 @@ C:\Tools\nssm\nssm.exe install qp-scraper "C:\Program Files\nodejs\node.exe" "C:
 
 # 3. Configure it
 C:\Tools\nssm\nssm.exe set qp-scraper AppDirectory C:\scraper
-C:\Tools\nssm\nssm.exe set qp-scraper AppEnvironmentExtra NODE_ENV=production
+C:\Tools\nssm\nssm.exe set qp-scraper AppEnvironmentExtra NODE_ENV=production SCRAPER_MODE=daemon
 C:\Tools\nssm\nssm.exe set qp-scraper AppStdout C:\scraper\logs\stdout.log
 C:\Tools\nssm\nssm.exe set qp-scraper AppStderr C:\scraper\logs\stderr.log
 C:\Tools\nssm\nssm.exe set qp-scraper Start SERVICE_AUTO_START
