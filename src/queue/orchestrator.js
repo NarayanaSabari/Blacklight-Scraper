@@ -21,11 +21,11 @@ import { getMetrics } from '../metrics/registry.js';
 const log = createLogger('orchestrator');
 
 export class QueueOrchestrator {
-    constructor({ blacklightConfig, queueConfig, defaultLocation }) {
-        if (!blacklightConfig) {
+    constructor({ blacklightConfig, queueConfig, defaultLocation, client = null, metrics = null, scraperResolver = null }) {
+        if (!client && !blacklightConfig) {
             throw new Error('QueueOrchestrator requires blacklightConfig');
         }
-        this.client = new BlacklightApiClient(blacklightConfig.apiUrl, blacklightConfig.apiKey);
+        this.client = client ?? new BlacklightApiClient(blacklightConfig.apiUrl, blacklightConfig.apiKey);
         this.queueConfig = queueConfig;
         // Per-platform scrapers still need a location string for their search
         // URL (e.g. LinkedIn's `&location=`). The backend no longer drives
@@ -35,6 +35,17 @@ export class QueueOrchestrator {
         this.defaultLocation = defaultLocation || 'United States';
         this.mutex = new Mutex();
         this.autoInterval = null;
+        // Injection seams (default to the production singletons). Behavior-
+        // neutral: server.js passes none of these, so construction is
+        // identical to before. Tests inject fakes to exercise the workflow
+        // without live HTTP / the real scraper registry.
+        this._metrics = metrics;
+        this._resolveScraper = scraperResolver ?? getScraper;
+    }
+
+    // Resolve the metrics sink: injected fake in tests, global registry in prod.
+    #metrics() {
+        return this._metrics ?? getMetrics();
     }
 
     // ----- public API -------------------------------------------------------
@@ -51,7 +62,7 @@ export class QueueOrchestrator {
     async runOnce() {
         if (!this.mutex.tryAcquire()) {
             log.info('Queue run skipped — claim already in flight');
-            getMetrics().recordQueueCheck('skipped_busy');
+            this.#metrics().recordQueueCheck('skipped_busy');
             return { skipped: true };
         }
         let queueResult;
@@ -70,7 +81,7 @@ export class QueueOrchestrator {
         // released so the next poll (30s tick or manual trigger) can
         // immediately claim work for any platform that finishes early.
         for (const assignment of assignments) {
-            this.#runAssignment(assignment, getMetrics()).catch((err) => {
+            this.#runAssignment(assignment, this.#metrics()).catch((err) => {
                 log.error('Assignment failed unexpectedly', {
                     sessionId: assignment.session_id,
                     role: assignment.role?.name,
@@ -116,7 +127,7 @@ export class QueueOrchestrator {
      * with 1 starved Indeed cred).
      */
     async #claim() {
-        const metrics = getMetrics();
+        const metrics = this.#metrics();
         log.info('Starting queue cycle');
 
         let usablePlatforms = null;
@@ -209,7 +220,7 @@ export class QueueOrchestrator {
         // platforms still mid-scrape — so over-claiming is impossible.
         const tasks = platforms.map(async (platformInfo) => {
             const platformName = platformInfo.name.toLowerCase();
-            const scraper = getScraper(platformName);
+            const scraper = this._resolveScraper(platformName);
 
             const triggerNextPoll = () => {
                 setImmediate(() => this.runOnce().catch((err) => {
@@ -236,11 +247,25 @@ export class QueueOrchestrator {
                 const formatted = jobs.map((job) => formatJobForBlacklight(job, platformName));
                 const submitResponse = await this.client.submitJobs(sessionId, platformName, formatted, 'success');
 
-                log.info('Jobs submitted', {
-                    platform: platformName,
-                    jobCount: formatted.length,
-                    progress: submitResponse.progress,
-                });
+                if (formatted.length === 0) {
+                    // O9 (spec): the wire status stays 'success' (changing it
+                    // needs backend coordination — deferred), but a 0-job
+                    // "success" is the silent-block signature. Emit a distinct
+                    // Loki-queryable signal so it is not buried among healthy
+                    // submissions. The metric dimension is already covered by
+                    // scraper_zero_result_sessions_total (Plan 1B, scraper layer).
+                    log.warn('Submitted 0 jobs as success — possible silent block / empty result', {
+                        platform: platformName,
+                        sessionId,
+                        scraper_alert: 'submitted_zero',
+                    });
+                } else {
+                    log.info('Jobs submitted', {
+                        platform: platformName,
+                        jobCount: formatted.length,
+                        progress: submitResponse.progress,
+                    });
+                }
                 metrics.recordJobsSubmitted(platformName, 'success', formatted.length);
                 triggerNextPoll();
 
@@ -285,6 +310,22 @@ export class QueueOrchestrator {
                 log.error('Platform task threw unexpectedly', { err: entry.reason?.message });
                 results.summary.failed += 1;
             }
+        }
+
+        // C3 (spec): an assignment where every platform failed must NOT be
+        // silently treated as a normal completion. We still call
+        // completeSession (the backend coordinates sibling sessions for the
+        // same role and must receive it), but we flag it loudly + on a
+        // dedicated metric so a dashboard/alert can distinguish "role done,
+        // 0 jobs because all platforms broke" from "role done normally".
+        if (results.summary.total_platforms > 0 && results.summary.successful === 0) {
+            log.error('All platforms failed for assignment — completing session anyway (backend coordination)', {
+                sessionId,
+                role: role.name,
+                totalPlatforms: results.summary.total_platforms,
+                scraper_alert: 'session_all_failed',
+            });
+            metrics.recordSessionAllFailed();
         }
 
         try {
