@@ -4,8 +4,10 @@
 // code, and message text to pick the best reason label. Keeping the logic
 // centralized means we can tweak patterns without touching scraper code.
 //
-// Reasons must match the label set declared in src/metrics/registry.js
-// (see scraper_failures_total) or Grafana alert rules will miss them.
+// prom-client does NOT enforce a closed set of `reason` label values, so
+// adding a reason here cannot break metric writes. The real coupling is
+// the committed Grafana alert rules (observability/alerts.yml): a reason
+// string used in an alert expr must match what this file emits.
 
 import { AuthError, NetworkError, TimeoutError, ParseError, BrowserError, BlockedError, DomChangedError } from '../core/errors.js';
 

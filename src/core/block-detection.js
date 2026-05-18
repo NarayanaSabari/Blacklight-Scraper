@@ -21,7 +21,7 @@ const DATADOME_MARKERS = [
 
 // URL path fragments meaning "not on a content page".
 const BLOCK_URL_FRAGMENTS = [
-    '/checkpoint/', '/authwall', '/uas/login', '/account/login',
+    '/checkpoint/', 'linkedin.com/authwall', '/uas/login', '/account/login',
     '/captcha/', '/challenge/',
 ];
 
