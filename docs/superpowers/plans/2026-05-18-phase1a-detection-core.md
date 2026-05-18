@@ -6,7 +6,9 @@
 
 **Architecture:** Pure additive building blocks. New typed errors extend the existing `ScraperError`. A new side-effect-free `src/core/block-detection.js` decides "is this page a challenge?" from structural signals (HTTP status, final URL, `<title>`, vendor markers) — never fuzzy body-text substring matching. BaseScraper gains a normalized return contract (`Array` *or* `{ jobs, emptyConfirmed }`) and an **opt-in** `strictEmpty` mode; default behavior (return `[]`, record `success`) is unchanged so nothing breaks in production until per-scraper wiring (Plan 1C) and metrics/alerts (Plan 1B) land.
 
-**Tech Stack:** Node.js 20 ESM, Node built-in test runner (`node:test` + `node:assert/strict`) — no new dependencies. prom-client (existing). No browser/network code in this plan.
+**Tech Stack:** Node.js 20+ ESM (the dev/CI host here runs **Node v24.14.0**), Node built-in test runner (`node:test` + `node:assert/strict`) — no new dependencies. prom-client (existing). No browser/network code in this plan.
+
+> **Node 24 note:** `node --test <dir>` (bare directory arg) is **broken on Node 24** — it falls through to the module loader. The portable form, verified on Node 24, is `node --test 'test/**/*.test.js'` (single-quoted so the shell passes the literal glob; Node's built-in globber expands `**` recursively and never scans repo `scripts/*-test.mjs`). Explicit single-file paths (`node --test test/x.test.js`) work on all versions. Node 24's default reporter prints `ℹ pass N` / `ℹ fail N` (not TAP `# pass`); treat "pass N / fail 0 / exit 0" as the success criterion regardless of reporter wording.
 
 **Source spec:** `docs/superpowers/specs/2026-05-18-blacklight-scraper-anti-bot-audit-design.md` — Phase 1 findings addressed here: **F8** (error taxonomy), **F3 / F11** (centralized structural block detection), **F12 / C1** (BaseScraper "0 jobs ≠ automatic success" seam), and the classifier half of **O2**. Per-scraper wiring (L1, L2, T1, T4, T9, T15, I1, I2, I3, I13, I14) is Plan 1C; metrics/alerts/orchestrator (O1, O3, O4, O5, O9, O10, C3) is Plan 1B.
 
@@ -54,7 +56,7 @@ test('node:test harness runs', () => {
 - [ ] **Step 2: Run it to verify the runner works before wiring the script**
 
 Run: `node --test test/smoke.test.js`
-Expected: output contains `# pass 1` and `# fail 0`, exit code 0.
+Expected: 1 test passes, 0 fail (summary shows `pass 1` / `fail 0`), exit code 0.
 
 - [ ] **Step 3: Add the `test` script to package.json**
 
@@ -65,14 +67,14 @@ In `package.json`, replace the `scripts` object (currently lines 7–11):
     "start": "node server.js",
     "dev": "NODE_ENV=development node --watch server.js",
     "chrome:login": "node scripts/chrome-debug.js",
-    "test": "node --test"
+    "test": "node --test 'test/**/*.test.js'"
   },
 ```
 
 - [ ] **Step 4: Run via the npm script to verify wiring**
 
 Run: `npm test`
-Expected: Node discovers `test/smoke.test.js`, prints `# pass 1`, exit code 0.
+Expected: Node recursively discovers `test/smoke.test.js` (and only `test/**` — never repo `scripts/`), summary `pass 1` / `fail 0`, exit code 0.
 
 - [ ] **Step 5: Commit**
 
@@ -818,7 +820,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 - [ ] **Step 1: Run the entire test suite**
 
 Run: `npm test`
-Expected: every test file green; final summary `# fail 0`. Record the pass count.
+Expected: every test file green; final summary `fail 0` (Node 24 prints `ℹ fail 0`). Record the pass count.
 
 - [ ] **Step 2: Verify zero default behavior change — static checks**
 
