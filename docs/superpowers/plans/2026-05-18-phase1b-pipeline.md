@@ -212,15 +212,23 @@ Append to `test/queue/orchestrator.test.js`:
 
 ```js
 function assignmentClient(extra = {}) {
+    // ONE-SHOT: the orchestrator re-polls via setImmediate(() => runOnce())
+    // after each platform settles, so an always-return getNextRole would
+    // infinite-loop the test. Serve the assignment once, then empty.
+    let served = false;
     return fakeClient({
         checkCredentialAvailability: async () => ({ indeed: 1, dice: 1 }),
-        getNextRole: async () => ({
-            assignments: [{
-                session_id: 'sess-AF',
-                role: { name: 'Backend Engineer', search_queries: null },
-                platforms: [{ name: 'indeed' }, { name: 'dice' }],
-            }],
-        }),
+        getNextRole: async () => {
+            if (served) return { assignments: [] };
+            served = true;
+            return {
+                assignments: [{
+                    session_id: 'sess-AF',
+                    role: { name: 'Backend Engineer', search_queries: null },
+                    platforms: [{ name: 'indeed' }, { name: 'dice' }],
+                }],
+            };
+        },
         ...extra,
     });
 }
@@ -359,14 +367,22 @@ Append to `test/queue/orchestrator.test.js`:
 ```js
 test('O9: a platform returning 0 jobs still submits success but is recorded distinctly', async () => {
     const m = fakeMetrics();
-    const c = assignmentClient({
-        getNextRole: async () => ({
-            assignments: [{
-                session_id: 'sess-ZERO',
-                role: { name: 'Backend Engineer', search_queries: null },
-                platforms: [{ name: 'indeed' }],
-            }],
-        }),
+    // Local ONE-SHOT getNextRole (do NOT pass an always-return override —
+    // it would infinite-loop via the orchestrator's setImmediate re-poll).
+    let served = false;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => ({ indeed: 1 }),
+        getNextRole: async () => {
+            if (served) return { assignments: [] };
+            served = true;
+            return {
+                assignments: [{
+                    session_id: 'sess-ZERO',
+                    role: { name: 'Backend Engineer', search_queries: null },
+                    platforms: [{ name: 'indeed' }],
+                }],
+            };
+        },
     });
     const emptyResolver = () => ({ execute: async () => [] }); // 0 jobs, no throw
     const o = new QueueOrchestrator({
