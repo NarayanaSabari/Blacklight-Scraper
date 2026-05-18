@@ -106,3 +106,39 @@ test('C3: when at least one platform succeeds, recordSessionAllFailed does NOT f
     assert.equal(m.calls.allFailed, 0, 'recordSessionAllFailed must not fire when a platform succeeded');
     assert.deepEqual(c.calls.completeSession, ['sess-AF']);
 });
+
+test('O9: a platform returning 0 jobs still submits success but is recorded distinctly', async () => {
+    const m = fakeMetrics();
+    let served = false;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => ({ indeed: 1 }),
+        getNextRole: async () => {
+            if (served) return { assignments: [] };
+            served = true;
+            return {
+                assignments: [{
+                    session_id: 'sess-ZERO',
+                    role: { name: 'Backend Engineer', search_queries: null },
+                    platforms: [{ name: 'indeed' }],
+                }],
+            };
+        },
+    });
+    const emptyResolver = () => ({ execute: async () => [] }); // 0 jobs, no throw
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: m,
+        scraperResolver: emptyResolver,
+    });
+    await o.runOnce();
+    await new Promise((r) => setTimeout(r, 50));
+    const sub = c.calls.submitJobs.find((s) => s.sid === 'sess-ZERO');
+    assert.ok(sub, 'submitJobs should have been called for the zero-job platform');
+    assert.equal(sub.n, 0);
+    assert.equal(sub.status, 'success');
+    assert.deepEqual(
+        m.calls.jobsSubmitted.find((j) => j[0] === 'indeed'),
+        ['indeed', 'success', 0],
+    );
+});

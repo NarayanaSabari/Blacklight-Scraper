@@ -247,11 +247,25 @@ export class QueueOrchestrator {
                 const formatted = jobs.map((job) => formatJobForBlacklight(job, platformName));
                 const submitResponse = await this.client.submitJobs(sessionId, platformName, formatted, 'success');
 
-                log.info('Jobs submitted', {
-                    platform: platformName,
-                    jobCount: formatted.length,
-                    progress: submitResponse.progress,
-                });
+                if (formatted.length === 0) {
+                    // O9 (spec): the wire status stays 'success' (changing it
+                    // needs backend coordination — deferred), but a 0-job
+                    // "success" is the silent-block signature. Emit a distinct
+                    // Loki-queryable signal so it is not buried among healthy
+                    // submissions. The metric dimension is already covered by
+                    // scraper_zero_result_sessions_total (Plan 1B, scraper layer).
+                    log.warn('Submitted 0 jobs as success — possible silent block / empty result', {
+                        platform: platformName,
+                        sessionId,
+                        scraper_alert: 'submitted_zero',
+                    });
+                } else {
+                    log.info('Jobs submitted', {
+                        platform: platformName,
+                        jobCount: formatted.length,
+                        progress: submitResponse.progress,
+                    });
+                }
                 metrics.recordJobsSubmitted(platformName, 'success', formatted.length);
                 triggerNextPoll();
 
