@@ -124,3 +124,29 @@ test('assertNotBlocked throws BlockedError with kind + platform', () => {
         },
     );
 });
+
+test('M1: a non-LinkedIn job URL containing "authwall" substring is NOT blocked', () => {
+    const r = detectBlock({
+        status: 200,
+        finalUrl: 'https://jobs.example.com/authwall-platform-engineer/9912',
+        title: 'Authwall Platform Engineer | Example Jobs',
+        html: '<div class="job_seen_beacon">role</div>',
+    });
+    assert.equal(r.blocked, false);
+});
+
+test('M1: a real LinkedIn authwall URL is still blocked (auth_wall)', () => {
+    const r = detectBlock({
+        status: 200,
+        finalUrl: 'https://www.linkedin.com/authwall?trk=bf&sessionRedirect=%2Fjobs',
+        title: 'LinkedIn',
+    });
+    assert.equal(r.blocked, true);
+    assert.equal(r.kind, 'auth_wall');
+});
+
+test('M2: HTTP 401 is blocked (http_forbidden)', () => {
+    const r = detectBlock({ status: 401, finalUrl: 'https://x', title: '' });
+    assert.equal(r.blocked, true);
+    assert.equal(r.kind, 'http_forbidden');
+});

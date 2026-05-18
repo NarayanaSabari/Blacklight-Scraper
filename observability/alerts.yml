@@ -1,0 +1,61 @@
+# Prometheus alerting rules — committed so the metric↔alert contract is
+# code-reviewable and versioned (audit finding O4). Load into the
+# Prometheus/Alertmanager that scrapes this fleet's Pushgateway.
+#
+# These fire on the SILENT failure modes Plan 1A/1B make observable: a
+# scraper that returns 0 jobs without throwing, or has not produced a
+# job in hours, while scraper_up is still 1.
+groups:
+  - name: scraper-anti-bot-durability
+    rules:
+      - alert: ScraperZeroResultRatioHigh
+        expr: |
+          (
+            sum by (platform) (rate(scraper_zero_result_sessions_total[1h]))
+            /
+            clamp_min(sum by (platform) (rate(scraper_sessions_total{result="success"}[1h])), 0.0001)
+          ) > 0.8
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.platform }} is mostly returning 0 jobs (suspected silent block / DOM change)"
+          description: "Over 80% of {{ $labels.platform }} successful sessions in the last hour yielded 0 jobs. This is the audit's dominant silent-failure signature."
+
+      - alert: ScraperNoNonzeroScrape
+        # The `> 0` guard prevents a cold-start false positive: a brand-new
+        # platform / fresh deploy initializes the gauge at 0, which would
+        # otherwise make `time() - 0` enormous and fire instantly. Only
+        # alert once the platform has had at least one real >0 scrape.
+        expr: |
+          (
+            time() - max by (platform) (scraper_last_nonzero_scrape_timestamp_seconds) > 21600
+          )
+          and
+          (
+            max by (platform) (scraper_last_nonzero_scrape_timestamp_seconds) > 0
+          )
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.platform }} has produced no jobs for > 6h while up"
+          description: "scraper_last_nonzero_scrape_timestamp_seconds for {{ $labels.platform }} is stale by >6h though the process is alive — blocked or broken."
+
+      - alert: ScraperBlockedFailures
+        expr: sum by (platform) (rate(scraper_failures_total{reason=~"blocked|captcha|dom_changed|auth_required|rate_limited"}[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.platform }} is reporting block/challenge failures"
+          description: "scraper_failures_total for {{ $labels.platform }} shows reason in (blocked, captcha, dom_changed, auth_required, rate_limited) over the last hour."
+
+      - alert: ScraperAllFailedSessions
+        expr: rate(scraper_sessions_all_failed_total[1h]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Assignments are completing with zero successful platforms"
+          description: "scraper_sessions_all_failed_total is increasing — at least one assignment had every platform fail/zero."
