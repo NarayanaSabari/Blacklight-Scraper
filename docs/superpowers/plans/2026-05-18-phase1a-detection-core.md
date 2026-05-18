@@ -689,6 +689,7 @@ test('unconfirmed empty, strict → throws BlockedError, recorded failed/blocked
     });
     assert.equal(m.calls.session[0][1], 'failed');
     assert.deepEqual(m.calls.failure[0], ['indeed', 'blocked']);
+    assert.deepEqual(m.calls.zero[0], ['indeed']); // noteZeroJobs fires before the strict throw
 });
 
 test('thrown ScraperError still propagates and is recorded failed', async () => {
@@ -743,6 +744,9 @@ function normalizeResult(result) {
     if (result && Array.isArray(result.jobs)) {
         return { jobs: result.jobs, emptyConfirmed: result.emptyConfirmed === true };
     }
+    // Non-array / missing `jobs`, or null/undefined → bad/empty return
+    // treated as UNCONFIRMED empty on purpose: it must surface loudly
+    // via the zero-jobs path, never silently as a confirmed success.
     return { jobs: [], emptyConfirmed: false };
 }
 
@@ -765,6 +769,9 @@ export class BaseScraper {
      * @param {string} location
      * @param {string|null} sessionId
      * @param {{searchQueries?: string[] | null}} [options]
+     *   Optional per-platform extras the orchestrator passes through —
+     *   today only LinkedIn looks at `searchQueries` (AI-generated
+     *   boolean variants from the backend); other scrapers ignore.
      * @returns {Promise<Array<object>>}
      */
     async execute(jobTitle, location, sessionId = null, options = {}) {
