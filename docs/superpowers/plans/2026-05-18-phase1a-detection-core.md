@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node.js 20+ ESM (the dev/CI host here runs **Node v24.14.0**), Node built-in test runner (`node:test` + `node:assert/strict`) — no new dependencies. prom-client (existing). No browser/network code in this plan.
 
-> **Node 24 note:** `node --test <dir>` (bare directory arg) is **broken on Node 24** — it falls through to the module loader. The portable form, verified on Node 24, is `node --test 'test/**/*.test.js'` (single-quoted so the shell passes the literal glob; Node's built-in globber expands `**` recursively and never scans repo `scripts/*-test.mjs`). Explicit single-file paths (`node --test test/x.test.js`) work on all versions. Node 24's default reporter prints `ℹ pass N` / `ℹ fail N` (not TAP `# pass`); treat "pass N / fail 0 / exit 0" as the success criterion regardless of reporter wording.
+> **Node 24 note:** `node --test <dir>` (bare directory arg) is **broken on Node 24** — it falls through to the module loader. The portable form, verified on Node 24, is `node --test 'test/**/*.test.js'` (single-quoted so the shell passes the literal glob; Node's built-in globber expands `**` recursively and never scans repo `scripts/*-test.mjs`). Explicit single-file paths (`node --test test/x.test.js`) work on all versions. Node 24's default reporter prints `ℹ pass N` / `ℹ fail N` (not TAP `# pass`); treat "pass N / fail 0 / exit 0" as the success criterion regardless of reporter wording. **Cumulative pass counts shown in later steps are illustrative** — Task 3 added 2 false-positive regression guards beyond the original 8, so whole-suite totals run +2 vs. the first-draft numbers; the real success criterion is always "the task's own new tests pass AND `fail 0`", never an exact cumulative integer.
 
 **Source spec:** `docs/superpowers/specs/2026-05-18-blacklight-scraper-anti-bot-audit-design.md` — Phase 1 findings addressed here: **F8** (error taxonomy), **F3 / F11** (centralized structural block detection), **F12 / C1** (BaseScraper "0 jobs ≠ automatic success" seam), and the classifier half of **O2**. Per-scraper wiring (L1, L2, T1, T4, T9, T15, I1, I2, I3, I13, I14) is Plan 1C; metrics/alerts/orchestrator (O1, O3, O4, O5, O9, O10, C3) is Plan 1B.
 
@@ -387,7 +387,29 @@ test('legit title containing the word "security" is NOT a false positive', () =>
     });
     assert.equal(r.blocked, false);
 });
+
+test('legit job URL slug containing "challenge" is NOT blocked (segment-anchored fragment)', () => {
+    const r = detectBlock({
+        status: 200,
+        finalUrl: 'https://www.indeed.com/jobs/challenge-engineer-12345',
+        title: 'Challenge Engineer Jobs | Indeed.com',
+        html: '<div class="job_seen_beacon">role</div>',
+    });
+    assert.equal(r.blocked, false);
+});
+
+test('job page whose body merely mentions datadome/cloudflare is NOT blocked', () => {
+    const r = detectBlock({
+        status: 200,
+        finalUrl: 'https://www.dice.com/job/12345',
+        title: 'Security Engineer | Example',
+        html: '<p>We use DataDome and Cloudflare to protect our API. Now hiring a security engineer.</p>',
+    });
+    assert.equal(r.blocked, false);
+});
 ```
+
+(The last two tests are false-positive regression guards: structural markers must not fire on legit job pages whose URL slug contains "challenge" or whose body merely mentions a vendor name. They drove tightening `'datadome'`→`'js.datadome.co'` and `/captcha|/challenge`→`/captcha/|/challenge/`.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -415,13 +437,13 @@ const CLOUDFLARE_MARKERS = [
     '__cf_chl', 'cf-browser-verification',
 ];
 const DATADOME_MARKERS = [
-    'captcha-delivery.com', 'geo.captcha-delivery', 'datadome', 'dd-captcha',
+    'captcha-delivery.com', 'geo.captcha-delivery', 'js.datadome.co', 'dd-captcha',
 ];
 
 // URL path fragments meaning "not on a content page".
 const BLOCK_URL_FRAGMENTS = [
     '/checkpoint/', '/authwall', '/uas/login', '/account/login',
-    '/captcha', '/challenge',
+    '/captcha/', '/challenge/',
 ];
 
 // <title> phrases used by Cloudflare / DataDome / Indeed / generic WAFs.
@@ -511,7 +533,7 @@ export function assertNotBlocked(input = {}) {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `node --test test/core/block-detection.test.js`
-Expected: `# pass 8`, `# fail 0`.
+Expected: 10 tests pass (8 detection cases + 2 false-positive regression guards), 0 fail.
 
 - [ ] **Step 5: Commit**
 
