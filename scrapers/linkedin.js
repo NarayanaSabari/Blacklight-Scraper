@@ -23,6 +23,15 @@ import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
 import { getMetrics } from '../src/metrics/registry.js';
+import { assertNotBlocked } from '../src/core/block-detection.js';
+import { DomChangedError, BlockedError, AuthError } from '../src/core/errors.js';
+
+// Flag-gated hardening (audit L1/L2/D1). OFF (default/shipped) = byte-
+// identical to today's LinkedIn scraper (empirically: 100 posts/~193s
+// with valid cookies). SCRAPER_STRICT_EMPTY=true per-host activates:
+// a block/checkpoint throws (→ cooldown + 'blocked'/'dom_changed'
+// metric) instead of a silent successful 0-post scrape.
+const STRICT = process.env.SCRAPER_STRICT_EMPTY === 'true';
 
 const log = createLogger('linkedin');
 const logProgress = (_scope, msg) => log.info(msg);
@@ -70,10 +79,14 @@ function loadCookies(credential) {
             path: c.path || '/',
             httpOnly: !!c.httpOnly,
             secure: !!c.secure,
+            // Playwright only accepts Strict|Lax|None. 'unspecified' (and
+            // any other value) MUST fall back to 'Lax' — passing the raw
+            // string through made addCookies reject it, silently dropping
+            // ~40% of the cookie jar (live: 14/24 injected). Safe-by-default.
             sameSite: c.sameSite === 'no_restriction' ? 'None'
                 : c.sameSite === 'strict' ? 'Strict'
                 : c.sameSite === 'lax' ? 'Lax'
-                : c.sameSite || 'Lax',
+                : 'Lax',
         };
         const exp = parseExpiry(c.expirationDate);
         if (exp !== undefined) out.expires = exp;
@@ -86,7 +99,9 @@ function loadCookies(credential) {
 // malformed entry doesn't break the whole batch.
 async function launchWithCookies(credential) {
     logProgress('LinkedIn', '🚀 Launching CloakBrowser stealth Chromium...');
-    const browser = await launch({ headless: true, humanize: true });
+    // Headed by default per operator requirement. LINKEDIN_HEADLESS=true
+    // is an escape hatch for environments with no display (CI/servers).
+    const browser = await launch({ headless: process.env.LINKEDIN_HEADLESS === 'true', humanize: true });
     const context = await browser.newContext({
         viewport: { width: 1366, height: 900 },
         locale: 'en-US',
@@ -145,6 +160,29 @@ const randomDelay = (min, max) => wait(min + Math.random() * (max - min));
 // (CDP helpers — isChromeRunning, startChromeWithDebugging,
 // connectToChrome — removed when this scraper moved to CloakBrowser.
 // See launchWithCookies() above.)
+
+// Pure page-state classifier — distinguishes a real results page from a
+// genuine empty search vs an auth-wall / challenge, so a block can be
+// made loud instead of silently reported as a successful 0-post scrape.
+// Uses the LIVE May-2026 componentkey signal (the old container check
+// in navigateToSearch keyed off pre-2026 selectors and false-alarmed on
+// every healthy run). Pure + junk-safe. Order: challenge → auth_wall →
+// results → no_results → unknown.
+export function linkedinPageState(html, url, title) {
+    const h = typeof html === 'string' ? html : '';
+    const u = typeof url === 'string' ? url : '';
+    const t = typeof title === 'string' ? title : '';
+    const hay = (h + ' ' + t).toLowerCase();
+    if (h.includes('challenge-platform') || h.includes('cf-chl-')
+        || /just a moment|attention required/i.test(t)) return 'challenge';
+    if (/\/login|\/uas\/login|\/checkpoint|\/authwall|session_redirect/.test(u)) return 'auth_wall';
+    if (h.includes('componentkey="expanded')
+        || h.includes('feed-shared-update-v2')
+        || h.includes('reusable-search__result-container')
+        || h.includes('scaffold-finite-scroll')) return 'results';
+    if (/no results found|try searching for|we couldn.t find|no results for/i.test(hay)) return 'no_results';
+    return 'unknown';
+}
 
 // Helper: Check if a URL indicates an unauthenticated/login page
 function isLoginPage(url) {
@@ -463,6 +501,23 @@ async function navigateToSearch(page, query) {
         logProgress('LinkedIn',
             '⚠️  No recognizable LinkedIn container on page — likely a redirect / challenge / login');
         await dumpDebugSnapshot(page, 'no-container');
+    }
+
+    // D1/L2: the hasResults/hasFeed check above keys off pre-May-2026
+    // selectors and false-positives on every healthy run — it cannot
+    // tell a real block from a good page. In STRICT mode, classify the
+    // page off the LIVE signal and throw on a genuine block/auth-wall so
+    // it is loud (cooldown + classified metric) instead of flowing to a
+    // silent successful 0-post scrape. OFF = legacy behavior untouched.
+    if (STRICT) {
+        const html = await page.content().catch(() => '');
+        const state = linkedinPageState(html, page.url(), pageInfo.title);
+        if (state === 'challenge') {
+            assertNotBlocked({ status: null, finalUrl: page.url(), title: pageInfo.title, html, platform: 'linkedin' });
+        }
+        if (state === 'auth_wall') {
+            throw new AuthError('LinkedIn auth-wall / checkpoint after search navigation (cookies likely expired)', { platform: 'linkedin' });
+        }
     }
 }
 
@@ -1088,7 +1143,7 @@ async function analyzePosts(posts) {
 // returning zero on ~43% of niche queries). When absent, falls back
 // to the legacy single-template `"<role>" AND (c2c OR W2 OR 1099)`.
 export async function scrapeLinkedIn(jobTitle, location, sessionId = null, options = {}) {
-    logProgress('LinkedIn', '🚀 LinkedIn Post Scraper (CDP Method)\n');
+    logProgress('LinkedIn', '🚀 LinkedIn Post Scraper (CloakBrowser + cookie auth)\n');
     logProgress('LinkedIn', '='.repeat(50));
 
     // Override CONFIG with parameters (location is ignored, search uses only jobTitle)
@@ -1333,11 +1388,32 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
             return normalizeJobData(jobObj, 'LinkedIn');
         });
 
+        // L1: 0 posts is NOT automatically success. In STRICT mode, if
+        // nothing was extracted and the page didn't positively show a
+        // LinkedIn "no results" state, treat it as a suspected silent
+        // block / DOM change and fail loudly (classified metric +
+        // cooldown via the catch below) rather than reportSuccess([]).
+        let emptyConfirmed = false;
+        if (normalizedPosts.length === 0) {
+            const html = await page.content().catch(() => '');
+            const state = linkedinPageState(html, page.url(), await page.title().catch(() => ''));
+            emptyConfirmed = state === 'no_results';
+            if (STRICT && !emptyConfirmed) {
+                throw new DomChangedError(
+                    `LinkedIn returned 0 posts and no "no results" marker (page state: ${state}) — suspected silent block / DOM change`,
+                    { platform: 'linkedin' },
+                );
+            }
+        }
+
         // Report success against THIS lease (not the platform name).
         loginSuccess = true;
         await lease.reportSuccess(`Scraped ${normalizedPosts.length} posts successfully`);
 
-        return normalizedPosts;
+        // BaseScraper (Plan 1A) accepts Array OR { jobs, emptyConfirmed }.
+        // emptyConfirmed only when LinkedIn positively showed no-results;
+        // behavior-neutral for the jobs payload when OFF.
+        return { jobs: normalizedPosts, emptyConfirmed: emptyConfirmed && normalizedPosts.length === 0 };
 
     } catch (error) {
         logProgress('LinkedIn', '\n❌ Error: ' + error.message);
@@ -1345,8 +1421,24 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
 
         lastError = error;
 
+        // Typed-error routing (Plan 1A): assertNotBlocked throws
+        // BlockedError, the gated 0-posts path throws DomChangedError,
+        // the auth-wall path throws AuthError. Route each to its intended
+        // cooldown taxonomy instead of the message-substring fallback
+        // below, which would mark them as permanent (0-min) credential
+        // burns and defeat the point of failing loud.
+        if (error instanceof BlockedError) {
+            logProgress('LinkedIn', '📤 BLOCKED / challenge — 60 min cooldown, trying next credential...');
+            await lease.reportFailure(`Blocked: ${error.message}`, 60);
+        } else if (error instanceof DomChangedError) {
+            logProgress('LinkedIn', '📤 DOM change / suspected silent block — 30 min cooldown...');
+            await lease.reportFailure(`DOM changed: ${error.message}`, 30);
+        } else if (error instanceof AuthError) {
+            logProgress('LinkedIn', '📤 Auth-wall / cookies expired — flag for refresh, trying next credential...');
+            await lease.reportFailure(`Auth/cookies expired: ${error.message}`, 0);
+        }
         // Report failure against THIS lease (not the platform name).
-        if (!loginSuccess) {
+        else if (!loginSuccess) {
             // Login or authentication failure - try next credential
             if (error.message.includes('Login failed') || error.message.includes('credentials') || error.message.includes('waitForSelector')) {
                 logProgress('LinkedIn', '🔄 Login/navigation failed - will try next credential...');
