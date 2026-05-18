@@ -32,6 +32,15 @@ import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
+import { assertNotBlocked } from '../src/core/block-detection.js';
+
+// Flag-gated hardening (audit I1/I13/I2). Read once. When this is NOT
+// 'true' (the default/shipped state) Indeed behaves byte-identically to
+// the pre-1C scraper: loginSuccess set early, any 0-card page ends
+// pagination, no block detection. Flipping SCRAPER_STRICT_EMPTY=true
+// per-host activates: a Cloudflare/DataDome challenge throws (→ cooldown
+// + 'blocked' metric) instead of a silent successful 0-job scrape.
+const STRICT = process.env.SCRAPER_STRICT_EMPTY === 'true';
 
 const log = createLogger('indeed');
 const logProgress = (_scope, msg) => log.info(msg);
@@ -209,6 +218,20 @@ function buildSearchUrl(domain, jobTitle, location, start = 0) {
     }
     
     return url;
+}
+
+/**
+ * Positively detect Indeed's "no results" page so a genuine empty search
+ * is distinguishable from a silent block / DOM change. Pure + safe on
+ * junk input. Indeed renders a `jobsearch-NoResult` container and/or the
+ * phrase "did not match any jobs".
+ * @param {string} html
+ * @returns {boolean}
+ */
+export function indeedNoResults(html) {
+    if (!html || typeof html !== 'string') return false;
+    if (html.includes('jobsearch-NoResult')) return true;
+    return /did not match any jobs/i.test(html);
 }
 
 /**
@@ -605,10 +628,15 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         // a regional redirect (e.g. in.indeed.com from Indian IPs), which
         // then makes the navigation back to www.indeed.com look bot-like
         // to Cloudflare. Probe confirmed direct-to-search returns 200.
-        loginSuccess = true;
+        // I13: setting loginSuccess=true before any navigation makes the
+        // catch-block cooldown taxonomy dead code. In STRICT mode defer it
+        // to confirmed page 0 (see loop). When NOT strict keep legacy
+        // early-true so behavior is byte-identical.
+        if (!STRICT) loginSuccess = true;
 
         const allJobs = [];
         const seenJobIds = new Set();
+        let sawConfirmedEmpty = false;
 
         // Scrape multiple pages
         for (let pageNum = 0; pageNum < CONFIG.MAX_PAGES; pageNum++) {
@@ -620,22 +648,51 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
             // waitUntil:'load' gives Cloudflare's JS challenge time to run.
             // domcontentloaded fires while still on the challenge page and
             // we end up parsing the "Additional Verification Required" page.
-            await page.goto(searchUrl, {
+            const navResp = await page.goto(searchUrl, {
                 waitUntil: 'load',
                 timeout: 60000
             });
             await page.waitForTimeout(humanDelay(8000, 12000));
-            
+
             // Close any popups
             await closePopups(page);
 
             // Extract jobs from current page
             const html = await page.content();
+
+            // STRICT: throw on a Cloudflare/DataDome/auth-wall challenge so
+            // a block becomes a loud failure (cooldown + 'blocked' metric)
+            // instead of a silent successful 0-job scrape (audit I1/F4).
+            // M5: inspects the SEARCH RESULTS document, never a job title.
+            if (STRICT) {
+                assertNotBlocked({
+                    status: typeof navResp?.status === 'function' ? navResp.status() : null,
+                    finalUrl: page.url(),
+                    title: await page.title().catch(() => ''),
+                    html,
+                    platform: 'indeed',
+                });
+            }
+
             const pageJobs = extractJobsFromSearchPage(html, domain);
-            
+
             logProgress('Indeed', `Page ${pageNum + 1}: Found ${pageJobs.length} jobs`);
 
+            // I13: not blocked and page 0 — genuinely past Cloudflare.
+            if (STRICT && pageNum === 0) loginSuccess = true;
+
             if (pageJobs.length === 0) {
+                // I2: page-0 zero is NOT "end of results" — it is a block
+                // or DOM change UNLESS Indeed positively shows its
+                // no-results marker. Later pages legitimately end here.
+                // Note: this lands the 30-min "after login" cooldown (loginSuccess=true by here) — intentional: a true CF/DataDome block was already caught above by the block-detection guard (60-min); reaching here means DOM-change-like, not a fingerprint block.
+                if (STRICT && pageNum === 0 && !indeedNoResults(html)) {
+                    throw new Error('Indeed page 1 returned 0 jobs with no "no results" marker — suspected block / DOM change');
+                }
+                if (pageNum === 0 && indeedNoResults(html)) {
+                    logProgress('Indeed', 'Indeed reports no matching jobs (confirmed empty)');
+                    sawConfirmedEmpty = true;
+                }
                 logProgress('Indeed', 'No more jobs found, stopping pagination');
                 break;
             }
@@ -695,7 +752,12 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
 
         await lease.reportSuccess(`Scraped ${normalizedJobs.length} jobs successfully`);
 
-        return normalizedJobs;
+        // BaseScraper (Plan 1A) accepts Array OR { jobs, emptyConfirmed }.
+        // emptyConfirmed only when Indeed positively showed its no-results
+        // marker. Scrape FLOW is byte-identical when STRICT off; emptyConfirmed may be
+        // true on a genuine no-results page (intended: suppresses the
+        // Plan 1B unconfirmed-zero warning for real empties).
+        return { jobs: normalizedJobs, emptyConfirmed: sawConfirmedEmpty && normalizedJobs.length === 0 };
 
     } catch (error) {
         try { await browser.close(); } catch { /* already closed */ }
