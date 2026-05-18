@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectBlock } from '../../src/core/block-detection.js';
+import { detectBlock, assertNotBlocked } from '../../src/core/block-detection.js';
+import { BlockedError } from '../../src/core/errors.js';
 
 test('clean results page is not blocked', () => {
     const r = detectBlock({
@@ -96,4 +97,30 @@ test('job page whose body merely mentions datadome/cloudflare is NOT blocked', (
         html: '<p>We use DataDome and Cloudflare to protect our API. Now hiring a security engineer.</p>',
     });
     assert.equal(r.blocked, false);
+});
+
+test('assertNotBlocked is a no-op on a clean page', () => {
+    assertNotBlocked({
+        status: 200,
+        finalUrl: 'https://www.indeed.com/jobs?q=node',
+        title: 'node jobs | Indeed.com',
+    });
+});
+
+test('assertNotBlocked throws BlockedError with kind + platform', () => {
+    assert.throws(
+        () => assertNotBlocked({
+            status: 403,
+            finalUrl: 'https://www.indeed.com/jobs',
+            title: '',
+            platform: 'indeed',
+        }),
+        (err) => {
+            assert.ok(err instanceof BlockedError);
+            assert.equal(err.code, 'BLOCKED');
+            assert.equal(err.kind, 'http_forbidden');
+            assert.equal(err.platform, 'indeed');
+            return true;
+        },
+    );
 });
