@@ -712,7 +712,7 @@ async function extractPosts(page, maxPosts) {
     const seenIds = new Set();
     const seenContentHashes = new Set(); // Track content to avoid duplicates
     let scrollAttempts = 0;
-    const maxScrolls = 150;
+    const maxScrolls = CONFIG.maxScrolls;
     let noNewPostsCount = 0;
     
     while (allPosts.length < maxPosts && scrollAttempts < maxScrolls) {
@@ -1115,8 +1115,8 @@ async function extractPosts(page, maxPosts) {
         // Stop if no new posts for 5 consecutive scrolls (was 15 — wasted
         // 30-45s scrolling when LinkedIn had genuinely run out of results
         // for the boolean query).
-        if (noNewPostsCount >= 5) {
-            logProgress('LinkedIn', '   ℹ️  No new posts for 5 scrolls, stopping...');
+        if (noNewPostsCount >= CONFIG.noProgressStop) {
+            logProgress('LinkedIn', `   ℹ️  No new posts for ${CONFIG.noProgressStop} scrolls, stopping...`);
             break;
         }
 
@@ -1137,7 +1137,7 @@ async function extractPosts(page, maxPosts) {
             }
         });
 
-        await randomDelay(CONFIG.scrollDelay, CONFIG.scrollDelay + 1000);
+        await wait(nextScrollDelay(scrollAttempts, Math.random, CONFIG.scrollPacing));
     }
 
     if (allPosts.length === 0) {
