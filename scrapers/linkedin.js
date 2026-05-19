@@ -40,6 +40,23 @@ const COOKIES_EXPIRED_COOLDOWN_MIN = 60;
 const log = createLogger('linkedin');
 const logProgress = (_scope, msg) => log.info(msg);
 
+// Anti-bot pacing knobs (env-tunable, read once at module load). Mirrors
+// env.js::toInt discipline — absent/garbage → default; never throws.
+export function readPacingConfig(env = process.env) {
+    const int = (v, d) => { const n = Number.parseInt(v, 10); return Number.isFinite(n) ? n : d; };
+    return {
+        maxScrolls: int(env.LINKEDIN_MAX_SCROLLS, 60),
+        noProgressStop: int(env.LINKEDIN_NOPROGRESS_STOP, 4),
+        scrollPacing: {
+            min: int(env.LINKEDIN_SCROLL_MIN_MS, 2500),
+            max: int(env.LINKEDIN_SCROLL_MAX_MS, 5000),
+            pauseEvery: int(env.LINKEDIN_SCROLL_PAUSE_EVERY, 6),
+            pauseMin: int(env.LINKEDIN_SCROLL_PAUSE_MIN_MS, 8000),
+            pauseMax: int(env.LINKEDIN_SCROLL_PAUSE_MAX_MS, 15000),
+        },
+    };
+}
+
 // Configuration
 const CONFIG = {
     searchQuery: '',   // Will be built as a boolean query dynamically
@@ -51,7 +68,8 @@ const CONFIG = {
     password: null,
     credentialId: null,
     // Use search instead of feed for better job targeting
-    useFeedInsteadOfSearch: false  // Set to true to use feed (has URLs but less relevant)
+    useFeedInsteadOfSearch: false,  // Set to true to use feed (has URLs but less relevant)
+    ...readPacingConfig(),
 };
 
 // Cookie-export tools emit `expirationDate` as either Unix seconds
