@@ -1197,11 +1197,11 @@ async function analyzePosts(posts) {
 // `options.searchQueries` (optional) is an array of pre-built LinkedIn
 // boolean search queries — typically 3 AI-generated variants supplied by
 // the backend's AIRoleNormalizationService and shipped through the queue
-// payload. When present, each query is run sequentially against the
-// same Chrome session and results are deduplicated by post id, raising
-// recall on niche roles (the legacy single-template was empirically
-// returning zero on ~43% of niche queries). When absent, falls back
-// to the legacy single-template `"<role>" AND (c2c OR W2 OR 1099)`.
+// payload. Anti-bot pacing: exactly ONE uniformly-random variant is run
+// per browser session (LinkedIn invalidates the automated session after
+// ~1 query); coverage of the remaining variants accrues across repeated
+// orchestrator cycles. When absent, falls back to the legacy
+// single-template `"<role>" AND (c2c OR W2 OR 1099)`.
 export async function scrapeLinkedIn(jobTitle, location, sessionId = null, options = {}) {
     logProgress('LinkedIn', '🚀 LinkedIn Post Scraper (CloakBrowser + cookie auth)\n');
     logProgress('LinkedIn', '='.repeat(50));
@@ -1294,10 +1294,11 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         browser = br;
         page = await context.newPage();
         
-        // Run each query sequentially against the same Chrome session,
-        // accumulating posts with cross-query dedup by post id (LinkedIn
-        // activity URN — already unique). Inter-query delay so we don't
-        // burn LinkedIn's rate limit when running 3 searches in a row.
+        // Anti-bot pacing: `queriesToRun` holds exactly ONE variant, so
+        // this loop iterates once per session. The cross-query
+        // accumulation/dedup machinery (and the qi>0 inter-query delay)
+        // is retained intact but effectively single-pass — it stays
+        // correct if the one-variant policy is ever relaxed.
         const seenIdsAcrossQueries = new Set();
         const posts = [];
         const perQueryYield = []; // [{ query, queryIndex, found, added }]
