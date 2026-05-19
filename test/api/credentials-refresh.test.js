@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { planCookieRefresh } from '../../src/api/credentials.js';
+import { CredentialsClient } from '../../src/api/credentials.js';
 
 const LI = [{ name: 'li_at', value: 'tok', domain: '.www.linkedin.com' },
             { name: 'lidc', value: 'x', domain: '.linkedin.com' }];
@@ -39,4 +40,17 @@ test('jar over 64 KB → skip (skipped_too_large)', () => {
     const p = planCookieRefresh({ isLocal: false, sessionId: 's', cookies: big });
     assert.equal(p.action, 'skip');
     assert.equal(p.outcome, 'skipped_too_large');
+});
+
+test('refreshCookies with no active lease: returns, never throws', async () => {
+    const c = new CredentialsClient({ apiUrl: 'https://x', apiKey: 'k' });
+    await assert.doesNotReject(() => c.refreshCookies('linkedin', [{ name: 'li_at', value: 'v' }]));
+});
+
+test('refreshCookies on a local-lease client is a no-op (no throw, no HTTP)', async () => {
+    const c = new CredentialsClient({ apiUrl: 'https://x', apiKey: 'k' });
+    const lease = c._issueLeaseForTest('linkedin', 'local-linkedin', { id: 'local-linkedin' }, 'sess-77');
+    assert.equal(lease.sessionId, 'sess-77');
+    assert.equal(typeof lease.refreshCookies, 'function');
+    await assert.doesNotReject(() => lease.refreshCookies([{ name: 'li_at', value: 'v' }]));
 });
