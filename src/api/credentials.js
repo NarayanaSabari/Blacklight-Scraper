@@ -30,7 +30,24 @@ import { getMetrics } from '../metrics/registry.js';
 
 const log = createLogger('credentials');
 
-class CredentialsClient {
+// Pure decision for the cookie-jar write-back (handoff §3/§4). No I/O.
+// Mirrors the backend's reject rules so we never POST a guaranteed-400:
+// local → no-op; jar must be a non-empty array containing a non-empty
+// `li_at`; serialized body must be ≤ 64 KB.
+export function planCookieRefresh({ isLocal, sessionId, cookies }) {
+    if (isLocal) return { action: 'skip', outcome: 'skipped_local' };
+    const hasAuth = Array.isArray(cookies) && cookies.length > 0
+        && cookies.some((c) => c && c.name === 'li_at'
+            && typeof c.value === 'string' && c.value.length > 0);
+    if (!hasAuth) return { action: 'skip', outcome: 'skipped_no_li_at' };
+    const body = { session_id: sessionId ?? null, cookies };
+    if (Buffer.byteLength(JSON.stringify(body), 'utf8') > 64 * 1024) {
+        return { action: 'skip', outcome: 'skipped_too_large' };
+    }
+    return { action: 'post', outcome: 'refreshed', body };
+}
+
+export class CredentialsClient {
     constructor({ apiUrl, apiKey }) {
         this.apiUrl = apiUrl ? apiUrl.replace(/\/$/, '') : null;
         this.apiKey = apiKey ?? null;
@@ -48,13 +65,25 @@ class CredentialsClient {
 
     // ----- lease bookkeeping ------------------------------------------------
 
-    #issueLease(platform, id, data) {
+    #issueLease(platform, id, data, sessionId = null) {
         const nonce = this.nextNonce++;
         const leaseKey = `${platform}:${id}:${nonce}`;
-        const lease = { leaseKey, platform, id, data };
+        const lease = { leaseKey, platform, id, data, sessionId };
         this.leases.set(leaseKey, lease);
         this.latestByPlatform.set(platform, leaseKey);
         return lease;
+    }
+
+    // Test-only: construct a lease + facade without network/config.
+    _issueLeaseForTest(platform, id, data, sessionId = null) {
+        return this.#wrapLease(this.#issueLease(platform, id, data, sessionId));
+    }
+
+    // Test-only: is this leaseKey still tracked? Used to pin the
+    // invariant that refreshCookies must NEVER forget the lease (the
+    // verdict report still has to resolve it afterwards).
+    _hasActiveLease(leaseKey) {
+        return this.leases.has(leaseKey);
     }
 
     #resolveLease(leaseKeyOrPlatform) {
@@ -104,7 +133,7 @@ class CredentialsClient {
                 return null;
             }
             const id = `local-${platform}`;
-            const lease = this.#issueLease(platform, id, { id, ...cred });
+            const lease = this.#issueLease(platform, id, { id, ...cred }, sessionId);
             metrics.recordCredentialsFetch(platform, 'found');
             return this.#wrapLease(lease);
         }
@@ -139,7 +168,7 @@ class CredentialsClient {
         }
 
         const credential = await response.json();
-        const lease = this.#issueLease(platform, credential.id, credential);
+        const lease = this.#issueLease(platform, credential.id, credential, sessionId);
         log.info('Credential acquired', {
             platform,
             name: credential.name ?? credential.email ?? `id=${credential.id}`,
@@ -153,8 +182,10 @@ class CredentialsClient {
             get leaseKey() { return lease.leaseKey; },
             get credential() { return lease.data; },
             get platform() { return lease.platform; },
+            get sessionId() { return lease.sessionId; },
             reportSuccess: (message) => this.reportSuccess(lease.leaseKey, message),
             reportFailure: (msg, cooldownMinutes) => this.reportFailure(lease.leaseKey, msg, cooldownMinutes),
+            refreshCookies: (cookies) => this.refreshCookies(lease.leaseKey, cookies),
             release: () => this.release(lease.leaseKey),
         };
     }
@@ -184,6 +215,32 @@ class CredentialsClient {
         } finally {
             this.#forgetLease(lease);
         }
+    }
+
+    async refreshCookies(leaseKeyOrPlatform, cookies) {
+        const lease = this.#resolveLease(leaseKeyOrPlatform);
+        if (!lease) {
+            log.warn('No active credential to refresh cookies for', { key: leaseKeyOrPlatform });
+            return;
+        }
+        const metrics = getMetrics();
+        const isLocal = this.isLocal || String(lease.id).startsWith('local-');
+        const plan = planCookieRefresh({ isLocal, sessionId: lease.sessionId, cookies });
+        if (plan.action === 'skip') {
+            metrics.recordCredentialRefresh(lease.platform, plan.outcome);
+            log.info('Cookie write-back skipped', { platform: lease.platform, reason: plan.outcome });
+            return;
+        }
+        try {
+            await this.#postLeaseAction(lease, 'refresh', plan.body);
+            metrics.recordCredentialRefresh(lease.platform, 'refreshed');
+            log.info('Credential jar refreshed', { platform: lease.platform });
+        } catch (error) {
+            metrics.recordCredentialRefresh(lease.platform, 'error');
+            log.warn('Credential refresh failed (best-effort, ignored)', { platform: lease.platform, err: error.message });
+        }
+        // NOTE: never #forgetLease — refresh is non-terminal; success/
+        // failure/release still own lease lifecycle (handoff §4).
     }
 
     async reportFailure(leaseKeyOrPlatform, errorMessage, cooldownMinutes = 0) {

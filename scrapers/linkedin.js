@@ -32,6 +32,10 @@ import { DomChangedError, BlockedError, AuthError } from '../src/core/errors.js'
 // a block/checkpoint throws (→ cooldown + 'blocked'/'dom_changed'
 // metric) instead of a silent successful 0-post scrape.
 const STRICT = process.env.SCRAPER_STRICT_EMPTY === 'true';
+// A logged-out COOKIE credential is recoverable, not a permanent burn:
+// bench-and-rotate so out-of-band / another session's write-back can
+// revive it. (Was a permanent 0-min burn after a CONFIG.email crash.)
+const COOKIES_EXPIRED_COOLDOWN_MIN = 60;
 
 const log = createLogger('linkedin');
 const logProgress = (_scope, msg) => log.info(msg);
@@ -203,6 +207,15 @@ function isAuthenticatedPage(url) {
            !isLoginPage(url);
 }
 
+// A cookie-only leased credential has no email/password — attempting a
+// password login iterates `CONFIG.email` (undefined) → "not iterable"
+// crash → permanent credential burn. This gate prevents that.
+export function canPasswordLogin(cred) {
+    return !!cred
+        && typeof cred.email === 'string' && cred.email.length > 0
+        && typeof cred.password === 'string' && cred.password.length > 0;
+}
+
 async function ensureLoggedIn(page) {
     logProgress('LinkedIn', '🔐 Verifying authentication status...');
     
@@ -219,7 +232,16 @@ async function ensureLoggedIn(page) {
         return true;
     }
     
-    // We got redirected to a login page - need to perform login
+    // §5: a cookie-only credential cannot password-login. Fail typed &
+    // recoverable instead of crashing on `for (const c of CONFIG.email)`.
+    // CONFIG.{email,password} are set from the leased credential in
+    // scrapeLinkedIn (~1218-1219) before navigateToSearch runs;
+    // performLogin already reads the same module CONFIG.
+    if (!canPasswordLogin(CONFIG)) {
+        throw new AuthError(
+            'LinkedIn session not authenticated and credential has no password to log in with (cookies expired/rotated)',
+            { platform: 'linkedin' });
+    }
     logProgress('LinkedIn', '🔑 Not logged in, performing login...');
     await performLogin(page);
     return true;
@@ -1408,6 +1430,11 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
 
         // Report success against THIS lease (not the platform name).
         loginSuccess = true;
+        // Cookie-jar write-back (handoff §4): reaching here means the
+        // session was authenticated (an auth-wall throws AuthError far
+        // earlier). Best-effort — never throws, never affects the verdict.
+        const jar = await context.cookies().catch(() => null);
+        await lease.refreshCookies(jar);
         await lease.reportSuccess(`Scraped ${normalizedPosts.length} posts successfully`);
 
         // BaseScraper (Plan 1A) accepts Array OR { jobs, emptyConfirmed }.
@@ -1435,7 +1462,7 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
             await lease.reportFailure(`DOM changed: ${error.message}`, 30);
         } else if (error instanceof AuthError) {
             logProgress('LinkedIn', '📤 Auth-wall / cookies expired — flag for refresh, trying next credential...');
-            await lease.reportFailure(`Auth/cookies expired: ${error.message}`, 0);
+            await lease.reportFailure(`Auth/cookies expired: ${error.message}`, COOKIES_EXPIRED_COOLDOWN_MIN);
         }
         // Report failure against THIS lease (not the platform name).
         else if (!loginSuccess) {
