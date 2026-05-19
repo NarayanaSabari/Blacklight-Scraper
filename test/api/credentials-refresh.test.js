@@ -54,3 +54,14 @@ test('refreshCookies on a local-lease client is a no-op (no throw, no HTTP)', as
     assert.equal(typeof lease.refreshCookies, 'function');
     await assert.doesNotReject(() => lease.refreshCookies([{ name: 'li_at', value: 'v' }]));
 });
+
+test('refreshCookies NEVER forgets the lease — the verdict must still resolve it after', async () => {
+    const c = new CredentialsClient({ apiUrl: 'https://x', apiKey: 'k' });
+    const lease = c._issueLeaseForTest('linkedin', 'local-linkedin', { id: 'local-linkedin' }, 's');
+    const key = lease.leaseKey;
+    assert.equal(c._hasActiveLease(key), true);
+    await lease.refreshCookies([{ name: 'li_at', value: 'v' }]);
+    assert.equal(c._hasActiveLease(key), true, 'lease must survive refreshCookies (write-back precedes the verdict)');
+    await lease.reportSuccess('done');
+    assert.equal(c._hasActiveLease(key), false, 'the subsequent verdict still resolved + finalized the same lease');
+});

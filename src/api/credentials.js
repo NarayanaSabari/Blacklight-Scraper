@@ -79,6 +79,13 @@ export class CredentialsClient {
         return this.#wrapLease(this.#issueLease(platform, id, data, sessionId));
     }
 
+    // Test-only: is this leaseKey still tracked? Used to pin the
+    // invariant that refreshCookies must NEVER forget the lease (the
+    // verdict report still has to resolve it afterwards).
+    _hasActiveLease(leaseKey) {
+        return this.leases.has(leaseKey);
+    }
+
     #resolveLease(leaseKeyOrPlatform) {
         if (!leaseKeyOrPlatform) return null;
         // Direct leaseKey hit
