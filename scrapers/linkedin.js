@@ -1112,9 +1112,10 @@ async function extractPosts(page, maxPosts) {
             logProgress('LinkedIn', `   ⚠️  No new posts found (${noNewPostsCount} scrolls without new content)`);
         }
 
-        // Stop if no new posts for 5 consecutive scrolls (was 15 — wasted
-        // 30-45s scrolling when LinkedIn had genuinely run out of results
-        // for the boolean query).
+        // Stop early once no new posts for CONFIG.noProgressStop
+        // consecutive scrolls (default 4, env LINKEDIN_NOPROGRESS_STOP;
+        // was a hard-coded 15, then 5) — avoids wasting 30-45s scrolling
+        // when LinkedIn has genuinely run out of results.
         if (noNewPostsCount >= CONFIG.noProgressStop) {
             logProgress('LinkedIn', `   ℹ️  No new posts for ${CONFIG.noProgressStop} scrolls, stopping...`);
             break;
