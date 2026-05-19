@@ -30,6 +30,23 @@ import { getMetrics } from '../metrics/registry.js';
 
 const log = createLogger('credentials');
 
+// Pure decision for the cookie-jar write-back (handoff §3/§4). No I/O.
+// Mirrors the backend's reject rules so we never POST a guaranteed-400:
+// local → no-op; jar must be a non-empty array containing a non-empty
+// `li_at`; serialized body must be ≤ 64 KB.
+export function planCookieRefresh({ isLocal, sessionId, cookies }) {
+    if (isLocal) return { action: 'skip', outcome: 'skipped_local' };
+    const hasAuth = Array.isArray(cookies) && cookies.length > 0
+        && cookies.some((c) => c && c.name === 'li_at'
+            && typeof c.value === 'string' && c.value.length > 0);
+    if (!hasAuth) return { action: 'skip', outcome: 'skipped_no_li_at' };
+    const body = { session_id: sessionId ?? null, cookies };
+    if (Buffer.byteLength(JSON.stringify(body), 'utf8') > 64 * 1024) {
+        return { action: 'skip', outcome: 'skipped_too_large' };
+    }
+    return { action: 'post', outcome: 'refreshed', body };
+}
+
 class CredentialsClient {
     constructor({ apiUrl, apiKey }) {
         this.apiUrl = apiUrl ? apiUrl.replace(/\/$/, '') : null;
