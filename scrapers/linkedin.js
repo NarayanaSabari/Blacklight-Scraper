@@ -57,6 +57,15 @@ export function readPacingConfig(env = process.env) {
     };
 }
 
+// Anti-bot: choose exactly ONE query variant per browser session.
+// Uniformly random so repeated orchestrator cycles cover all variants
+// and the query pattern is less predictable. Pure (rng injectable).
+export function pickSessionQuery(queries, rng = Math.random) {
+    if (!Array.isArray(queries) || queries.length === 0) return null;
+    const i = Math.min(queries.length - 1, Math.max(0, Math.floor(rng() * queries.length)));
+    return queries[i];
+}
+
 // Configuration
 const CONFIG = {
     searchQuery: '',   // Will be built as a boolean query dynamically
