@@ -24,5 +24,21 @@ No LOCAL-file write-back (LOCAL `refreshCookies` = `skipped_local` no-op; LOCAL 
 ## HONEST CAVEAT — REMOTE end-to-end not exercised here
 Full prod REMOTE e2e (a real scrape → live `…/refresh` POST → backend 200) **was not run**: the only API key provided this session 401s on `api.qpeakhire.com` (`Invalid or revoked`). REMOTE correctness is therefore covered by: the exhaustive `planCookieRefresh` unit tests (which fix the exact request body), the reviewed never-throw/never-forget invariants, the `#postLeaseAction` path being the identical mechanism already used in production by `reportSuccess`/`reportFailure` (only `action`+`body` differ), and the backend team's handoff §6 curl test. A heavy headed LOCAL scrape was deliberately not run because in LOCAL mode `refreshCookies` is a documented no-op (`skipped_local`) — it would not exercise the REMOTE path. This limitation is stated, not worked around; recommend a one-time REMOTE smoke once a valid key is available.
 
+## Documented follow-ups (non-blocking; from the final whole-increment review)
+- **M1 — no direct HTTP-mock test for the refresh POST URL/body.** The plan's
+  self-review claimed a "REMOTE happy path asserts the URL `…/queue/<id>/refresh`"
+  test; it was deliberately NOT delivered — asserting it requires intercepting
+  the module-imported `requestWithRetry`, i.e. `node:test` `mock.module` +
+  `--experimental-test-module-mocks`, which would mean changing the `npm test`
+  runner for the whole suite (scope creep / runner-stability risk at the final
+  step). The request *body* is exhaustively pinned by the `planCookieRefresh`
+  unit tests and the URL is built by the SAME production-proven `#postLeaseAction`
+  used daily by `reportSuccess`/`reportFailure` (only `action`/`body` differ), so
+  correctness is established by composition + code-trace + the final review.
+  Stated honestly rather than papered over. Recommended follow-up: add the
+  one HTTP-mock assertion if/when the suite adopts module-mocking.
+- **M2 — one-time REMOTE smoke** once a valid `api.qpeakhire.com` key exists
+  (see HONEST CAVEAT above).
+
 ## Production impact
-Best-effort write-back adds one swallowed POST on the LinkedIn success path (cannot change jobs or verdict). §5 turns a hard crash + permanent credential burn into a typed, recoverable (60-min) failure that also benefits the pre-existing post-search auth-wall path (same "cookies expired" semantics, intentionally shared). No other flow changes; the `0→60` cooldown is the only `reportFailure` cooldown altered.
+Best-effort write-back adds one swallowed POST on the LinkedIn success path (cannot change jobs or verdict). §5 turns a hard crash + permanent credential burn into a typed, recoverable (60-min) failure that also benefits the pre-existing post-search auth-wall path (same "cookies expired" semantics, intentionally shared). No other flow changes; the `0→60` cooldown is the only `reportFailure` cooldown altered. Final whole-increment review (opus): READY TO SHIP, no Critical/Important.
