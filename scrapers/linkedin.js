@@ -66,6 +66,17 @@ export function pickSessionQuery(queries, rng = Math.random) {
     return queries[i];
 }
 
+// Human-like scroll pacing: a jittered base delay, plus a longer
+// "reading pause" every `pauseEvery` scrolls. Pure (rng injectable).
+export function nextScrollDelay(scrollIndex, rng, cfg) {
+    const r = typeof rng === 'function' ? rng : Math.random;
+    const { min, max, pauseEvery, pauseMin, pauseMax } = cfg;
+    if (scrollIndex > 0 && pauseEvery > 0 && scrollIndex % pauseEvery === 0) {
+        return Math.round(pauseMin + r() * (pauseMax - pauseMin));
+    }
+    return Math.round(min + r() * (max - min));
+}
+
 // Configuration
 const CONFIG = {
     searchQuery: '',   // Will be built as a boolean query dynamically
