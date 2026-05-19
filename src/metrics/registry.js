@@ -223,6 +223,13 @@ class MetricsRegistry {
             registers: reg,
         });
 
+        this.credentialRefreshesTotal = new Counter({
+            name: 'scraper_credential_refreshes_total',
+            help: 'Cookie-jar write-back attempts per platform.',
+            labelNames: ['platform', 'outcome'], // refreshed|skipped_local|skipped_no_li_at|skipped_too_large|error
+            registers: reg,
+        });
+
         // Logger tap -------------------------------------------------------
         this.logLinesTotal = new Counter({
             name: 'scraper_log_lines_total',
@@ -318,6 +325,10 @@ class MetricsRegistry {
 
     recordCredentialsFetch(platform, result) {
         this.#safe(() => this.credentialsFetchesTotal.labels(platform, result).inc());
+    }
+
+    recordCredentialRefresh(platform, outcome) {
+        this.#safe(() => this.credentialRefreshesTotal.labels(platform, outcome).inc());
     }
 
     recordLogLine(level, scope) {
