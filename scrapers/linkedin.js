@@ -1408,6 +1408,11 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
 
         // Report success against THIS lease (not the platform name).
         loginSuccess = true;
+        // Cookie-jar write-back (handoff §4): reaching here means the
+        // session was authenticated (an auth-wall throws AuthError far
+        // earlier). Best-effort — never throws, never affects the verdict.
+        const jar = await context.cookies().catch(() => null);
+        await lease.refreshCookies(jar);
         await lease.reportSuccess(`Scraped ${normalizedPosts.length} posts successfully`);
 
         // BaseScraper (Plan 1A) accepts Array OR { jobs, emptyConfirmed }.
