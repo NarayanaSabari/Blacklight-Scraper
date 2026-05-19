@@ -1214,13 +1214,17 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
     const aiQueries = Array.isArray(options.searchQueries) && options.searchQueries.length > 0
         ? options.searchQueries
         : null;
-    const queriesToRun = aiQueries || [buildBooleanSearchQuery(jobTitle)];
+    // Anti-bot: run exactly ONE query per browser session — LinkedIn
+    // invalidates the automated session after ~1 query. A uniformly-
+    // random variant gives all variants coverage across repeated cycles.
+    const chosen = pickSessionQuery(aiQueries) ?? buildBooleanSearchQuery(jobTitle);
+    const chosenIdx = aiQueries ? aiQueries.indexOf(chosen) : -1;
+    const queriesToRun = [chosen];
     CONFIG.searchQuery = queriesToRun[0]; // for downstream compatibility (logs, dumpDebugSnapshot)
 
     logProgress('LinkedIn', `   Job Title: "${jobTitle}"`);
     if (aiQueries) {
-        logProgress('LinkedIn', `   Using ${queriesToRun.length} AI-generated query variant(s):`);
-        queriesToRun.forEach((q, i) => logProgress('LinkedIn', `      [${i + 1}] ${q}`));
+        logProgress('LinkedIn', `   🎲 Variant [${chosenIdx + 1}/${aiQueries.length}] selected for this session: ${chosen}`);
     } else {
         logProgress('LinkedIn', `   Boolean Query (legacy template): ${CONFIG.searchQuery}\n`);
     }
