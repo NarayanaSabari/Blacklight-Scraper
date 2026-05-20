@@ -225,7 +225,7 @@ Expected: clean check, 0 stale close-time captures, 3+ references to `latestAuth
 ```
 npm test
 ```
-Expected: green, no regression. The never-`#forgetLease` test in `test/credentials/refresh-never-forgets-lease.test.js` still passes (the lease lifecycle path is unchanged; only the *input jar* to `refreshCookies` changes).
+Expected: green, no regression. The `refreshCookies NEVER forgets the lease` test in `test/api/credentials-refresh.test.js:58` still passes (the lease lifecycle path is unchanged; only the *input jar* to `refreshCookies` changes).
 
 - [ ] **Step 6: Commit**
 

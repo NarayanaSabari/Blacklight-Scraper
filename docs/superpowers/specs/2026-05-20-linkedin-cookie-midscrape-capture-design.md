@@ -66,7 +66,7 @@ lease → `pickSessionQuery` → one variant → `navigateToSearch` (one `ensure
 
 ## 4. Error handling
 
-Unchanged. The capture call is wrapped in try/catch and **never** throws into the scroll loop; `refreshCookies` already provably never throws and never `#forgetLease`s (regression-pinned in `test/credentials/refresh-never-forgets-lease.test.js`). Verdict / `{jobs, emptyConfirmed}` / AuthError / BlockedError / DomChangedError taxonomies are not touched.
+Unchanged. The capture call is wrapped in try/catch and **never** throws into the scroll loop; `refreshCookies` already provably never throws and never `#forgetLease`s (regression-pinned by the `refreshCookies NEVER forgets the lease` test in `test/api/credentials-refresh.test.js:58`). Verdict / `{jobs, emptyConfirmed}` / AuthError / BlockedError / DomChangedError taxonomies are not touched.
 
 ## 5. Testing
 
@@ -81,7 +81,7 @@ Unchanged. The capture call is wrapped in try/catch and **never** throws into th
 - jar with `li_at` among other cookies → `true`
 
 **Regression:**
-- `test/credentials/refresh-never-forgets-lease.test.js` still passes (the never-`#forgetLease` invariant is unaffected by the capture-site change).
+- The `refreshCookies NEVER forgets the lease` test in `test/api/credentials-refresh.test.js:58` still passes (the never-`#forgetLease` invariant is unaffected by the capture-site change).
 - `npm test` green (133 → 141+ with the new helper tests).
 
 **Empirical (out-of-scope here, by design):**

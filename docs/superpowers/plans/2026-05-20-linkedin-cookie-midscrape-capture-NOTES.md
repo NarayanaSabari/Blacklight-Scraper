@@ -24,7 +24,7 @@ Three commits, all `scrapers/linkedin.js` + one new pure-helper test file:
 - `node --check scrapers/linkedin.js`: clean.
 - `npm test`: **142 / 0** (was 133; +9 from `hasLiAt`).
 - Static probe (post-T3): `latestAuthenticatedJar`=3 hits, `onAuthenticatedBatch`=4, `hasLiAt`=2, `context\.cookies`=0 — all expected.
-- Regression-pin `test/credentials/refresh-never-forgets-lease.test.js` still green — the never-`#forgetLease` invariant on `refreshCookies` was the load-bearing claim that let us drop the close-time recapture without a fallback (null jar → `planCookieRefresh` returns `{action:'skip', reason:'skipped_no_li_at'}` → graceful log, no throw).
+- Regression-pin `refreshCookies NEVER forgets the lease` in `test/api/credentials-refresh.test.js:58` still green — the never-`#forgetLease` invariant on `refreshCookies` was the load-bearing claim that let us drop the close-time recapture without a fallback (null jar → `planCookieRefresh` returns `{action:'skip', reason:'skipped_no_li_at'}` → graceful log, no throw).
 
 ## Honest caveat — effectiveness is observable only in prod
 
