@@ -292,8 +292,19 @@ async function ensureLoggedIn(page) {
 }
 
 async function performLogin(page) {
+    // §5 (defense-in-depth): a cookie-only credential cannot password-login.
+    // The ensureLoggedIn call site has its own pre-check, but navigateToSearch
+    // (~:469) calls performLogin directly on a US-redirect-to-login retry —
+    // fail typed & recoverable here too instead of crashing on
+    // `for (let char of CONFIG.email)` (line ~340) → permanent cooldown:0.
+    if (!canPasswordLogin(CONFIG)) {
+        throw new AuthError(
+            'LinkedIn session not authenticated and credential has no password to log in with (cookies expired/rotated)',
+            { platform: 'linkedin' });
+    }
+
     const currentUrl = page.url();
-    
+
     // Navigate to login page if not already there
     if (!currentUrl.includes('/login') && !currentUrl.includes('/uas/login')) {
         logProgress('LinkedIn', '📍 Navigating to login page...');
