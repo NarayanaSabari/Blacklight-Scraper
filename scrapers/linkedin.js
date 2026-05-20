@@ -1318,6 +1318,15 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         const posts = [];
         const perQueryYield = []; // [{ query, queryIndex, found, added }]
 
+        // Mid-scrape cookie capture (handoff 2026-05-20 §4): stash the
+        // freshest jar that still has li_at, captured *during* a successful
+        // results batch (not at close — by then LinkedIn may have
+        // invalidated li_at server-side).
+        let latestAuthenticatedJar = null;
+        const onAuthenticatedBatch = (jar) => {
+            if (hasLiAt(jar)) latestAuthenticatedJar = jar;
+        };
+
         for (let qi = 0; qi < queriesToRun.length; qi++) {
             if (posts.length >= CONFIG.maxPosts) {
                 logProgress('LinkedIn',
@@ -1339,7 +1348,7 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
 
             await navigateToSearch(page, q);
             const remainingBudget = CONFIG.maxPosts - posts.length;
-            const queryPosts = await extractPosts(page, remainingBudget);
+            const queryPosts = await extractPosts(page, remainingBudget, { onAuthenticatedBatch });
 
             // Dedup by id — same post can match multiple queries.
             // Tag with the query that found it for downstream tracing.
@@ -1488,11 +1497,12 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
 
         // Report success against THIS lease (not the platform name).
         loginSuccess = true;
-        // Cookie-jar write-back (handoff §4): reaching here means the
-        // session was authenticated (an auth-wall throws AuthError far
-        // earlier). Best-effort — never throws, never affects the verdict.
-        const jar = await context.cookies().catch(() => null);
-        await lease.refreshCookies(jar);
+        // Cookie-jar write-back (handoff 2026-05-20 §4): post the freshest
+        // known-authenticated jar captured mid-scrape — NOT a close-time
+        // recapture, which would re-read a jar LinkedIn has often already
+        // poisoned. refreshCookies is null-safe (planCookieRefresh maps
+        // null/no-li_at → skipped_no_li_at, no throw).
+        await lease.refreshCookies(latestAuthenticatedJar);
         await lease.reportSuccess(`Scraped ${normalizedPosts.length} posts successfully`);
 
         // BaseScraper (Plan 1A) accepts Array OR { jobs, emptyConfirmed }.
