@@ -663,7 +663,7 @@ async function dumpDebugSnapshot(page, label) {
     }
 }
 
-async function extractPosts(page, maxPosts) {
+async function extractPosts(page, maxPosts, opts = {}) {
     logProgress('LinkedIn', `📦 Extracting up to ${maxPosts} posts...`);
 
     const isFeedMode = CONFIG.useFeedInsteadOfSearch;
@@ -1113,6 +1113,14 @@ async function extractPosts(page, maxPosts) {
                 logProgress('LinkedIn', `      Post: ${firstPost.postUrl ? '✓' : '✗'} ${firstPost.postUrl || 'Not found'}`);
             }
             noNewPostsCount = 0;
+            if (typeof opts.onAuthenticatedBatch === 'function') {
+                try {
+                    const jar = await page.context().cookies();
+                    await opts.onAuthenticatedBatch(jar);
+                } catch (_capErr) {
+                    // best-effort — never throws into the scroll loop
+                }
+            }
         } else {
             noNewPostsCount++;
             logProgress('LinkedIn', `   ⚠️  No new posts found (${noNewPostsCount} scrolls without new content)`);
