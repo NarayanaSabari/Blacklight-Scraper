@@ -1358,6 +1358,20 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
                 `\n🔎 Query [${qi + 1}/${queriesToRun.length}]: ${q}`);
 
             await navigateToSearch(page, q);
+
+            // Earliest authenticated capture (handoff 2026-05-20 §3a): the
+            // moment navigateToSearch returns we're provably on /search/results/
+            // content/... and authenticated; on a flagged account LinkedIn can
+            // revoke li_at during the scroll loop, so grab the jar *before*
+            // extractPosts begins scrolling. The per-batch capture inside
+            // extractPosts still runs — latestAuthenticatedJar holds whichever
+            // good capture was most recent. Best-effort, never throws.
+            try {
+                await onAuthenticatedBatch(await page.context().cookies());
+            } catch (_preScrollCapErr) {
+                // swallow — capture is best-effort, the per-batch hook is the backstop
+            }
+
             const remainingBudget = CONFIG.maxPosts - posts.length;
             const queryPosts = await extractPosts(page, remainingBudget, { onAuthenticatedBatch });
 
