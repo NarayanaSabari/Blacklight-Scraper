@@ -40,6 +40,43 @@ const COOKIES_EXPIRED_COOLDOWN_MIN = 60;
 const log = createLogger('linkedin');
 const logProgress = (_scope, msg) => log.info(msg);
 
+// Anti-bot pacing knobs (env-tunable, read once at module load). Mirrors
+// env.js::toInt discipline — absent/garbage → default; never throws.
+export function readPacingConfig(env = process.env) {
+    const int = (v, d) => { const n = Number.parseInt(v, 10); return Number.isFinite(n) ? n : d; };
+    return {
+        maxScrolls: int(env.LINKEDIN_MAX_SCROLLS, 60),
+        noProgressStop: int(env.LINKEDIN_NOPROGRESS_STOP, 4),
+        scrollPacing: {
+            min: int(env.LINKEDIN_SCROLL_MIN_MS, 2500),
+            max: int(env.LINKEDIN_SCROLL_MAX_MS, 5000),
+            pauseEvery: int(env.LINKEDIN_SCROLL_PAUSE_EVERY, 6),
+            pauseMin: int(env.LINKEDIN_SCROLL_PAUSE_MIN_MS, 8000),
+            pauseMax: int(env.LINKEDIN_SCROLL_PAUSE_MAX_MS, 15000),
+        },
+    };
+}
+
+// Anti-bot: choose exactly ONE query variant per browser session.
+// Uniformly random so repeated orchestrator cycles cover all variants
+// and the query pattern is less predictable. Pure (rng injectable).
+export function pickSessionQuery(queries, rng = Math.random) {
+    if (!Array.isArray(queries) || queries.length === 0) return null;
+    const i = Math.min(queries.length - 1, Math.max(0, Math.floor(rng() * queries.length)));
+    return queries[i];
+}
+
+// Human-like scroll pacing: a jittered base delay, plus a longer
+// "reading pause" every `pauseEvery` scrolls. Pure (rng injectable).
+export function nextScrollDelay(scrollIndex, rng, cfg) {
+    const r = typeof rng === 'function' ? rng : Math.random;
+    const { min, max, pauseEvery, pauseMin, pauseMax } = cfg;
+    if (scrollIndex > 0 && pauseEvery > 0 && scrollIndex % pauseEvery === 0) {
+        return Math.round(pauseMin + r() * (pauseMax - pauseMin));
+    }
+    return Math.round(min + r() * (max - min));
+}
+
 // Configuration
 const CONFIG = {
     searchQuery: '',   // Will be built as a boolean query dynamically
@@ -51,7 +88,8 @@ const CONFIG = {
     password: null,
     credentialId: null,
     // Use search instead of feed for better job targeting
-    useFeedInsteadOfSearch: false  // Set to true to use feed (has URLs but less relevant)
+    useFeedInsteadOfSearch: false,  // Set to true to use feed (has URLs but less relevant)
+    ...readPacingConfig(),
 };
 
 // Cookie-export tools emit `expirationDate` as either Unix seconds
@@ -674,7 +712,7 @@ async function extractPosts(page, maxPosts) {
     const seenIds = new Set();
     const seenContentHashes = new Set(); // Track content to avoid duplicates
     let scrollAttempts = 0;
-    const maxScrolls = 150;
+    const maxScrolls = CONFIG.maxScrolls;
     let noNewPostsCount = 0;
     
     while (allPosts.length < maxPosts && scrollAttempts < maxScrolls) {
@@ -1074,11 +1112,12 @@ async function extractPosts(page, maxPosts) {
             logProgress('LinkedIn', `   ⚠️  No new posts found (${noNewPostsCount} scrolls without new content)`);
         }
 
-        // Stop if no new posts for 5 consecutive scrolls (was 15 — wasted
-        // 30-45s scrolling when LinkedIn had genuinely run out of results
-        // for the boolean query).
-        if (noNewPostsCount >= 5) {
-            logProgress('LinkedIn', '   ℹ️  No new posts for 5 scrolls, stopping...');
+        // Stop early once no new posts for CONFIG.noProgressStop
+        // consecutive scrolls (default 4, env LINKEDIN_NOPROGRESS_STOP;
+        // was a hard-coded 15, then 5) — avoids wasting 30-45s scrolling
+        // when LinkedIn has genuinely run out of results.
+        if (noNewPostsCount >= CONFIG.noProgressStop) {
+            logProgress('LinkedIn', `   ℹ️  No new posts for ${CONFIG.noProgressStop} scrolls, stopping...`);
             break;
         }
 
@@ -1099,7 +1138,7 @@ async function extractPosts(page, maxPosts) {
             }
         });
 
-        await randomDelay(CONFIG.scrollDelay, CONFIG.scrollDelay + 1000);
+        await wait(nextScrollDelay(scrollAttempts, Math.random, CONFIG.scrollPacing));
     }
 
     if (allPosts.length === 0) {
@@ -1159,11 +1198,11 @@ async function analyzePosts(posts) {
 // `options.searchQueries` (optional) is an array of pre-built LinkedIn
 // boolean search queries — typically 3 AI-generated variants supplied by
 // the backend's AIRoleNormalizationService and shipped through the queue
-// payload. When present, each query is run sequentially against the
-// same Chrome session and results are deduplicated by post id, raising
-// recall on niche roles (the legacy single-template was empirically
-// returning zero on ~43% of niche queries). When absent, falls back
-// to the legacy single-template `"<role>" AND (c2c OR W2 OR 1099)`.
+// payload. Anti-bot pacing: exactly ONE uniformly-random variant is run
+// per browser session (LinkedIn invalidates the automated session after
+// ~1 query); coverage of the remaining variants accrues across repeated
+// orchestrator cycles. When absent, falls back to the legacy
+// single-template `"<role>" AND (c2c OR W2 OR 1099)`.
 export async function scrapeLinkedIn(jobTitle, location, sessionId = null, options = {}) {
     logProgress('LinkedIn', '🚀 LinkedIn Post Scraper (CloakBrowser + cookie auth)\n');
     logProgress('LinkedIn', '='.repeat(50));
@@ -1176,13 +1215,17 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
     const aiQueries = Array.isArray(options.searchQueries) && options.searchQueries.length > 0
         ? options.searchQueries
         : null;
-    const queriesToRun = aiQueries || [buildBooleanSearchQuery(jobTitle)];
+    // Anti-bot: run exactly ONE query per browser session — LinkedIn
+    // invalidates the automated session after ~1 query. A uniformly-
+    // random variant gives all variants coverage across repeated cycles.
+    const chosen = pickSessionQuery(aiQueries) ?? buildBooleanSearchQuery(jobTitle);
+    const chosenIdx = aiQueries ? aiQueries.indexOf(chosen) : -1;
+    const queriesToRun = [chosen];
     CONFIG.searchQuery = queriesToRun[0]; // for downstream compatibility (logs, dumpDebugSnapshot)
 
     logProgress('LinkedIn', `   Job Title: "${jobTitle}"`);
     if (aiQueries) {
-        logProgress('LinkedIn', `   Using ${queriesToRun.length} AI-generated query variant(s):`);
-        queriesToRun.forEach((q, i) => logProgress('LinkedIn', `      [${i + 1}] ${q}`));
+        logProgress('LinkedIn', `   🎲 Variant [${chosenIdx + 1}/${aiQueries.length}] selected for this session: ${chosen}`);
     } else {
         logProgress('LinkedIn', `   Boolean Query (legacy template): ${CONFIG.searchQuery}\n`);
     }
@@ -1252,10 +1295,11 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         browser = br;
         page = await context.newPage();
         
-        // Run each query sequentially against the same Chrome session,
-        // accumulating posts with cross-query dedup by post id (LinkedIn
-        // activity URN — already unique). Inter-query delay so we don't
-        // burn LinkedIn's rate limit when running 3 searches in a row.
+        // Anti-bot pacing: `queriesToRun` holds exactly ONE variant, so
+        // this loop iterates once per session. The cross-query
+        // accumulation/dedup machinery (and the qi>0 inter-query delay)
+        // is retained intact but effectively single-pass — it stays
+        // correct if the one-variant policy is ever relaxed.
         const seenIdsAcrossQueries = new Set();
         const posts = [];
         const perQueryYield = []; // [{ query, queryIndex, found, added }]
