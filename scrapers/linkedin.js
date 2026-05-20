@@ -77,6 +77,12 @@ export function nextScrollDelay(scrollIndex, rng, cfg) {
     return Math.round(min + r() * (max - min));
 }
 
+export function hasLiAt(jar) {
+    return Array.isArray(jar) && jar.some(
+        c => c && c.name === 'li_at' && typeof c.value === 'string' && c.value.length > 0
+    );
+}
+
 // Configuration
 const CONFIG = {
     searchQuery: '',   // Will be built as a boolean query dynamically
