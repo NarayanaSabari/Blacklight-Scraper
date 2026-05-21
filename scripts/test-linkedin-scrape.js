@@ -12,6 +12,7 @@
 import {
     launchPersistentProfile, navigateToSearch, extractPosts,
     buildBooleanSearchQuery, postSourceUrl, activityPermalink, extractActivityId,
+    resolvePostUrlViaMenu,
     CONFIG, linkedInProfileDir,
 } from '../scrapers/linkedin.js';
 
@@ -53,7 +54,12 @@ async function main() {
         process.exit(2);
     }
 
-    const posts = await extractPosts(page, MAX);
+    const onNewPost = async (post) => {
+        if (post.postUrl) return;
+        const act = await resolvePostUrlViaMenu(page, post.id);
+        if (act) { post.activityUrn = `urn:li:activity:${act}`; post.postUrl = activityPermalink(act); }
+    };
+    const posts = await extractPosts(page, MAX, { onNewPost });
     console.log(`\n=== Scraped ${posts.length} post(s) (cap ${MAX}) ===\n`);
 
     const counts = { PERMALINK: 0, OTHER: 0, PROFILE: 0, EMPTY: 0 };
