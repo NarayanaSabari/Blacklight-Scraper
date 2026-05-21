@@ -71,16 +71,24 @@ test('D4: sameSite never passes the raw value through', () => {
 test('L5: stale "(CDP Method)" banner removed', () => {
     assert.doesNotMatch(SRC, /CDP Method/);
 });
-test('catch routes typed errors via instanceof BEFORE substring fallback', () => {
-    const i = SRC.indexOf('lastError = error;');
-    const blk = SRC.indexOf('error instanceof BlockedError');
-    const dom = SRC.indexOf('error instanceof DomChangedError');
+test('persistent-session catch: AuthError cools+reestablishes, others keep the warm session, always rethrows', () => {
+    // Persistent-session model (design §5): decouple ROLE outcome from
+    // CREDENTIAL outcome. Only AuthError (dead credential) cools the
+    // credential down AND tears the session down to reestablish; Blocked /
+    // DomChanged leave the warm session intact (no per-role credential
+    // cooldown). The catch always re-throws so BaseScraper classifies the role.
+    const cat = SRC.indexOf('} catch (error) {');
     const aut = SRC.indexOf('error instanceof AuthError');
-    const sub = SRC.indexOf("!loginSuccess");
-    assert.ok(i >= 0 && blk > i && dom > blk && aut > dom, 'typed branches missing/misordered');
-    assert.ok(sub > aut, 'instanceof routing must precede the !loginSuccess substring branch');
-    assert.match(SRC, /instanceof BlockedError[^]*reportFailure\([^,]+,\s*60\)/);
-    assert.match(SRC, /instanceof DomChangedError[^]*reportFailure\([^,]+,\s*30\)/);
+    assert.ok(cat >= 0 && aut > cat, 'AuthError branch missing from catch');
+    assert.match(SRC, /instanceof AuthError[^]*reportFailure\([^,]+,\s*COOKIES_EXPIRED_COOLDOWN_MIN\)/);
+    assert.match(SRC, /instanceof AuthError[^]*session\.reestablish\(sessionId\)/);
+    assert.match(SRC, /instanceof BlockedError[^]*keeping warm session/);
+    assert.match(SRC, /instanceof DomChangedError[^]*keeping warm session/);
+    // Blocked / DomChanged must NOT cool the credential down.
+    assert.doesNotMatch(SRC, /instanceof BlockedError[^]*reportFailure/);
+    assert.doesNotMatch(SRC, /instanceof DomChangedError[^]*reportFailure/);
+    // Always re-throw.
+    assert.match(SRC, /\}\s*\n\s*throw error;\s*\n\s*\}/);
 });
 test('auth-wall throws AuthError (not a plain Error)', () => {
     assert.match(SRC, /throw new AuthError\('LinkedIn auth-wall \/ checkpoint after search navigation/);
