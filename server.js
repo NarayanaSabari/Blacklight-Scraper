@@ -19,6 +19,7 @@ import express from 'express';
 import { getConfig } from './src/config/env.js';
 import { createLogger, attachLokiSink, attachMetricsSink } from './src/logger/index.js';
 import { initializeCredentialsClient, getCredentialsClient } from './src/api/credentials.js';
+import { getLinkedInSession } from './src/scrapers/linkedin-session.js';
 import { QueueOrchestrator } from './src/queue/orchestrator.js';
 import { getMetrics } from './src/metrics/registry.js';
 import { getPusher } from './src/metrics/push.js';
@@ -153,6 +154,9 @@ async function main() {
         const steps = [
             ['pusher', telemetry.pusher.stop({ finalPush: true })],
             ['loki', telemetry.lokiTransport.stop({ finalFlush: true })],
+            // Persistent LinkedIn session: close the warm browser + release
+            // its held lease before the catch-all releaseAll() below.
+            ['linkedin-session', getLinkedInSession().shutdown()],
             ['credentials', getCredentialsClient().releaseAll()],
         ];
         for (const [label, promise] of steps) {

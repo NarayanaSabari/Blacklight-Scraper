@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "NODE_ENV=development node --watch server.js",
-    "chrome:login": "node scripts/chrome-debug.js",
+    "linkedin:login": "node scripts/linkedin-login.js",
     "test": "node --test 'test/**/*.test.js'",
     "setup": "node server.js --setup"
   },

@@ -1,27 +1,28 @@
-// LinkedIn Scraper — CloakBrowser + cookie auth
+// LinkedIn Scraper — CloakBrowser persistent stealth profile
 //
-// Was: CDP-attach to a manually-running Chrome (`npm run chrome:login`).
-// Now: CloakBrowser stealth Chromium with cookies injected from the
-// credentials API. Same auth surface, no manual Chrome step, scales to
-// concurrent scrapes from the same machine.
-//
-// Auth strategy:
-//   1. Lease a credential from the API. It carries `credentials`
-//      (cookie array) plus an `email/password` fallback.
-//   2. Inject cookies into a fresh CloakBrowser context.
-//   3. Navigate to feed/search. If we land on the auth wall (cookies
-//      stale), the existing `performLogin()` flow logs in with
-//      email/password — works the same in CloakBrowser as in CDP.
+// Auth model (persistent-session D1b, manual-login): the operator logs in
+// ONCE via `npm run linkedin:login` into an on-disk CloakBrowser profile.
+// scrapeLinkedIn borrows a page per role from the long-lived LinkedInSession
+// (one warm context for the whole process); the logged-in session lives in
+// the profile and rotates organically — no per-run cookie injection. A
+// credential is still leased as a slot/lock + email/password re-login
+// fallback (performLogin). Earlier models — CDP-attach to a manual Chrome,
+// then CloakBrowser + per-run API-cookie injection — are both superseded.
+// (`launchWithCookies`/`loadCookies` remain for the optional cookie-seed path
+//  but are unused on the persistent-profile scrape path.)
 //
 // Scroll behaviour: LinkedIn A/B tests two DOMs. LEGACY scrolls at the
 // window level; NEW puts the feed inside a scrollable <main> and the
 // document scrollHeight stays pinned. We scroll the inner <main> when
 // it's the actual scroll root, else fall back to window scroll.
 
-import { launch } from 'cloakbrowser';
+import os from 'os';
+import path from 'path';
+import { launch, launchPersistentContext } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
+import { getLinkedInSession } from '../src/scrapers/linkedin-session.js';
 import { getMetrics } from '../src/metrics/registry.js';
 import { assertNotBlocked } from '../src/core/block-detection.js';
 import { DomChangedError, BlockedError, AuthError } from '../src/core/errors.js';
@@ -145,7 +146,7 @@ function loadCookies(credential) {
 // Launch CloakBrowser and create a context with the credential's
 // cookies pre-injected. Per-cookie retry on bulk-add failure so one
 // malformed entry doesn't break the whole batch.
-async function launchWithCookies(credential) {
+export async function launchWithCookies(credential) {
     logProgress('LinkedIn', '🚀 Launching CloakBrowser stealth Chromium...');
     // Headed by default per operator requirement. LINKEDIN_HEADLESS=true
     // is an escape hatch for environments with no display (CI/servers).
@@ -172,6 +173,33 @@ async function launchWithCookies(credential) {
     }
     logProgress('LinkedIn', `✅ CloakBrowser ready (${added}/${cookies.length} cookies injected)`);
     return { browser, context };
+}
+
+// On-disk persistent stealth profile directory. The operator logs in ONCE
+// via `npm run linkedin:login`; the session (cookies, localStorage) lives
+// here and rotates organically across runs — no per-run cookie injection.
+export function linkedInProfileDir() {
+    return process.env.LINKEDIN_PROFILE_DIR
+        || path.join(os.homedir(), '.blacklight-linkedin-profile');
+}
+
+// Launch the persistent stealth profile (D1b, manual-login model). Returns a
+// Playwright BrowserContext directly (cloakbrowser.launchPersistentContext
+// has no separate Browser handle — close the context to tear down). No cookie
+// injection: the profile already holds the operator's logged-in session.
+export async function launchPersistentProfile() {
+    const userDataDir = linkedInProfileDir();
+    logProgress('LinkedIn', `🚀 Launching CloakBrowser persistent profile (${userDataDir})...`);
+    const context = await launchPersistentContext({
+        userDataDir,
+        headless: process.env.LINKEDIN_HEADLESS === 'true',
+        humanize: true,
+        viewport: { width: 1366, height: 900 },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
+    });
+    logProgress('LinkedIn', '✅ CloakBrowser persistent profile ready');
+    return context;
 }
 
 /**
@@ -1255,52 +1283,18 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         logProgress('LinkedIn', `   Boolean Query (legacy template): ${CONFIG.searchQuery}\n`);
     }
     
-    const apiClient = getCredentialsAPIClient();
-    const maxAttempts = 3;
-    let attemptCount = 0;
-    let lastError = null;
-    
-    // Retry loop: Try up to maxAttempts credentials
-    while (attemptCount < maxAttempts) {
-        attemptCount++;
-        
-        // Fetch credentials from API with wait-and-retry logic
-        logProgress('LinkedIn', `\n🔑 Attempting to fetch credential (attempt ${attemptCount}/${maxAttempts})...`);
-        
-        // Acquire a LEASE (not legacy getCredential) so reportSuccess /
-        // reportFailure target this specific lease. The legacy
-        // platform-keyed API resolves through latestByPlatform which is
-        // overwritten by any concurrent acquire — without lease-keyed
-        // reports, two parallel linkedin scrapes release each other's
-        // leases and credential state in the backend drifts.
-        let lease = null;
-        const maxCredentialRetries = 10; // Wait for credentials up to 10 times
-        const credentialRetryDelay = 60000; // 60 seconds between retries
-
-        for (let credRetry = 0; credRetry < maxCredentialRetries; credRetry++) {
-            lease = await apiClient.acquire('linkedin', sessionId);
-
-            if (lease) {
-                break;
-            }
-
-            if (credRetry < maxCredentialRetries - 1) {
-                logProgress('LinkedIn', `⏳ No credentials available, waiting ${credentialRetryDelay/1000}s before retry ${credRetry + 1}/${maxCredentialRetries}...`);
-                await new Promise(resolve => setTimeout(resolve, credentialRetryDelay));
-            }
-        }
-
-        if (!lease) {
-            logProgress('LinkedIn', `⚠️  No LinkedIn credentials available after ${maxCredentialRetries} retries`);
-            if (lastError) {
-                throw lastError;
-            }
-            throw new Error('No LinkedIn credentials available from API');
-        }
-
-        const credential = lease.credential;
+    // Persistent-session model (D1b): the LinkedInSession singleton holds
+    // ONE long-lived CloakBrowser context + credential lease for the whole
+    // process. We borrow a fresh page (tab) per role via withPage and never
+    // close the browser here — it stays warm so LinkedIn keeps the session
+    // alive and cookies rotate in place, instead of cold-launching +
+    // re-injecting a decaying cookie export every role.
+    const session = getLinkedInSession();
+    try {
+        return await session.withPage(sessionId, async (page) => {
+        const credential = session.lease.credential;
         // Print credential info (mask password)
-        logProgress('LinkedIn', `✅ Credential fetched:`);
+        logProgress('LinkedIn', `✅ Credential in use:`);
         logProgress('LinkedIn', `   📧 Email: ${credential.email}`);
         logProgress('LinkedIn', `   🔒 Password: ${'*'.repeat(credential.password?.length || 8)}`);
         logProgress('LinkedIn', `   🆔 Credential ID: ${credential.id}`);
@@ -1308,17 +1302,6 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         CONFIG.email = credential.email;
         CONFIG.password = credential.password;
         CONFIG.credentialId = credential.id;
-        
-        let browser;
-        let page;  // hoisted so the finally block can close everything
-        let loginSuccess = false;
-
-    try {
-        // CloakBrowser launch + cookie injection from the leased
-        // credential. No more CDP attach, no manual chrome:login step.
-        const { browser: br, context } = await launchWithCookies(credential);
-        browser = br;
-        page = await context.newPage();
         
         // Anti-bot pacing: `queriesToRun` holds exactly ONE variant, so
         // this loop iterates once per session. The cross-query
@@ -1520,83 +1503,49 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
             }
         }
 
-        // Report success against THIS lease (not the platform name).
-        loginSuccess = true;
-        // Cookie-jar write-back (handoff 2026-05-20 §4): post the freshest
-        // known-authenticated jar captured mid-scrape — NOT a close-time
-        // recapture, which would re-read a jar LinkedIn has often already
-        // poisoned. refreshCookies is null-safe (planCookieRefresh maps
-        // null/no-li_at → skipped_no_li_at, no throw).
-        await lease.refreshCookies(latestAuthenticatedJar);
-        await lease.reportSuccess(`Scraped ${normalizedPosts.length} posts successfully`);
+        // Per-role liveness against the held lease. Persistent session
+        // stays warm; no per-role cookie write-back (no per-role browser
+        // close means no close-time poison to work around).
+        await session.lease.reportSuccess(`Scraped ${normalizedPosts.length} posts successfully`);
 
         // BaseScraper (Plan 1A) accepts Array OR { jobs, emptyConfirmed }.
         // emptyConfirmed only when LinkedIn positively showed no-results;
         // behavior-neutral for the jobs payload when OFF.
         return { jobs: normalizedPosts, emptyConfirmed: emptyConfirmed && normalizedPosts.length === 0 };
 
+        });
     } catch (error) {
         logProgress('LinkedIn', '\n❌ Error: ' + error.message);
         logProgress('LinkedIn', 'Stack trace: ' + error.stack);
 
-        lastError = error;
-
-        // Typed-error routing (Plan 1A): assertNotBlocked throws
-        // BlockedError, the gated 0-posts path throws DomChangedError,
-        // the auth-wall path throws AuthError. Route each to its intended
-        // cooldown taxonomy instead of the message-substring fallback
-        // below, which would mark them as permanent (0-min) credential
-        // burns and defeat the point of failing loud.
-        if (error instanceof BlockedError) {
-            logProgress('LinkedIn', '📤 BLOCKED / challenge — 60 min cooldown, trying next credential...');
-            await lease.reportFailure(`Blocked: ${error.message}`, 60);
-        } else if (error instanceof DomChangedError) {
-            logProgress('LinkedIn', '📤 DOM change / suspected silent block — 30 min cooldown...');
-            await lease.reportFailure(`DOM changed: ${error.message}`, 30);
-        } else if (error instanceof AuthError) {
-            logProgress('LinkedIn', '📤 Auth-wall / cookies expired — flag for refresh, trying next credential...');
-            await lease.reportFailure(`Auth/cookies expired: ${error.message}`, COOKIES_EXPIRED_COOLDOWN_MIN);
-        }
-        // Report failure against THIS lease (not the platform name).
-        else if (!loginSuccess) {
-            // Login or authentication failure - try next credential
-            if (error.message.includes('Login failed') || error.message.includes('credentials') || error.message.includes('waitForSelector')) {
-                logProgress('LinkedIn', '🔄 Login/navigation failed - will try next credential...');
-                logProgress('LinkedIn', '📤 Notifying system: WRONG CREDENTIALS (permanent failure)');
-                await lease.reportFailure(`Login failed: ${error.message}`, 0);
-            } else if (error.message.includes('rate limit') || error.message.includes('challenge')) {
-                logProgress('LinkedIn', '⏳ Rate limited - will try next credential...');
-                logProgress('LinkedIn', '📤 Notifying system: RATE LIMIT (60 min cooldown)');
-                await lease.reportFailure(`Rate limited or challenge: ${error.message}`, 60);
-            } else {
-                // Any other error during login/setup phase - treat as credential failure
-                logProgress('LinkedIn', '⚠️  Credential error - will try next credential...');
-                logProgress('LinkedIn', `   Error details: ${error.message}`);
-                logProgress('LinkedIn', '📤 Notifying system: CREDENTIAL ERROR (permanent failure)');
-                await lease.reportFailure(`Credential error: ${error.message}`, 0);
+        // Persistent-session failure policy (design §5): decouple the ROLE
+        // outcome from the CREDENTIAL outcome.
+        //  • AuthError → the credential is dead: cool it down AND tear the
+        //    session down so the next role re-establishes with a fresh lease.
+        //  • Blocked / DomChanged / other → the credential is fine, only this
+        //    role failed: keep the warm session, do NOT cool the credential.
+        // Always re-throw so BaseScraper records + classifies the role.
+        if (error instanceof AuthError) {
+            logProgress('LinkedIn', '📤 Auth-wall / cookies expired — cooldown + reestablishing session...');
+            try {
+                await session.lease?.reportFailure(`Auth/cookies expired: ${error.message}`, COOKIES_EXPIRED_COOLDOWN_MIN);
+            } catch (repErr) {
+                logProgress('LinkedIn', `   reportFailure failed: ${repErr.message}`);
             }
-            // Continue to next credential attempt - no throw, let loop continue
+            try {
+                await session.reestablish(sessionId);
+            } catch (reErr) {
+                logProgress('LinkedIn', `   session reestablish failed: ${reErr.message}`);
+            }
+        } else if (error instanceof BlockedError) {
+            logProgress('LinkedIn', '📤 BLOCKED / challenge — role failed, keeping warm session...');
+        } else if (error instanceof DomChangedError) {
+            logProgress('LinkedIn', '📤 DOM change / suspected silent block — role failed, keeping warm session...');
         } else {
-            // If login was successful but scraping failed, still try next credential
-            logProgress('LinkedIn', '⚠️  Scraping error after login - will try next credential...');
-            logProgress('LinkedIn', '📤 Notifying system: SCRAPING ERROR (30 min cooldown)');
-            await lease.reportFailure(`Scraping error: ${error.message}`, 30);
+            logProgress('LinkedIn', '⚠️  Scrape error — role failed, keeping warm session...');
         }
-        
-    } finally {
-        // CloakBrowser instance is per-scrape and isolated — just tear
-        // down the whole browser. The previous CDP-era shared-context
-        // tab-juggling logic is gone (other scrapers each launch their
-        // own CloakBrowser now, so no fleet-collision risk).
-        if (browser) {
-            try { await browser.close(); } catch { /* already closed */ }
-        }
+        throw error;
     }
-    } // End of while loop
-    
-    // If we exhausted all attempts, throw the last error
-    logProgress('LinkedIn', `\n❌ All ${maxAttempts} credential attempts failed`);
-    throw lastError || new Error('All LinkedIn credential attempts failed');
 }
 
 

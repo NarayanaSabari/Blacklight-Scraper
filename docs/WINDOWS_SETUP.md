@@ -141,31 +141,27 @@ once via central.qpeakhire.com:
 
 ## 5. LinkedIn — one-time interactive login
 
-LinkedIn scraping uses Chrome DevTools Protocol against a real Chrome
-with a persistent profile. This needs a one-time human login per host.
+LinkedIn scraping uses a long-lived CloakBrowser stealth profile on disk.
+This needs a one-time human login per host.
 
 ```powershell
-npm run chrome:login
+npm run linkedin:login
 ```
 
 That:
-- Launches Chrome with `--remote-debugging-port=9222 --user-data-dir=%USERPROFILE%\chrome-debug-profile`
-- Opens `linkedin.com/feed`
-- Picks the standard Chrome path on Windows automatically (`C:\Program Files\Google\Chrome\Application\chrome.exe`).
-  Override with the `CHROME_PATH` env var if Chrome is installed elsewhere.
+- Opens a **headed** CloakBrowser on the scraper's persistent profile dir
+  (`%USERPROFILE%\.blacklight-linkedin-profile`; override with `LINKEDIN_PROFILE_DIR`)
+- Navigates to `linkedin.com/login`
 
-In that Chrome window:
-1. Sign in with the LinkedIn email/password you added in step 4
+In that browser window:
+1. Sign in to LinkedIn
 2. Solve any *"Confirm it's you"* / SMS / 2FA prompt
 3. Wait until the feed loads
-4. Leave the window open in the background; don't close it
+4. Return to the terminal and press Enter to save + close
 
-After this, cookies persist in `chrome-debug-profile`, so the scraper
-can connect over CDP and run searches without further logins until
-LinkedIn invalidates the session (typically weeks).
-
-If `npm run chrome:login` reports *"Chrome already running with debug port"*,
-you're already set — skip ahead.
+After this, the session persists in the profile dir, so the scraper
+reuses your logged-in session without further logins until LinkedIn
+invalidates it. Re-run `npm run linkedin:login` whenever the session dies.
 
 ## 6. Start the scraper
 
@@ -225,11 +221,11 @@ C:\Tools\nssm\nssm.exe stop qp-scraper
 C:\Tools\nssm\nssm.exe status qp-scraper
 ```
 
-> **Heads up:** the LinkedIn CDP flow needs a real desktop session.
-> When running as a service it'll work as long as you're logged in to
-> the Windows account that owns the `chrome-debug-profile` directory.
-> If you log out, Chrome closes and LinkedIn scrapes fail. For a true
-> headless box, leave the user logged in (or use Windows' auto-login).
+> **Heads up:** `npm run linkedin:login` opens a HEADED browser, so the
+> one-time login needs a real desktop session. The scraper itself
+> (`npm start`) can run headless (`LINKEDIN_HEADLESS=true`). The logged-in
+> session lives in the persistent profile dir (`%USERPROFILE%\.blacklight-linkedin-profile`)
+> — keep that directory intact across restarts.
 
 ## 8. Updating the code
 
