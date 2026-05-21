@@ -208,9 +208,12 @@ export class QueueOrchestrator {
             },
         };
 
-        // Run platforms IN PARALLEL within an assignment. Each scrape
-        // is self-contained (its own browser context, its own credential
-        // lease) so concurrency is safe. Failures are isolated via
+        // Run platforms IN PARALLEL within an assignment. Most scrapers are
+        // self-contained (own browser context + credential lease per scrape).
+        // EXCEPTION: LinkedIn now shares ONE long-lived browser context +
+        // credential lease across roles (the LinkedInSession singleton, which
+        // is single-flight so concurrent borrowers don't double-lease/launch).
+        // Concurrency stays safe either way. Failures are isolated via
         // Promise.allSettled + per-task try/catch.
         //
         // After EACH platform task settles (success or fail), we kick a
