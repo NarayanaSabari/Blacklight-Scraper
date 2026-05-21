@@ -110,8 +110,18 @@ export function postSourceUrl(postUrl) {
     return u;
 }
 
+// Decode the post's activity id from the "Report post" link that LinkedIn
+// renders inside the "···" control menu — its href carries
+// `updateUrn=urn:li:activity:<id>` (URL-encoded). This is the post's OWN urn
+// (not a comment/reaction), so it's a deterministic source for the permalink.
+// '' when the href has no updateUrn.
+export function activityIdFromMenuHref(href) {
+    const m = decodeURIComponent(String(href ?? '')).match(/updateUrn=urn:li:activity:(\d+)/);
+    return m ? m[1] : '';
+}
+
 // Configuration
-const CONFIG = {
+export const CONFIG = {
     searchQuery: '',   // Will be built as a boolean query dynamically
     jobTitle: '',      // Will be set dynamically
     maxPosts: 100,
@@ -228,6 +238,31 @@ export async function launchPersistentProfile() {
     return context;
 }
 
+// Resolve a post's permalink by opening its "···" control menu and reading the
+// activity id from the Report-post link (`updateUrn=urn:li:activity:<id>`). The
+// activity URN isn't in the rendered DOM, so this per-post interaction is the
+// reliable source. Best-effort: returns '' (→ empty url, never wrong) if the
+// element/menu/link isn't found. Always closes the menu (Escape).
+export async function resolvePostUrlViaMenu(page, hash) {
+    if (!hash) return '';
+    try {
+        const el = await page.$(`main div[componentkey*="${hash}"]`);
+        if (!el) return '';
+        const btn = await el.$('button[aria-label^="Open control menu for post by"]');
+        if (!btn) return '';
+        await btn.scrollIntoViewIfNeeded().catch(() => {});
+        await btn.click();
+        let href = '';
+        for (let i = 0; i < 12 && !href; i++) {
+            href = await page.evaluate(() =>
+                document.querySelector('a[href*="report-in-modal"][href*="updateUrn"]')?.getAttribute('href') || '');
+            if (!href) await new Promise(r => setTimeout(r, 150));
+        }
+        await page.keyboard.press('Escape').catch(() => {});
+        return activityIdFromMenuHref(href);
+    } catch { return ''; }
+}
+
 /**
  * Build a LinkedIn boolean search query.
  * 
@@ -246,7 +281,7 @@ export async function launchPersistentProfile() {
  * @param {string} jobTitle - The job title/role to search for
  * @returns {string} LinkedIn boolean search query string
  */
-function buildBooleanSearchQuery(jobTitle) {
+export function buildBooleanSearchQuery(jobTitle) {
     const titlePart = `"${jobTitle}"`;
 
     // Pattern: "Job Title" AND (c2c OR W2 OR 1099)
@@ -500,7 +535,7 @@ async function performLogin(page) {
     return true;
 }
 
-async function navigateToSearch(page, query) {
+export async function navigateToSearch(page, query) {
     logProgress('LinkedIn', `🔍 Boolean Search Query: ${CONFIG.searchQuery}`);
     
     // Verify login by navigating to feed (this also establishes session)
@@ -728,7 +763,7 @@ async function dumpDebugSnapshot(page, label) {
     }
 }
 
-async function extractPosts(page, maxPosts, opts = {}) {
+export async function extractPosts(page, maxPosts, opts = {}) {
     logProgress('LinkedIn', `📦 Extracting up to ${maxPosts} posts...`);
 
     const isFeedMode = CONFIG.useFeedInsteadOfSearch;
@@ -1167,22 +1202,28 @@ async function extractPosts(page, maxPosts, opts = {}) {
         
         // Add new posts with deduplication
         let newPostsCount = 0;
-        extractedPosts.forEach(post => {
+        for (const post of extractedPosts) {
             // Check both ID and content hash to avoid duplicates
             const isDuplicateById = seenIds.has(post.id);
             const isDuplicateByContent = seenContentHashes.has(post.contentHash);
-            
+
             // Only add if not duplicate and we haven't reached max
             if (!isDuplicateById && !isDuplicateByContent && allPosts.length < maxPosts) {
                 seenIds.add(post.id);
                 seenContentHashes.add(post.contentHash);
-                
+
                 // Remove contentHash before adding to final results
                 const { contentHash, ...postWithoutHash } = post;
                 allPosts.push(postWithoutHash);
                 newPostsCount++;
+
+                // Resolve this post's permalink NOW, while its element is fresh
+                // in the DOM (it was just scrolled into view). Best-effort.
+                if (typeof opts.onNewPost === 'function') {
+                    await opts.onNewPost(postWithoutHash);
+                }
             }
-        });
+        }
         
         if (newPostsCount > 0) {
             logProgress('LinkedIn', `   ✓ Found ${newPostsCount} new posts (total: ${allPosts.length})`);
@@ -1363,6 +1404,18 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
             if (hasLiAt(jar)) latestAuthenticatedJar = jar;
         };
 
+        // Resolve each new post's permalink via its "···" menu (the activity
+        // URN isn't in the rendered DOM). Called per post during extraction,
+        // while the element is fresh. Best-effort — empty url, never wrong.
+        const onNewPost = async (post) => {
+            if (post.postUrl) return;
+            const act = await resolvePostUrlViaMenu(page, post.id);
+            if (act) {
+                post.activityUrn = `urn:li:activity:${act}`;
+                post.postUrl = activityPermalink(act);
+            }
+        };
+
         for (let qi = 0; qi < queriesToRun.length; qi++) {
             if (posts.length >= CONFIG.maxPosts) {
                 logProgress('LinkedIn',
@@ -1398,7 +1451,7 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
             }
 
             const remainingBudget = CONFIG.maxPosts - posts.length;
-            const queryPosts = await extractPosts(page, remainingBudget, { onAuthenticatedBatch });
+            const queryPosts = await extractPosts(page, remainingBudget, { onAuthenticatedBatch, onNewPost });
 
             // Dedup by id — same post can match multiple queries.
             // Tag with the query that found it for downstream tracing.
