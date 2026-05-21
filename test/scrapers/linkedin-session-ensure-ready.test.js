@@ -7,7 +7,9 @@ function fakeDeps() {
     const apiClient = {
         acquire: async () => { leases++; return { credential: { id: 12, email: 'a@b.c', password: 'p' }, reportSuccess: async () => {}, reportFailure: async () => {}, release: async () => {} }; },
     };
-    const launcher = async () => { launches++; return { browser: { close: async () => {} }, context: { newPage: async () => ({ close: async () => {} }) } }; };
+    // launchPersistentProfile returns a BrowserContext directly (no separate
+    // Browser handle) and takes NO credential argument (no cookie injection).
+    const launcher = async () => { launches++; return { newPage: async () => ({ close: async () => {} }), close: async () => {}, browser: () => null }; };
     return { apiClient, launcher, counts: () => ({ leases, launches }) };
 }
 

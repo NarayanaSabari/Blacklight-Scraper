@@ -314,28 +314,26 @@ TELEMETRY_URL=                  # Override telemetry base URL (default: blacklig
 TELEMETRY_KEY=                  # Override telemetry key (default: blacklight.apiKey)
 ```
 
-### LinkedIn — launch Chrome for interactive login
+### LinkedIn — log in once to the persistent stealth profile
 
-LinkedIn scraping uses Chrome DevTools Protocol, which requires a
-real Chrome running with `--remote-debugging-port=9222`. Run this
-once before starting the scraper so you can log in manually (and
-solve any security challenges LinkedIn throws):
+LinkedIn scraping uses a long-lived CloakBrowser stealth profile stored on
+disk. Log in by hand once; the session persists across scraper runs and
+rotates organically (no per-run cookie injection):
 
 ```bash
-npm run chrome:login
+npm run linkedin:login
 ```
 
 This:
-- Launches Chrome with `--user-data-dir=~/chrome-debug-profile` (separate
-  from your regular browser — they can run side-by-side)
-- Opens `linkedin.com/feed` in the new window
-- Is idempotent — if a Chrome is already running on port 9222 it
-  prints guidance and exits cleanly
-- Picks the right Chrome binary per OS (macOS / Windows / Linux);
-  override with `CHROME_PATH=/custom/chrome`
+- Opens a **headed** CloakBrowser on the scraper's persistent profile dir
+  (`~/.blacklight-linkedin-profile`; override with `LINKEDIN_PROFILE_DIR`)
+- Navigates to `linkedin.com/login` — log in (and solve any challenge), then
+  press Enter in the terminal to save + close
+- `npm start` then reuses this exact logged-in session (one warm browser for
+  the whole process, a fresh tab per role)
 
-After logging in once, cookies persist in `~/chrome-debug-profile`
-across restarts, so subsequent launches remember your session.
+After logging in once, the session persists in the profile dir across
+restarts, so subsequent scraper runs remember your login.
 
 ### Credentials
 

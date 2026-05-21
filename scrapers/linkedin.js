@@ -1,24 +1,24 @@
-// LinkedIn Scraper — CloakBrowser + cookie auth
+// LinkedIn Scraper — CloakBrowser persistent stealth profile
 //
-// Was: CDP-attach to a manually-running Chrome (`npm run chrome:login`).
-// Now: CloakBrowser stealth Chromium with cookies injected from the
-// credentials API. Same auth surface, no manual Chrome step, scales to
-// concurrent scrapes from the same machine.
-//
-// Auth strategy:
-//   1. Lease a credential from the API. It carries `credentials`
-//      (cookie array) plus an `email/password` fallback.
-//   2. Inject cookies into a fresh CloakBrowser context.
-//   3. Navigate to feed/search. If we land on the auth wall (cookies
-//      stale), the existing `performLogin()` flow logs in with
-//      email/password — works the same in CloakBrowser as in CDP.
+// Auth model (persistent-session D1b, manual-login): the operator logs in
+// ONCE via `npm run linkedin:login` into an on-disk CloakBrowser profile.
+// scrapeLinkedIn borrows a page per role from the long-lived LinkedInSession
+// (one warm context for the whole process); the logged-in session lives in
+// the profile and rotates organically — no per-run cookie injection. A
+// credential is still leased as a slot/lock + email/password re-login
+// fallback (performLogin). Earlier models — CDP-attach to a manual Chrome,
+// then CloakBrowser + per-run API-cookie injection — are both superseded.
+// (`launchWithCookies`/`loadCookies` remain for the optional cookie-seed path
+//  but are unused on the persistent-profile scrape path.)
 //
 // Scroll behaviour: LinkedIn A/B tests two DOMs. LEGACY scrolls at the
 // window level; NEW puts the feed inside a scrollable <main> and the
 // document scrollHeight stays pinned. We scroll the inner <main> when
 // it's the actual scroll root, else fall back to window scroll.
 
-import { launch } from 'cloakbrowser';
+import os from 'os';
+import path from 'path';
+import { launch, launchPersistentContext } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
@@ -173,6 +173,33 @@ export async function launchWithCookies(credential) {
     }
     logProgress('LinkedIn', `✅ CloakBrowser ready (${added}/${cookies.length} cookies injected)`);
     return { browser, context };
+}
+
+// On-disk persistent stealth profile directory. The operator logs in ONCE
+// via `npm run linkedin:login`; the session (cookies, localStorage) lives
+// here and rotates organically across runs — no per-run cookie injection.
+export function linkedInProfileDir() {
+    return process.env.LINKEDIN_PROFILE_DIR
+        || path.join(os.homedir(), '.blacklight-linkedin-profile');
+}
+
+// Launch the persistent stealth profile (D1b, manual-login model). Returns a
+// Playwright BrowserContext directly (cloakbrowser.launchPersistentContext
+// has no separate Browser handle — close the context to tear down). No cookie
+// injection: the profile already holds the operator's logged-in session.
+export async function launchPersistentProfile() {
+    const userDataDir = linkedInProfileDir();
+    logProgress('LinkedIn', `🚀 Launching CloakBrowser persistent profile (${userDataDir})...`);
+    const context = await launchPersistentContext({
+        userDataDir,
+        headless: process.env.LINKEDIN_HEADLESS === 'true',
+        humanize: true,
+        viewport: { width: 1366, height: 900 },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
+    });
+    logProgress('LinkedIn', '✅ CloakBrowser persistent profile ready');
+    return context;
 }
 
 /**
