@@ -36,5 +36,11 @@ Status: COMPLETE (Phase 1). `npm test` → **149 / 0** (+7 vs the 142 baseline).
 - **Write-back revert (§7):** the mid-scrape capture (`onAuthenticatedBatch`/`latestAuthenticatedJar`/`hasLiAt`) + `refreshCookies` remain in the codebase (capture vars now unused on the scrape path; `refreshCookies` call dropped). Full removal only AFTER Phase 1 is validated in prod — keeps the change reversible.
 - **Phase 3:** multi-browser pool (D4).
 
+## Addendum (2026-05-21) — persistent profile via MANUAL LOGIN
+
+After review, the user observed `chrome:login` opened a browser nothing used: the scraper launched its own CloakBrowser + injected the decaying API cookies, ignoring any manual login (and the old `chrome:login` CDP-attach to port 9222 was abandoned long ago — nothing connected to it). Decision (user, 2026-05-21): use **`cloakbrowser.launchPersistentContext({ userDataDir })`** — a stealth browser with an **on-disk profile the operator logs into ONCE** via the new `npm run linkedin:login`. The session lives in the profile and rotates organically; **no per-run cookie injection**. This supersedes the spec's original "inject cookies once" establishment (§3 component A).
+
+Changed: `launchPersistentProfile()`/`linkedInProfileDir()` in `linkedin.js`; `LinkedInSession` uses it (teardown closes the *context*, no separate browser); `scripts/linkedin-login.js` + `npm run linkedin:login`; removed vestigial `scripts/chrome-debug.js` + `chrome:login`; README/MAC/WINDOWS setup docs updated; session unit tests updated for the context-returning launcher. Credential still leased as a slot/lock + email/password re-login fallback (not used for cookies). `launchWithCookies`/`loadCookies` remain as a dead (documented) optional cookie-seed path. `npm test` still 149/0.
+
 ## Validation plan (post-merge, operational)
 Run `node server.js` with LinkedIn roles flowing. Expect: exactly one "Launching CloakBrowser" line across many roles; per-role pages open/close; the browser stays up; far fewer `/uas/login` auth-walls per role than the cold-launch baseline. If LinkedIn still burns the session fast, that's the flagged-account reality (operational fixes), not a code defect.
