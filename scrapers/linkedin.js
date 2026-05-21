@@ -111,7 +111,7 @@ export function postSourceUrl(postUrl) {
 }
 
 // Configuration
-const CONFIG = {
+export const CONFIG = {
     searchQuery: '',   // Will be built as a boolean query dynamically
     jobTitle: '',      // Will be set dynamically
     maxPosts: 100,
@@ -246,7 +246,7 @@ export async function launchPersistentProfile() {
  * @param {string} jobTitle - The job title/role to search for
  * @returns {string} LinkedIn boolean search query string
  */
-function buildBooleanSearchQuery(jobTitle) {
+export function buildBooleanSearchQuery(jobTitle) {
     const titlePart = `"${jobTitle}"`;
 
     // Pattern: "Job Title" AND (c2c OR W2 OR 1099)
@@ -500,7 +500,7 @@ async function performLogin(page) {
     return true;
 }
 
-async function navigateToSearch(page, query) {
+export async function navigateToSearch(page, query) {
     logProgress('LinkedIn', `🔍 Boolean Search Query: ${CONFIG.searchQuery}`);
     
     // Verify login by navigating to feed (this also establishes session)
@@ -728,7 +728,7 @@ async function dumpDebugSnapshot(page, label) {
     }
 }
 
-async function extractPosts(page, maxPosts, opts = {}) {
+export async function extractPosts(page, maxPosts, opts = {}) {
     logProgress('LinkedIn', `📦 Extracting up to ${maxPosts} posts...`);
 
     const isFeedMode = CONFIG.useFeedInsteadOfSearch;
