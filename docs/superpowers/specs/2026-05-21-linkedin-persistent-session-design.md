@@ -59,7 +59,7 @@ scrapeLinkedIn(jobTitle, location, sessionId, options):
 ```
 
 - `navigateToSearch`/`ensureLoggedIn`/`performLogin`/`extractPosts`/`pickSessionQuery`/pacing all stay. The change is **who owns the browser** (session manager, not scrapeLinkedIn) and **lease lifetime** (held, not per-call).
-- The per-role write-back (`lease.refreshCookies`) becomes a **no-op path for now** (we don't close the context, so there is no close-time poison). Left in place but unreached on the happy path until §7 cleanup. (Keeps the diff reversible and avoids ripping out validated code before D1b is proven.)
+- The per-role write-back `lease.refreshCookies(...)` **call is dropped** in Phase 1 (as built — plan §4 step 4): once the context is never closed per role there is no close-time poison, so the call is a guaranteed no-op. The mid-scrape **capture vars** (`onAuthenticatedBatch`/`latestAuthenticatedJar`/`hasLiAt` on the scrape path) are **left in place** (now write-only) for reversibility; full removal is the §7 cleanup after prod validation. Rollback remains a clean `git revert` of the branch regardless. (Earlier draft said "keep the call unreached"; reconciled here to match the as-built code.)
 
 ### Component C — lifecycle wiring (`server.js`)
 
