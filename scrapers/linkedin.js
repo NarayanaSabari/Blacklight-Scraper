@@ -145,7 +145,7 @@ function loadCookies(credential) {
 // Launch CloakBrowser and create a context with the credential's
 // cookies pre-injected. Per-cookie retry on bulk-add failure so one
 // malformed entry doesn't break the whole batch.
-async function launchWithCookies(credential) {
+export async function launchWithCookies(credential) {
     logProgress('LinkedIn', '🚀 Launching CloakBrowser stealth Chromium...');
     // Headed by default per operator requirement. LINKEDIN_HEADLESS=true
     // is an escape hatch for environments with no display (CI/servers).
