@@ -84,6 +84,32 @@ export function hasLiAt(jar) {
     );
 }
 
+// Pull the numeric activity id out of any blob containing
+// `urn:li:activity:<digits>` (a post element's markup, a data-urn attr, a
+// link). Returns '' when absent. Mirrors the in-page extractor regex so the
+// contract is unit-tested.
+export function extractActivityId(text) {
+    const m = String(text ?? '').match(/urn:li:activity:(\d+)/);
+    return m ? m[1] : '';
+}
+
+// Canonical LinkedIn post permalink from an activity id. '' for anything
+// that isn't all digits (so a bad id never yields a broken URL).
+export function activityPermalink(activityId) {
+    return /^\d+$/.test(String(activityId ?? ''))
+        ? `https://www.linkedin.com/feed/update/urn:li:activity:${activityId}/`
+        : '';
+}
+
+// The job "source" URL must be the POST permalink — NEVER the author's
+// `/in/` profile link (it looks like the posting *is* that person's page).
+// Empty is better than wrong. Returns '' for blank or profile URLs.
+export function postSourceUrl(postUrl) {
+    const u = String(postUrl ?? '').trim();
+    if (!u || u.includes('/in/')) return '';
+    return u;
+}
+
 // Configuration
 const CONFIG = {
     searchQuery: '',   // Will be built as a boolean query dynamically
@@ -1064,15 +1090,30 @@ async function extractPosts(page, maxPosts, opts = {}) {
                         timestamp = timeMatch[1];
                     }
 
-                    // Permalink: usually absent in search results, but
-                    // try the few selectors that still might catch it.
+                    // Permalink: find the post's activity URN (a data-urn
+                    // attribute, else anywhere in the element markup) and build
+                    // the canonical permalink. Fall back to an explicit
+                    // update/posts link. NEVER use the author /in/ link here —
+                    // that points at a person, not the post.
+                    let activityId = '';
+                    const urnHost = element.querySelector('[data-urn*="urn:li:activity:"]');
+                    const urnAttr = element.getAttribute('data-urn')
+                        || (urnHost && urnHost.getAttribute('data-urn'))
+                        || '';
+                    let urnMatch = urnAttr.match(/urn:li:activity:(\d+)/);
+                    if (!urnMatch) urnMatch = element.outerHTML.match(/urn:li:activity:(\d+)/);
+                    if (urnMatch) activityId = urnMatch[1];
+
                     let postUrl = '';
-                    const updateLink = element.querySelector(
-                        'a[href*="/feed/update/"], a[href*="/posts/"], a[href*="urn:li:activity"]'
-                    );
-                    if (updateLink?.href) {
-                        postUrl = updateLink.href.split('?')[0];
+                    if (activityId) {
+                        postUrl = `https://www.linkedin.com/feed/update/urn:li:activity:${activityId}/`;
+                    } else {
+                        const updateLink = element.querySelector(
+                            'a[href*="/feed/update/"], a[href*="/posts/"], a[href*="urn:li:activity"]'
+                        );
+                        if (updateLink?.href) postUrl = updateLink.href.split('?')[0];
                     }
+                    const activityUrn = activityId ? `urn:li:activity:${activityId}` : '';
 
                     // Track for debug on first successful extraction
                     if (debugInfo.foundIds.length === 0) {
@@ -1096,6 +1137,7 @@ async function extractPosts(page, maxPosts, opts = {}) {
                             content: postContent,
                             timestamp,
                             postUrl,
+                            activityUrn,
                             contentLength: postContent.length,
                             contentHash,
                         });
@@ -1451,8 +1493,12 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
             // Clean description
             const desc = cleanText(post.content || '') || 'N/A';
             
-            // Job URL - use post URL or author profile as fallback
-            const url = (post.postUrl || post.authorProfileUrl || '').trim() || '';
+            // Job source URL = the POST permalink ONLY. Prefer the extracted
+            // permalink; else rebuild from the activity URN. NEVER fall back to
+            // the author /in/ profile — a profile link misleadingly looks like
+            // the posting is that person's page. Empty is better than wrong.
+            const url = postSourceUrl(post.postUrl)
+                || activityPermalink(extractActivityId(post.activityUrn || post.postUrl));
             
             // Generate unique job ID
             let jobId = post.id;
