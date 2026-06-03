@@ -19,6 +19,22 @@ import { normalizeJobData } from '../src/core/normalize.js';
 const log = createLogger('monster');
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// Parses an aria-label of the form "<Title> at <Company>" into title + company.
+// Returns null on any malformed input — the caller treats null as a
+// dom_changed signal (Monster split the label or renamed the pattern).
+// We use a strict regex (not split(' at ')) to ban silent garbage.
+export function parseAriaLabel(text) {
+    if (text === null || text === undefined) return null;
+    const s = String(text).trim();
+    if (!s) return null;
+    const m = s.match(/^(.+?)\s+at\s+(.+)$/);
+    if (!m) return null;
+    const title = m[1].trim();
+    const company = m[2].trim();
+    if (!title || !company) return null;
+    return { title, company };
+}
+
 // First-touch on /jobs/search returns 403 from DataDome on a brand-new
 // session. A brief visit to monster.com first establishes cookies and
 // lets the subsequent search-page navigation through.
