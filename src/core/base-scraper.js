@@ -18,6 +18,7 @@ import { createLogger } from '../logger/index.js';
 import { ScraperError, BlockedError } from './errors.js';
 import { getMetrics } from '../metrics/registry.js';
 import { classifyError } from '../metrics/classify.js';
+import { classifyUrl } from './url-quality.js';
 
 function normalizeResult(result) {
     if (Array.isArray(result)) {
@@ -65,6 +66,14 @@ export class BaseScraper {
             const { jobs, emptyConfirmed } = normalizeResult(raw);
             const durationMs = Date.now() - start;
             const jobCount = jobs.length;
+
+            try {
+                for (const job of jobs) {
+                    metrics.recordUrlQuality?.(this.platform, classifyUrl(job?.url));
+                }
+            } catch (_e) {
+                // Observability must never crash the scraping path.
+            }
 
             if (jobCount === 0 && !emptyConfirmed) {
                 this.log.warn('Scrape returned 0 jobs (unconfirmed) — possible block / DOM change', {
