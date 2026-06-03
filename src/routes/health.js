@@ -3,6 +3,7 @@
 
 import { existsSync } from 'node:fs';
 import { PLATFORM_NAMES } from '../scrapers/registry.js';
+import { classifyLinkedinUrl } from '../setup/verify.js';
 
 export function registerHealthRoute(app, port, deps = {}) {
     const bootInfo = deps.bootInfo ?? { gitSha: 'unknown', pkgVersion: '0.0.0' };
@@ -38,7 +39,9 @@ export function registerHealthRoute(app, port, deps = {}) {
             nodeVersion: bootInfo.nodeVersion,
             pkgVersion: bootInfo.pkgVersion,
             profileDir: bootInfo.profileDir,
-            profileDirExists: bootInfo.profileDir ? existsSync(bootInfo.profileDir) : false,
+            profileDirExists: bootInfo.profileDir && bootInfo.profileDir !== 'unknown'
+                ? existsSync(bootInfo.profileDir)
+                : null,
             sessionAlive: !!session?.isAlive?.(),
             leaseCredentialId: session?.lease?.credential?.id ?? null,
             headless: !!bootInfo.headless,
@@ -60,7 +63,6 @@ export function registerHealthRoute(app, port, deps = {}) {
             const { url, urlClass } = await session.withPage(sessionId, async (page) => {
                 await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 15000 });
                 const u = page.url();
-                const { classifyLinkedinUrl } = await import('../setup/verify.js');
                 return { url: u, urlClass: classifyLinkedinUrl(u) };
             });
             res.json({
