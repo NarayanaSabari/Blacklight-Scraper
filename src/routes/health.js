@@ -46,4 +46,37 @@ export function registerHealthRoute(app, port, deps = {}) {
             uptimeSec: Math.round(process.uptime()),
         });
     });
+
+    app.get('/health/linkedin', async (req, res) => {
+        if (req.query.probe !== '1') {
+            return res.json({
+                probe: false,
+                hint: 'Add ?probe=1 to run an in-session feed check. Cheap state is on /healthz.',
+            });
+        }
+        const session = getLinkedInSession();
+        const sessionId = `healthcheck-${Date.now()}`;
+        try {
+            const { url, urlClass } = await session.withPage(sessionId, async (page) => {
+                await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 15000 });
+                const u = page.url();
+                const { classifyLinkedinUrl } = await import('../setup/verify.js');
+                return { url: u, urlClass: classifyLinkedinUrl(u) };
+            });
+            res.json({
+                probe: true,
+                checkedAt: new Date().toISOString(),
+                url,
+                urlClass,
+                loggedIn: urlClass === 'authed',
+            });
+        } catch (e) {
+            res.status(503).json({
+                probe: true,
+                checkedAt: new Date().toISOString(),
+                loggedIn: false,
+                error: e?.message ?? String(e),
+            });
+        }
+    });
 }
