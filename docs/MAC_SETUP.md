@@ -291,6 +291,29 @@ tail -f ~/scraper/logs/stdout.log ~/scraper/logs/stderr.log
 > fail. For a true headless Mac, leave the user logged in (System
 > Settings → Users & Groups → Login Options → enable auto-login).
 
+> **⚠ Node does NOT hot-reload imported source files. After `git pull` you MUST restart the service.**
+>
+> ```bash
+> launchctl kickstart -k gui/$UID/com.qp.scraper
+> ```
+>
+> If you're not running under launchd, kill the existing `node server.js`
+> process and start a new one with `npm start`.
+>
+> **Skipping the restart is silent** — the in-memory copy of the scraper
+> keeps executing the OLD code, while `git log` and the file system show
+> the new commit. Symptoms include emitting `job_url=""` rows that backend
+> tooling cannot fix without a re-scrape.
+>
+> Confirm the new code is live by checking `/healthz`:
+>
+> ```bash
+> curl -s http://localhost:3001/healthz | jq '.gitSha'
+> ```
+>
+> The `gitSha` returned must match `git rev-parse --short HEAD` in this
+> directory. If they differ, the process is running stale code.
+
 ## 8. Updating the code
 
 ```bash
@@ -332,7 +355,9 @@ dashboard).
 - Page is showing a security/captcha challenge instead of results. The
   IP got flagged. Solve the captcha in your real browser (same Mac,
   same IP), re-export cookies, update the credential in the dashboard.
-  Hot-reload picks it up within a few seconds.
+  Note: `config/credentials.json` is re-read on every scrape, so credential
+  rotations take effect without a restart. This does NOT apply to the
+  scraper source code — see the restart callout above.
 
 **`Active session already exists` for many minutes**
 - A previous scrape session is stuck `in_progress` in the DB (zombie).
