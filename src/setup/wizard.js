@@ -234,9 +234,22 @@ export async function runSetupWizard(deps = {}) {
             };
         }
         out(result.message);
+        out('─────────────────────────────────────────────────────────────────────');
+        out('IMPORTANT — next step (do not skip):');
+        out('');
+        out('  The runtime uses an on-disk LinkedIn profile, NOT the cookies you');
+        out('  just saved. To make scraping work you MUST log in once:');
+        out('');
+        out('      npm run linkedin:login');
+        out('');
+        out('  Sign in to LinkedIn in the window that opens, press Enter in this');
+        out('  terminal when you see your feed, then start the server:');
+        out('');
+        out('      npm start');
+        out('─────────────────────────────────────────────────────────────────────');
         out(runMode === 'remote'
-            ? 'Setup complete. Start with: npm start  — to run it as a managed service, see docs/MAC_SETUP.md or docs/WINDOWS_SETUP.md'
-            : 'Setup complete. Start with: npm start');
+            ? 'Setup complete. To run it as a managed service, see docs/MAC_SETUP.md or docs/WINDOWS_SETUP.md.'
+            : 'Setup complete.');
         return 0;
     } catch (e) {
         if (e === CANCEL) return 1;
