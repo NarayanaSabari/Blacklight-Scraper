@@ -25,6 +25,8 @@ import { getMetrics } from './src/metrics/registry.js';
 import { getPusher } from './src/metrics/push.js';
 import { Heartbeat } from './src/metrics/heartbeat.js';
 import { initializeLokiTransport } from './src/logger/loki-transport.js';
+import { resolveBootInfo } from './src/config/boot-info.js';
+import { linkedInProfileDir } from './scrapers/linkedin.js';
 import { registerHealthRoute } from './src/routes/health.js';
 import { registerScrapeRoute } from './src/routes/scrape.js';
 import { registerScrapeQueueRoute } from './src/routes/scrape-queue.js';
@@ -82,7 +84,10 @@ async function main() {
     }
     const config = getConfig();
 
-    log.info('Starting Unified Job Scraper API', {
+    const bootInfo = resolveBootInfo({ profileDir: () => linkedInProfileDir() });
+
+    log.info('boot', {
+        ...bootInfo,
         nodeEnv: config.nodeEnv,
         port: config.port,
         logLevel: config.logLevel,
@@ -92,19 +97,26 @@ async function main() {
     });
 
     const telemetry = bootTelemetry(config);
+    telemetry.metrics.recordBuildInfo({
+        nodeVersion: bootInfo.nodeVersion,
+        gitSha: bootInfo.gitSha,
+        pkgVersion: bootInfo.pkgVersion,
+        headless: bootInfo.headless,
+        strict: bootInfo.strict,
+    });
     initializeCredentialsClient();
     const orchestrator = buildOrchestrator(config);
 
     const app = express();
     app.use(express.json({ limit: '1mb' }));
 
-    registerHealthRoute(app, config.port);
+    registerHealthRoute(app, config.port, { bootInfo, getLinkedInSession });
     registerMetricsRoute(app);
     registerScrapeRoute(app);
     registerScrapeQueueRoute(app, orchestrator);
 
     const server = app.listen(config.port, () => {
-        log.info('Server listening', { port: config.port });
+        log.info('Server listening', { port: config.port, ...bootInfo });
         if (orchestrator && !config.isDevelopment) {
             orchestrator.startAutoChecker();
         } else if (config.isDevelopment) {
