@@ -26,6 +26,7 @@ import { getPusher } from './src/metrics/push.js';
 import { Heartbeat } from './src/metrics/heartbeat.js';
 import { initializeLokiTransport } from './src/logger/loki-transport.js';
 import { resolveBootInfo } from './src/config/boot-info.js';
+import { exitCodeFor, EXIT_REASONS } from './src/server/exit-codes.js';
 import { linkedInProfileDir } from './scrapers/linkedin.js';
 import { registerHealthRoute } from './src/routes/health.js';
 import { registerScrapeRoute } from './src/routes/scrape.js';
@@ -147,41 +148,35 @@ async function main() {
     };
 
     let shuttingDown = false;
+    let shutdownReason = EXIT_REASONS.SIGNAL;
+
     const shutdown = async (signal) => {
         if (shuttingDown) return;
         shuttingDown = true;
 
-        // Start the outer budget IMMEDIATELY — whatever happens below,
-        // we exit in SHUTDOWN_BUDGET_MS. Must be the first thing so
-        // slow awaits can't push us past our SIGKILL grace window.
         setTimeout(() => {
-            log.warn('Hard-exit budget exhausted; forcing exit');
-            process.exit(0);
+            log.warn('Hard-exit budget exhausted; forcing exit', { reason: shutdownReason });
+            process.exit(exitCodeFor(shutdownReason));
         }, SHUTDOWN_BUDGET_MS).unref();
 
-        log.info('Shutdown initiated', { signal, budgetMs: SHUTDOWN_BUDGET_MS });
+        log.info('Shutdown initiated', { signal, budgetMs: SHUTDOWN_BUDGET_MS, reason: shutdownReason, ...bootInfo });
         orchestrator?.stopAutoChecker();
         telemetry.heartbeat.stop();
 
         const steps = [
             ['pusher', telemetry.pusher.stop({ finalPush: true })],
             ['loki', telemetry.lokiTransport.stop({ finalFlush: true })],
-            // Persistent LinkedIn session: close the warm browser + release
-            // its held lease before the catch-all releaseAll() below.
             ['linkedin-session', getLinkedInSession().shutdown()],
             ['credentials', getCredentialsClient().releaseAll()],
         ];
         for (const [label, promise] of steps) {
-            try {
-                await withTimeout(label, promise);
-            } catch (error) {
-                log.error(`shutdown step '${label}' failed`, { err: error.message });
-            }
+            try { await withTimeout(label, promise); }
+            catch (error) { log.error(`shutdown step '${label}' failed`, { err: error.message }); }
         }
 
         server.close(() => {
-            log.info('Server closed');
-            process.exit(0);
+            log.info('Server closed', { reason: shutdownReason });
+            process.exit(exitCodeFor(shutdownReason));
         });
     };
 
@@ -189,11 +184,18 @@ async function main() {
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('unhandledRejection', (reason) => {
         log.error('Unhandled promise rejection', { reason: String(reason) });
+        shutdownReason = EXIT_REASONS.CRASH;
+        shutdown('unhandledRejection');
+    });
+    process.on('uncaughtException', (err) => {
+        log.error('Uncaught exception', { err: String(err?.stack || err) });
+        shutdownReason = EXIT_REASONS.CRASH;
+        shutdown('uncaughtException');
     });
 }
 
 main().catch((error) => {
     // eslint-disable-next-line no-console
     console.error('Fatal startup error:', error);
-    process.exit(1);
+    process.exit(exitCodeFor(EXIT_REASONS.CRASH));
 });
