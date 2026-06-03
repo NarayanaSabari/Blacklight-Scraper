@@ -32,14 +32,15 @@ async function main() {
     const counts = { permalink: 0, profile_in: 0, empty: 0, other: 0 };
     const badTitle = []; const badCompany = [];
     jobs.forEach((j, i) => {
-        const url = j.url ?? 'N/A';
+        const url = j.job?.url ?? 'N/A';
         const q = classifyUrl(url === 'N/A' ? '' : url);
         counts[q]++;
-        if (!j.title || j.title === 'N/A' || j.title.length <= 1) badTitle.push(i);
+        const titleVal = j.job?.title ?? '';
+        if (!titleVal || titleVal === 'N/A' || titleVal.length <= 1) badTitle.push(i);
         if (!j.company?.name || j.company.name === 'N/A') badCompany.push(i);
         if (i < 5) {
             console.log(`#${i + 1} [${q}]`);
-            console.log(`   title    : ${j.title}`);
+            console.log(`   title    : ${j.job?.title ?? '(missing)'}`);
             console.log(`   company  : ${j.company?.name ?? j.company}`);
             console.log(`   location : ${j.location?.formatted ?? j.location}`);
             console.log(`   url      : ${url}`);

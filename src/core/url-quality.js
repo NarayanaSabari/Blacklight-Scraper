@@ -2,7 +2,7 @@
 // scrapers/linkedin.js::postSourceUrl's "/in/ is never a job URL" rule, with
 // a generic permalink pattern that also matches Indeed/Dice job pages.
 
-const PERMALINK_RE = /\/feed\/update\/|\/posts\/|\/jobs\/view\/|\/jobs?\/[a-z0-9-]+\/?$/i;
+const PERMALINK_RE = /\/feed\/update\/|\/posts\/|\/jobs\/view\/|\/job-openings\/|\/jobs?\/[a-z0-9-]+\/?$/i;
 
 export function classifyUrl(url) {
     if (url === null || url === undefined || url === '') return 'empty';

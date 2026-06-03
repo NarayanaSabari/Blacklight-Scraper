@@ -43,6 +43,7 @@ export function constructJobUrl(realHref, jobId) {
     const h = realHref ? String(realHref).trim() : '';
     if (h) {
         if (h.startsWith('http://') || h.startsWith('https://')) return h;
+        if (h.startsWith('//')) return `https:${h}`;
         if (h.startsWith('/')) return `https://www.monster.com${h}`;
     }
     const id = jobId ? String(jobId).trim() : '';
@@ -260,7 +261,7 @@ export async function scrapeMonster(jobTitle, location, sessionId = null) {
                     const realHref = a ? a.getAttribute('href') : '';
                     return {
                         title, company, jobId, realHref,
-                        text: (card.textContent || '').trim().slice(0, 4000),
+                        text: (card.innerText || card.textContent || '').trim().slice(0, 4000),
                     };
                 }
                 const cards = [...document.querySelectorAll('article[data-testid="JobCard"]')];
