@@ -23,10 +23,8 @@ export function resolveBootInfo(deps = {}) {
     const nodeVersion = deps.nodeVersion ?? process.version;
     const pid = deps.pid ?? process.pid;
 
-    let gitSha;
-    if (env.GIT_SHA) {
-        gitSha = String(env.GIT_SHA).trim();
-    } else {
+    let gitSha = String(env.GIT_SHA ?? '').trim();
+    if (!gitSha) {
         try {
             const out = execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] });
             gitSha = String(out).trim();
@@ -34,6 +32,7 @@ export function resolveBootInfo(deps = {}) {
             gitSha = 'unknown';
         }
     }
+    if (!gitSha) gitSha = 'unknown';
 
     let pkgVersion = '0.0.0';
     try { pkgVersion = readPkg().version || pkgVersion; } catch { /* keep default */ }

@@ -53,3 +53,33 @@ test('resolveBootInfo: headless/strict default false when env unset', () => {
     assert.equal(info.headless, false);
     assert.equal(info.strict, false);
 });
+
+test('resolveBootInfo: whitespace-only GIT_SHA falls through to git/unknown', () => {
+    const info = resolveBootInfo(fixedDeps({
+        env: { GIT_SHA: '   \n  ' },
+        execSync: () => Buffer.from('cafebab\n'),
+    }));
+    assert.equal(info.gitSha, 'cafebab');
+});
+
+test('resolveBootInfo: whitespace-only GIT_SHA with broken git → "unknown"', () => {
+    const info = resolveBootInfo(fixedDeps({
+        env: { GIT_SHA: '   ' },
+        execSync: () => { throw new Error('no git'); },
+    }));
+    assert.equal(info.gitSha, 'unknown');
+});
+
+test('resolveBootInfo: readPkg throw → pkgVersion "0.0.0"', () => {
+    const info = resolveBootInfo(fixedDeps({
+        readPkg: () => { throw new Error('no package.json'); },
+    }));
+    assert.equal(info.pkgVersion, '0.0.0');
+});
+
+test('resolveBootInfo: readPkg returns object without version → pkgVersion "0.0.0"', () => {
+    const info = resolveBootInfo(fixedDeps({
+        readPkg: () => ({ name: 'x' }),
+    }));
+    assert.equal(info.pkgVersion, '0.0.0');
+});
