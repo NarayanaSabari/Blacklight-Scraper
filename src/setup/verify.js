@@ -67,15 +67,37 @@ export async function verifyLocal({ launch, cookies, headless, timeoutMs = 30000
 }
 
 export async function verifyRemote({ fetchFn, blacklight, scraperCredentials }) {
+    const EXPECTED_KEYS = ['ok', 'credentials', 'queue', 'status', 'session', 'available'];
+
     const hit = async (label, base, apiKey, p) => {
-        const r = await fetchFn(`${String(base).replace(/\/$/, '')}${p}`, { headers: { 'X-Scraper-API-Key': apiKey } });
-        return { label, status: r.status };
+        const r = await fetchFn(`${String(base).replace(/\/$/, '')}${p}`, {
+            headers: { 'X-Scraper-API-Key': apiKey },
+        });
+        const ct = (r.headers?.get?.('content-type') ?? '').toLowerCase();
+        return { label, status: r.status, ct, response: r };
     };
+
     try {
         const a = await hit('credentials', scraperCredentials.apiUrl, scraperCredentials.apiKey, '/api/scraper-credentials/queue/availability');
         const b = await hit('blacklight', blacklight.apiUrl, blacklight.apiKey, '/api/scraper/queue/current-session');
+
         const denied = [a, b].find((x) => x.status === 401 || x.status === 403);
         if (denied) return { status: 'bad', message: `❌ ${denied.label} API rejected the key (${denied.status}) — check the apiKey.` };
+
+        for (const x of [a, b]) {
+            if (!x.ct.startsWith('application/json')) {
+                return { status: 'bad', message: `❌ ${x.label} API returned non-JSON content-type (${x.ct || 'unknown'}) — captive portal or wrong URL? Expected application/json.` };
+            }
+            let body;
+            try { body = await x.response.json(); }
+            catch (_e) { return { status: 'bad', message: `❌ ${x.label} API response was not parseable JSON.` }; }
+            const hasExpected = body && typeof body === 'object'
+                && EXPECTED_KEYS.some((k) => Object.prototype.hasOwnProperty.call(body, k));
+            if (!hasExpected) {
+                return { status: 'bad', message: `❌ ${x.label} API returned an unexpected schema (no ${EXPECTED_KEYS.join('/')}); check the URL points at the right service.` };
+            }
+        }
+
         return { status: 'ok', message: '✅ APIs reachable & key accepted — ready. Run: npm start' };
     } catch (e) {
         return { status: 'warn', message: `⚠️ Could not reach an API (${String(e.message).split('\n')[0]}); config written.` };

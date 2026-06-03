@@ -60,9 +60,10 @@ test('verifyLocal: authed page → ok; login page → bad; launch throw → warn
 });
 
 test('verifyRemote: 200 → ok; 401 → bad; network throw → warn', async () => {
-    const ok = await verifyRemote({ fetchFn: async () => ({ status: 200 }), blacklight: { apiUrl: 'https://b', apiKey: 'k' }, scraperCredentials: { apiUrl: 'https://c', apiKey: 'k' } });
+    const okFetch = async () => ({ status: 200, headers: { get: () => 'application/json' }, json: async () => ({ ok: true }) });
+    const ok = await verifyRemote({ fetchFn: okFetch, blacklight: { apiUrl: 'https://b', apiKey: 'k' }, scraperCredentials: { apiUrl: 'https://c', apiKey: 'k' } });
     assert.equal(ok.status, 'ok');
-    const bad = await verifyRemote({ fetchFn: async () => ({ status: 401 }), blacklight: { apiUrl: 'https://b', apiKey: 'k' }, scraperCredentials: { apiUrl: 'https://c', apiKey: 'k' } });
+    const bad = await verifyRemote({ fetchFn: async () => ({ status: 401, headers: { get: () => 'application/json' }, json: async () => ({ ok: true }) }), blacklight: { apiUrl: 'https://b', apiKey: 'k' }, scraperCredentials: { apiUrl: 'https://c', apiKey: 'k' } });
     assert.equal(bad.status, 'bad');
     const warn = await verifyRemote({ fetchFn: async () => { throw new Error('ECONN'); }, blacklight: { apiUrl: 'https://b', apiKey: 'k' }, scraperCredentials: { apiUrl: 'https://c', apiKey: 'k' } });
     assert.equal(warn.status, 'warn');
