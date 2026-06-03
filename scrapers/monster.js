@@ -35,6 +35,20 @@ export function parseAriaLabel(text) {
     return { title, company };
 }
 
+// Builds the canonical job URL. Prefers a real anchor href (the card's
+// own <a>); falls back to constructing one from the data-job-id UUID.
+// Returns null if neither is present — caller skips the row.
+export function constructJobUrl(realHref, jobId) {
+    const h = realHref ? String(realHref).trim() : '';
+    if (h) {
+        if (h.startsWith('http://') || h.startsWith('https://')) return h;
+        if (h.startsWith('/')) return `https://www.monster.com${h}`;
+    }
+    const id = jobId ? String(jobId).trim() : '';
+    if (id) return `https://www.monster.com/job-openings/${id}`;
+    return null;
+}
+
 // First-touch on /jobs/search returns 403 from DataDome on a brand-new
 // session. A brief visit to monster.com first establishes cookies and
 // lets the subsequent search-page navigation through.
