@@ -117,6 +117,31 @@ Indeed cookies, TechFetch login) live in the central dashboard
 (Dashboard → Credentials), not in this file. The scraper pulls them on
 demand via the `scraperCredentials` API config above.
 
+## After updating
+
+Node does NOT hot-reload imported source files. After `git pull` you
+MUST restart `node server.js` for the new code to take effect. Confirm
+with `curl -s http://localhost:3001/healthz | jq .gitSha` — the value
+must match `git rev-parse --short HEAD`.
+
+Platform-specific recipes:
+
+- macOS: see [docs/MAC_SETUP.md](docs/MAC_SETUP.md#updating)
+- Windows: see [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md#updating)
+
+## Exit codes
+
+`node server.js` exits with a structured code so supervisors can pick a
+restart policy:
+
+| Code | Reason | Supervisor action |
+|---|---|---|
+| 0 | clean SIGINT/SIGTERM | per policy |
+| 2 | `auth-dead` — LinkedIn session unrecoverable, no fallback | page humans, do NOT auto-restart |
+| 3 | `lease-starved` — credential pool empty for N polls | back off, retry later |
+| 42 | `crash` — uncaught exception / unhandled rejection | restart |
+| 1 | unknown / startup failure | treat as crash |
+
 ## 🎯 Usage
 
 ### Start the Server (Production)
