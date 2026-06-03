@@ -15,6 +15,7 @@
 import { launch } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
+import { BlockedError, DomChangedError, NetworkError } from '../src/core/errors.js';
 
 const log = createLogger('monster');
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -155,58 +156,30 @@ async function warmup(page) {
     log.info(`Warmup complete (status ${resp?.status() ?? '?'})`);
 }
 
-async function extractJobsFromCurrentPage(page) {
-    return page.evaluate(() => {
-        // Monster job cards anchor to /job-openings/<id>. The anchor's
-        // ancestor <article> (or fallback container) carries the
-        // displayed title, company, location, and time-posted info.
-        const cards = Array.from(document.querySelectorAll('a[href*="/job-openings/"]'));
-        const seen = new Set();
-        const results = [];
-        for (const a of cards) {
-            const href = a.href;
-            if (!href || seen.has(href)) continue;
-            seen.add(href);
+const CONFIG = {
+    MAX_PAGES: 5,
+    MAX_JOBS: 100,
+    MIN_PAGE_SPACING_MS: 3000,
+    MAX_PAGE_SPACING_MS: 5000,
+    NAV_TIMEOUT_MS: 30000,
+    API_RESPONSE_TIMEOUT_MS: 15000,
+    CARD_SELECTOR_TIMEOUT_MS: 5000,
+};
 
-            const container = a.closest('article, [data-test*="JobCard"], li, div[role="article"]') || a.parentElement || a;
-            const fullText = (container.innerText || '').trim();
-            const lines = fullText.split('\n').map((l) => l.trim()).filter(Boolean);
-
-            // Most Monster cards lay out as:
-            //   line 0: <Job Title>
-            //   line 1: <Company Name>
-            //   line 2: <Location>  (sometimes plus "Remote" tag)
-            //   line 3: <Time posted, e.g. "2 days ago">
-            // Plus extra noise (save button labels, salary banners).
-            const title = lines[0] || a.getAttribute('aria-label') || a.innerText.trim();
-            const company = lines[1] || '';
-            const locationStr = lines[2] || '';
-            const datePosted = lines.find((l) => /\b(day|hour|week|min)/i.test(l)) || '';
-
-            results.push({
-                title,
-                company,
-                location: locationStr,
-                url: href,
-                datePosted,
-                description: fullText.slice(0, 1000),
-            });
-        }
-        return results;
-    });
+export function searchUrl(jobTitle, location, pageNum) {
+    return `https://www.monster.com/jobs/search` +
+        `?q=${encodeURIComponent(jobTitle)}` +
+        `&where=${encodeURIComponent(location)}` +
+        `&page=${pageNum}`;
 }
 
 export async function scrapeMonster(jobTitle, location, sessionId = null) {
-    void sessionId; // CloakBrowser anonymous launches don't need credentials.
+    void sessionId;
     log.info(`Searching for "${jobTitle}" in "${location}"`);
-
     log.info('🚀 Launching CloakBrowser stealth Chromium...');
-    // humanize: true is REQUIRED for monster — DataDome scores the
-    // behavioral signals (timing, mouse curves, scroll patterns) in
-    // addition to fingerprints. headless without humanize returns 403
-    // on monster.com's homepage too. Confirmed via warmup probe.
     const browser = await launch({ headless: true, humanize: true });
-
+    const allJobs = [];
+    let collectedAnything = false;
     try {
         const context = await browser.newContext({
             viewport: { width: 1366, height: 900 },
@@ -214,68 +187,128 @@ export async function scrapeMonster(jobTitle, location, sessionId = null) {
             timezoneId: 'America/New_York',
         });
         const page = await context.newPage();
-
         await warmup(page);
 
-        const maxJobs = 100;
-        const maxPages = 5;
-        const seenUrls = new Set();
-        const allJobs = [];
-        let consecutiveEmptyPages = 0;
+        const seen = new Set();
+        let consecutiveEmpty = 0;
 
-        for (let pageNum = 1; pageNum <= maxPages && allJobs.length < maxJobs; pageNum++) {
-            const searchUrl =
-                `https://www.monster.com/jobs/search` +
-                `?q=${encodeURIComponent(jobTitle)}` +
-                `&where=${encodeURIComponent(location)}` +
-                `&page=${pageNum}` +
-                `&recency=last+week` +
-                `&so=m.s.sh`;
-            log.info(`Fetching page ${pageNum}: ${searchUrl}`);
+        for (let pageNum = 1; pageNum <= CONFIG.MAX_PAGES && allJobs.length < CONFIG.MAX_JOBS; pageNum++) {
+            const url = searchUrl(jobTitle, location, pageNum);
+            log.info(`Fetching page ${pageNum}: ${url}`);
 
-            const resp = await page.goto(searchUrl, {
-                waitUntil: 'domcontentloaded',
-                timeout: 45000,
+            // Gate the navigation on the appsapi POST as our "page is alive" signal.
+            // waitForResponse is set up BEFORE goto so we don't miss the early fire.
+            const apiResponsePromise = page.waitForResponse(
+                (r) => r.url().includes('/jobs-svx-service/v2/monster/search-jobs/') && r.request().method() === 'POST',
+                { timeout: CONFIG.API_RESPONSE_TIMEOUT_MS },
+            ).then(() => true).catch(() => false);
+            try {
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.NAV_TIMEOUT_MS });
+            } catch (e) {
+                if (allJobs.length >= 1) return { jobs: allJobs, emptyConfirmed: false, partial: true };
+                throw new NetworkError(`Monster page.goto failed: ${e.message}`, { platform: 'monster', cause: e });
+            }
+            const sawApiResponse = await apiResponsePromise;
+
+            // Soft-wait for cards to render (best effort — classifier owns the verdict).
+            await page.waitForSelector('article[data-testid="JobCard"]', { timeout: CONFIG.CARD_SELECTOR_TIMEOUT_MS }).catch(() => {});
+
+            const probe = await page.evaluate(() => ({
+                bodyText: (document.body?.innerText || '').slice(0, 4000),
+                cardCount: document.querySelectorAll('article[data-testid="JobCard"]').length,
+            }));
+            const verdict = classifyMonsterPage({
+                url: page.url(),
+                bodyText: probe.bodyText,
+                cardCount: probe.cardCount,
+                sawApiResponse,
             });
-            await sleep(4000 + Math.random() * 2000);
+            log.info(`Page ${pageNum} classified: ${verdict.state} (${verdict.signal})`);
 
-            if (resp && resp.status() >= 400) {
-                throw new Error(`Search page returned ${resp.status()} on page ${pageNum}`);
+            if (verdict.state === 'soft_blocked') {
+                if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
+                throw new BlockedError(`Monster blocked: ${verdict.signal}`, { platform: 'monster', kind: 'datadome' });
+            }
+            if (verdict.state === 'dom_changed') {
+                if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
+                throw new DomChangedError(`Monster DOM changed: ${verdict.signal}`, { platform: 'monster' });
+            }
+            if (verdict.state === 'network_error') {
+                if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
+                throw new NetworkError(`Monster page didn't load: ${verdict.signal}`, { platform: 'monster' });
+            }
+            if (verdict.state === 'empty_confirmed') {
+                consecutiveEmpty++;
+                if (consecutiveEmpty >= 2) break;
+                await sleep(CONFIG.MIN_PAGE_SPACING_MS + Math.random() * (CONFIG.MAX_PAGE_SPACING_MS - CONFIG.MIN_PAGE_SPACING_MS));
+                continue;
             }
 
-            const rawJobs = await extractJobsFromCurrentPage(page);
-            let newCount = 0;
-            for (const j of rawJobs) {
-                if (!j.url || seenUrls.has(j.url)) continue;
-                seenUrls.add(j.url);
+            // results — extract.
+            const raw = await page.evaluate(() => {
+                function extractInPage(card) {
+                    const btn = card.querySelector('button[data-job-id], button[aria-label]');
+                    if (!btn) return null;
+                    const aria = btn.getAttribute('aria-label');
+                    if (!aria) return { __domChanged: true, reason: 'no_aria_label' };
+                    const m = aria.trim().match(/^(.+?)\s+at\s+(.+)$/);
+                    if (!m) return { __domChanged: true, reason: 'aria_label_format' };
+                    const title = m[1].trim(); const company = m[2].trim();
+                    const jobId = btn.getAttribute('data-job-id') || '';
+                    if (!title || !company || !jobId) return null;
+                    const a = card.querySelector('a[href*="/job-openings/"]');
+                    const realHref = a ? a.getAttribute('href') : '';
+                    return {
+                        title, company, jobId, realHref,
+                        text: (card.textContent || '').trim().slice(0, 4000),
+                    };
+                }
+                const cards = [...document.querySelectorAll('article[data-testid="JobCard"]')];
+                return cards.map(extractInPage);
+            });
 
+            // Aggregate domChanged + finish parsing in Node (so the pure helpers stay testable)
+            let cardDomChanged = 0;
+            let newCount = 0;
+            for (const r of raw) {
+                if (!r) continue;
+                if (r.__domChanged) { cardDomChanged++; continue; }
+                const builtUrl = constructJobUrl(r.realHref, r.jobId);
+                if (!builtUrl || seen.has(builtUrl)) continue;
+                seen.add(builtUrl);
+                const { location: loc, datePosted } = parseLocationDate(r.text);
                 allJobs.push(normalizeJobData({
-                    title: j.title,
-                    url: j.url,
-                    description: j.description,
-                    datePosted: j.datePosted,
-                    hiringOrganization: j.company,
-                    jobLocation: j.location,
+                    title: r.title,
+                    hiringOrganization: r.company,
+                    jobLocation: loc,
+                    url: builtUrl,
+                    datePosted,
+                    salary: parsePay(r.text),
+                    description: r.text.slice(0, 800),
+                    isPromoted: isPromoted(r.text),
                 }, 'Monster'));
                 newCount++;
-                if (allJobs.length >= maxJobs) break;
+                if (allJobs.length >= CONFIG.MAX_JOBS) break;
             }
-            log.info(`Page ${pageNum}: ${rawJobs.length} cards on page, ${newCount} new unique, total: ${allJobs.length}`);
+            collectedAnything = collectedAnything || allJobs.length > 0;
 
-            if (newCount === 0) {
-                consecutiveEmptyPages++;
-                if (consecutiveEmptyPages >= 2) {
-                    log.info('No new jobs across 2 consecutive pages — search exhausted.');
-                    break;
-                }
-            } else {
-                consecutiveEmptyPages = 0;
+            if (cardDomChanged > 0 && cardDomChanged >= Math.ceil(raw.length / 2)) {
+                if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
+                throw new DomChangedError(`Monster aria-label format changed (${cardDomChanged}/${raw.length} cards)`, { platform: 'monster' });
             }
+
+            log.info(`Page ${pageNum}: ${raw.length} cards, ${newCount} new unique, total: ${allJobs.length}`);
+            if (newCount === 0) consecutiveEmpty++; else consecutiveEmpty = 0;
+            if (consecutiveEmpty >= 2) break;
+
+            await sleep(CONFIG.MIN_PAGE_SPACING_MS + Math.random() * (CONFIG.MAX_PAGE_SPACING_MS - CONFIG.MIN_PAGE_SPACING_MS));
         }
 
-        const jobsToReturn = allJobs.slice(0, maxJobs);
-        log.info(`Completed! Found ${jobsToReturn.length} unique jobs`);
-        return jobsToReturn;
+        log.info(`Completed! Found ${allJobs.length} unique jobs`);
+        if (allJobs.length === 0) {
+            return { jobs: [], emptyConfirmed: true };
+        }
+        return allJobs;
     } finally {
         try { await browser.close(); } catch { /* already closed */ }
     }
