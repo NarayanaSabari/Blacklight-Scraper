@@ -81,6 +81,41 @@ export function isPromoted(text) {
     return /\bpromoted\b/i.test(String(text ?? ''));
 }
 
+// Extracts a single card from a DOM Element (browser or jsdom). Returns:
+//   - a structured row object on success
+//   - { __domChanged: true, reason } when the aria-label format breaks
+//     (caller aggregates these to throw DomChangedError when > 50% fail)
+//   - null when the row should be skipped silently (e.g. button missing
+//     data-job-id — likely a UI artifact, not an actual job card)
+export function extractCardFromElement(card) {
+    if (!card || typeof card.querySelector !== 'function') return null;
+    const btn = card.querySelector('button[data-job-id], button[aria-label]');
+    if (!btn) return null;
+    const aria = btn.getAttribute('aria-label');
+    if (!aria) return { __domChanged: true, reason: 'no_aria_label' };
+    const parsed = parseAriaLabel(aria);
+    if (!parsed) return { __domChanged: true, reason: 'aria_label_format' };
+    const jobId = btn.getAttribute('data-job-id') || '';
+    if (!jobId) return null;
+    const realAnchor = card.querySelector('a[href*="/job-openings/"]');
+    const realHref = realAnchor ? realAnchor.getAttribute('href') : '';
+    const url = constructJobUrl(realHref, jobId);
+    if (!url) return null;
+    const text = (card.textContent || '').trim();
+    const { location, datePosted } = parseLocationDate(text);
+    return {
+        title: parsed.title,
+        company: parsed.company,
+        location,
+        datePosted,
+        salary: parsePay(text),
+        jobId,
+        url,
+        description: text.slice(0, 800),
+        isPromoted: isPromoted(text),
+    };
+}
+
 // First-touch on /jobs/search returns 403 from DataDome on a brand-new
 // session. A brief visit to monster.com first establishes cookies and
 // lets the subsequent search-page navigation through.
