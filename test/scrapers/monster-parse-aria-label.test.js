@@ -16,10 +16,17 @@ test('parseAriaLabel: multi-word company with spaces', () => {
     });
 });
 
-test('parseAriaLabel: title containing " at " uses LAST " at " as the separator', () => {
+test('parseAriaLabel: title containing " at " uses FIRST " at " as separator (non-greedy)', () => {
+    // The regex /^(.+?)\s+at\s+(.+)$/ is non-greedy on the title group,
+    // so it consumes the shortest possible title — i.e. splits on the
+    // FIRST " at ", and everything after becomes the company name.
     assert.deepEqual(parseAriaLabel('Engineer III at Google'), {
         title: 'Engineer III',
         company: 'Google',
+    });
+    assert.deepEqual(parseAriaLabel('Platform Engineer at AWS at Amazon'), {
+        title: 'Platform Engineer',
+        company: 'AWS at Amazon',
     });
 });
 

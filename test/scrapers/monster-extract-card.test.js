@@ -1,11 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { extractCardFromElement } from '../../scrapers/monster.js';
 
-const FIXTURE = fs.readFileSync(path.resolve('test/fixtures/monster-card.html'), 'utf-8');
+const FIXTURE = fs.readFileSync(new URL('../fixtures/monster-card.html', import.meta.url), 'utf-8');
 
 function loadCards() {
     const dom = new JSDOM(`<!doctype html><html><body>${FIXTURE}</body></html>`);
