@@ -49,6 +49,38 @@ export function constructJobUrl(realHref, jobId) {
     return null;
 }
 
+// Parses location + posted-date from a card's innerText. Handles both
+// the joined "Redmond, WA7 days ago" layout (the probe observed) and
+// the split-by-newline layout.
+export function parseLocationDate(text) {
+    const s = String(text ?? '');
+    // location: "City, ST" (two-letter US state) OR the literal "Remote"
+    const locRe = /(Remote|[A-Z][a-zA-Z .'-]+,\s*[A-Z]{2})/;
+    const dateRe = /(\d+\s+(?:hour|day|week|month|min(?:ute)?)s?\s+ago)/i;
+    const lm = s.match(locRe);
+    const dm = s.match(dateRe);
+    return {
+        location: lm ? lm[1].trim() : '',
+        datePosted: dm ? dm[1].trim() : '',
+    };
+}
+
+// Parses a salary / pay band from innerText. Matches single values and
+// ranges, with optional "/ Year|Hour|Month" suffix. Returns "" when
+// absent (Monster doesn't always display pay).
+export function parsePay(text) {
+    const s = String(text ?? '');
+    const re = /(\$[\d,]+(?:\s*[–\-]\s*\$[\d,]+)?(?:\s*\/\s*(?:Year|Hour|Month))?)/i;
+    const m = s.match(re);
+    return m ? m[1].trim() : '';
+}
+
+// Flag a card as a sponsored / promoted insertion. Today's marker is
+// the word "Promoted" appearing in the card body.
+export function isPromoted(text) {
+    return /\bpromoted\b/i.test(String(text ?? ''));
+}
+
 // First-touch on /jobs/search returns 403 from DataDome on a brand-new
 // session. A brief visit to monster.com first establishes cookies and
 // lets the subsequent search-page navigation through.
