@@ -73,6 +73,58 @@ export function parseEmploymentType(rawType) {
     return EMPLOYMENT_TYPE_MAP[rawType] ?? String(rawType).toLowerCase();
 }
 
+// Maps a JobPosting JSON-LD object into the flat record we pass to
+// normalizeJobData. Returns the row on success, or
+// { __domChanged: true, reason } when a load-bearing field is missing —
+// caller aggregates these and throws DomChangedError when the rate
+// crosses the batch threshold (Section E of the spec).
+export function extractJobFromStructuredData(jsonLd, requestUrl) {
+    if (!jsonLd?.title) return { __domChanged: true, reason: 'missing_title' };
+    const company = jsonLd?.hiringOrganization?.name;
+    if (!company) return { __domChanged: true, reason: 'missing_company' };
+
+    const jobId = jsonLd.identifier?.value || String(requestUrl).split('/').filter(Boolean).pop();
+    const addr = jsonLd.jobLocation?.address ?? {};
+    const city = addr.addressLocality ?? null;
+    const state = addr.addressRegion ?? null;
+    const country = addr.addressCountry ?? null;
+    const locationFormatted = city && state ? `${city}, ${state}` : (city || state || 'N/A');
+    const isRemote = jsonLd.jobLocationType === 'TELECOMMUTE';
+
+    const salary = parseSalary(jsonLd.baseSalary);
+    const employmentType = parseEmploymentType(jsonLd.employmentType);
+
+    const fmtDate = (v) => {
+        if (!v) return null;
+        const d = new Date(v);
+        if (Number.isNaN(d.getTime())) return null;
+        return d.toISOString().split('T')[0];
+    };
+
+    return {
+        jobId,
+        title: jsonLd.title,
+        company,
+        companyProfileUrl: jsonLd.hiringOrganization?.sameAs ?? null,
+        companyLogoUrl: jsonLd.hiringOrganization?.logo ?? null,
+        locationFormatted,
+        city,
+        state,
+        country,
+        isRemote,
+        salaryFormatted: salary.formatted,
+        salaryMin: salary.min,
+        salaryMax: salary.max,
+        salaryCurrency: salary.currency,
+        salaryPeriod: salary.period,
+        employmentType,
+        postedDate: fmtDate(jsonLd.datePosted),
+        validThrough: fmtDate(jsonLd.validThrough),
+        description: jsonLd.description ?? '',
+        url: jsonLd.url || requestUrl,
+    };
+}
+
 /**
  * Fetch recruiter profile page and extract name/title from RSC payload.
  * Email/phone are behind authentication and cannot be scraped without login.
