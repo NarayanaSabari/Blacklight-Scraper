@@ -10,6 +10,7 @@
     "linkedin:login": "node scripts/linkedin-login.js",
     "linkedin:test-scrape": "node scripts/test-linkedin-scrape.js",
     "monster:test-scrape": "node scripts/test-monster-scrape.js",
+    "dice:test-scrape": "node scripts/test-dice-scrape.js",
     "test": "node --test 'test/**/*.test.js'",
     "setup": "node server.js --setup"
   },
