@@ -13,7 +13,7 @@ import * as cheerio from 'cheerio';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
-import { BlockedError, DomChangedError, NetworkError, ParseError } from '../src/core/errors.js';
+import { BlockedError, DomChangedError, NetworkError } from '../src/core/errors.js';
 
 const log = createLogger('dice');
 const logProgress = (_scope, msg) => log.info(msg);
