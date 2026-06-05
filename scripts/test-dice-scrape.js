@@ -57,8 +57,13 @@ async function main() {
     console.log(`   bad title : ${badTitle.length} (must be 0)`);
     console.log(`   bad company: ${badCompany.length} (must be 0)`);
 
-    if (jobs.length > 0 && counts.permalink / jobs.length < 0.5) {
-        console.log('\n⚠ PERMALINK rate < 50% — extractor likely broken.');
+    // Dice URLs (https://www.dice.com/job-detail/<uuid>) classify as 'other'
+    // because the shared classifyUrl regex targets LinkedIn-style permalinks.
+    // The real signal for "extractor broken" on Dice is bad rows (empty URL,
+    // /in/ leak, or missing title/company) — not 'other'.
+    const badUrlCount = counts.empty + counts.profile_in;
+    if (jobs.length > 0 && (badUrlCount / jobs.length > 0.1 || badTitle.length > 0 || badCompany.length > 0)) {
+        console.log('\n⚠ Bad rows detected — extractor likely broken.');
         process.exit(3);
     }
     process.exit(0);
