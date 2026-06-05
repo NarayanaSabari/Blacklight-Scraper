@@ -53,6 +53,26 @@ export function parseSalary(baseSalary) {
     return { min, max, currency, period, formatted };
 }
 
+const EMPLOYMENT_TYPE_MAP = Object.freeze({
+    FULL_TIME: 'full_time',
+    PART_TIME: 'part_time',
+    CONTRACTOR: 'contract',
+    TEMPORARY: 'temporary',
+    INTERN: 'internship',
+});
+
+// Maps Dice's employmentType (single string or array of strings) into our
+// canonical lower-snake_case form. Unknown values pass through lowercased.
+// Missing/empty → 'N/A' (matches the rest of the normalize.js defaults).
+export function parseEmploymentType(rawType) {
+    if (rawType === null || rawType === undefined || rawType === '') return 'N/A';
+    if (Array.isArray(rawType)) {
+        if (rawType.length === 0) return 'N/A';
+        return rawType.map((t) => EMPLOYMENT_TYPE_MAP[t] ?? String(t).toLowerCase()).join(', ');
+    }
+    return EMPLOYMENT_TYPE_MAP[rawType] ?? String(rawType).toLowerCase();
+}
+
 /**
  * Fetch recruiter profile page and extract name/title from RSC payload.
  * Email/phone are behind authentication and cannot be scraped without login.
