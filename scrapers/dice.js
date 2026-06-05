@@ -17,6 +17,23 @@ import { stripHtmlTags } from '../src/core/html.js';
 const log = createLogger('dice');
 const logProgress = (_scope, msg) => log.info(msg);
 
+// Parses the body of <script id="jobDetailStructuredData">. Pure given a
+// string. Returns {data, error}: data is the parsed object on success,
+// or null with a human-readable error string. The caller turns the
+// error into a typed ParseError or DomChangedError depending on context.
+export function parseStructuredData(scriptText) {
+    if (scriptText === null || scriptText === undefined || scriptText === '') {
+        return { data: null, error: 'empty structured-data script body' };
+    }
+    let parsed;
+    try { parsed = JSON.parse(scriptText); }
+    catch (e) { return { data: null, error: `JSON parse failed: ${e.message}` }; }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { data: null, error: 'structured data is not an object' };
+    }
+    return { data: parsed, error: null };
+}
+
 /**
  * Fetch recruiter profile page and extract name/title from RSC payload.
  * Email/phone are behind authentication and cannot be scraped without login.
