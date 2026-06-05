@@ -34,6 +34,25 @@ export function parseStructuredData(scriptText) {
     return { data: parsed, error: null };
 }
 
+// Parses the baseSalary block from a JobPosting JSON-LD. Handles both
+// the modern "MonetaryAmount" shape (minValue/maxValue at top level) and
+// the legacy "value.minValue" nested shape. Returns a stable object with
+// {min, max, currency, period, formatted}. The formatted string is the
+// human-readable label downstream UIs render.
+export function parseSalary(baseSalary) {
+    const fallback = { min: null, max: null, currency: 'USD', period: null, formatted: 'N/A' };
+    if (baseSalary === null || baseSalary === undefined) return fallback;
+    const min = baseSalary.minValue ?? baseSalary.value?.minValue ?? null;
+    const max = baseSalary.maxValue ?? baseSalary.value?.maxValue ?? null;
+    const currency = baseSalary.currency || 'USD';
+    const period = baseSalary.unitText || null;
+    if (min === null && max === null) return { ...fallback, currency, period };
+    const fmt = (v) => (v !== null && v !== undefined) ? `$${Number(v).toLocaleString()}` : null;
+    const suffix = period === 'HOUR' ? '/hr' : period === 'YEAR' ? '/yr' : '';
+    const formatted = [fmt(min), fmt(max)].filter(Boolean).join(' - ') + suffix;
+    return { min, max, currency, period, formatted };
+}
+
 /**
  * Fetch recruiter profile page and extract name/title from RSC payload.
  * Email/phone are behind authentication and cannot be scraped without login.
