@@ -13,7 +13,7 @@ import { scrapeIndeed } from '../../scrapers/indeed.js';
 import { scrapeMonster } from '../../scrapers/monster.js';
 
 export const SCRAPERS = Object.freeze({
-    dice: new BaseScraper('dice', scrapeDice),
+    dice: new BaseScraper('dice', scrapeDice, { strictEmpty: true }),
     techfetch: new BaseScraper('techfetch', scrapeTechFetch),
     linkedin: new BaseScraper('linkedin', scrapeLinkedIn),
     glassdoor: new BaseScraper('glassdoor', scrapeGlassdoor),
