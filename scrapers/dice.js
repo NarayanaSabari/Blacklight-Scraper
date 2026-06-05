@@ -125,6 +125,33 @@ export function extractJobFromStructuredData(jsonLd, requestUrl) {
     };
 }
 
+// Pure page-state classifier for the search-results page.
+//   results          → real results page, anchors are extractable
+//   empty_confirmed  → real "0 results" page (no false alarm)
+//   soft_blocked     → Cloudflare / access-denied page (defensive)
+//   dom_changed      → page rendered fully but the anchors we expect are absent
+//   network_error    → page didn't render meaningfully (small body, nothing positive)
+const DICE_DOM_CHANGED_BYTES_THRESHOLD = 50_000;
+
+export function classifyDiceSearchPage({ url, bodyText, anchorCount, bytes }) {
+    const u = String(url ?? '');
+    const t = String(bodyText ?? '');
+    if (/cloudflare|access denied|please verify|ray id|verify you are human/i.test(t) ||
+        /captcha|challenge/i.test(u)) {
+        return { state: 'soft_blocked', signal: 'cloudflare-style block page' };
+    }
+    if (anchorCount > 0) {
+        return { state: 'results', signal: `anchors=${anchorCount}` };
+    }
+    if (/no jobs (found|match)|0 results/i.test(t)) {
+        return { state: 'empty_confirmed', signal: 'no-jobs-found text' };
+    }
+    if ((bytes ?? 0) >= DICE_DOM_CHANGED_BYTES_THRESHOLD) {
+        return { state: 'dom_changed', signal: `large render (${bytes}b) but 0 anchors and no empty-results text` };
+    }
+    return { state: 'network_error', signal: `small body (${bytes}b), no positive signal` };
+}
+
 /**
  * Fetch recruiter profile page and extract name/title from RSC payload.
  * Email/phone are behind authentication and cannot be scraped without login.
