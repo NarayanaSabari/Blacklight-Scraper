@@ -10,18 +10,15 @@ import { scrapeTechFetch } from '../../scrapers/techfetch.js';
 import { scrapeLinkedIn } from '../../scrapers/linkedin.js';
 import { scrapeGlassdoor } from '../../scrapers/glassdoor.js';
 import { scrapeIndeed } from '../../scrapers/indeed.js';
+import { scrapeMonster } from '../../scrapers/monster.js';
 
-// Monster is currently disabled — DataDome rate-limits ~70% of requests
-// from our IP pool even with CloakBrowser + humanize + warmup. Re-enable
-// once we have residential proxy rotation in place. scrapers/monster.js
-// is kept intact so the work isn't lost. To restore: re-add the import
-// and the `monster:` entry below.
 export const SCRAPERS = Object.freeze({
-    dice: new BaseScraper('dice', scrapeDice),
+    dice: new BaseScraper('dice', scrapeDice, { strictEmpty: true }),
     techfetch: new BaseScraper('techfetch', scrapeTechFetch),
     linkedin: new BaseScraper('linkedin', scrapeLinkedIn),
     glassdoor: new BaseScraper('glassdoor', scrapeGlassdoor),
     indeed: new BaseScraper('indeed', scrapeIndeed),
+    monster: new BaseScraper('monster', scrapeMonster, { strictEmpty: true }),
 });
 
 export const PLATFORM_NAMES = Object.freeze(Object.keys(SCRAPERS));

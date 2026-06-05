@@ -91,11 +91,13 @@ class MetricsRegistry {
 
         this.buildInfo = new Gauge({
             name: 'scraper_build_info',
-            help: 'Build info; always 1. Useful for joining by version/os labels.',
-            labelNames: ['node_version'],
+            help: 'Build info; always 1. Useful for joining by version/sha/headless/strict labels.',
+            labelNames: ['node_version', 'git_sha', 'pkg_version', 'headless', 'strict'],
             registers: reg,
         });
-        this.buildInfo.labels(process.version).set(1);
+        // Sentinel default so the gauge has a value before server.js calls
+        // recordBuildInfo() with the real labels. Replaced at boot.
+        this.buildInfo.labels(process.version, 'unknown', '0.0.0', 'false', 'false').set(1);
 
         // Sessions ---------------------------------------------------------
         this.sessionsTotal = new Counter({
@@ -117,6 +119,13 @@ class MetricsRegistry {
             name: 'scraper_jobs_scraped_total',
             help: 'Total jobs successfully scraped per platform.',
             labelNames: ['platform'],
+            registers: reg,
+        });
+
+        this.urlQualityTotal = new Counter({
+            name: 'scraper_url_quality_total',
+            help: 'Job URLs emitted by scrapers, classified at the BaseScraper output seam (quality = permalink|profile_in|empty|other).',
+            labelNames: ['platform', 'quality'],
             registers: reg,
         });
 
@@ -286,6 +295,24 @@ class MetricsRegistry {
     // testable now; the call site lands with the orchestrator work.
     recordSessionAllFailed() {
         this.#safe(() => this.sessionsAllFailedTotal.inc());
+    }
+
+    recordUrlQuality(platform, quality) {
+        this.#safe(() => this.urlQualityTotal.labels(platform ?? 'unknown', quality ?? 'unknown').inc());
+    }
+
+    recordBuildInfo(info) {
+        this.#safe(() => {
+            // Reset to drop the boot-time sentinel.
+            this.buildInfo.reset();
+            this.buildInfo.labels(
+                String(info.nodeVersion ?? 'unknown'),
+                String(info.gitSha ?? 'unknown'),
+                String(info.pkgVersion ?? '0.0.0'),
+                String(!!info.headless),
+                String(!!info.strict),
+            ).set(1);
+        });
     }
 
     recordJobsSubmitted(platform, status, count) {

@@ -13,349 +13,387 @@ import * as cheerio from 'cheerio';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
+import { BlockedError, DomChangedError, NetworkError } from '../src/core/errors.js';
 
 const log = createLogger('dice');
 const logProgress = (_scope, msg) => log.info(msg);
 
-/**
- * Fetch recruiter profile page and extract name/title from RSC payload.
- * Email/phone are behind authentication and cannot be scraped without login.
- */
-async function fetchRecruiterProfile(recruiterId, browser) {
-    if (!recruiterId) return { name: 'N/A', title: null, company: null };
-    const url = `https://www.dice.com/recruiter-profile/${recruiterId}`;
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    });
-    const page = await context.newPage();
-    try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await page.waitForTimeout(1500);
-        const html = await page.content();
-        const $r = cheerio.load(html);
-
-        // Extract from RSC payload: firstName/lastName are embedded in self.__next_f.push blocks
-        let firstName = null, lastName = null, jobTitle = null, companyName = null;
-        $r('script').each((_, el) => {
-            const src = $r(el).html() || '';
-            if (!src.includes('firstName')) return;
-            // Match "firstName":"Deva","lastName":"Raya","jobTitle":"Recruiter","companyName":"..."
-            const firstMatch = src.match(/"firstName"\s*:\s*"([^"]+)"/);
-            const lastMatch  = src.match(/"lastName"\s*:\s*"([^"]+)"/);
-            const titleMatch = src.match(/"jobTitle"\s*:\s*"([^"]+)"/);
-            const compMatch  = src.match(/"companyName"\s*:\s*"([^"]+)"/);
-            if (firstMatch) firstName = firstMatch[1];
-            if (lastMatch)  lastName  = lastMatch[1];
-            if (titleMatch) jobTitle  = titleMatch[1];
-            if (compMatch)  companyName = compMatch[1];
-        });
-
-        const name = [firstName, lastName].filter(Boolean).join(' ') || 'N/A';
-        logProgress('Dice', `Recruiter: ${name} (${jobTitle || 'N/A'}) @ ${companyName || 'N/A'}`);
-        return { name, title: jobTitle, company: companyName };
-    } catch (e) {
-        logProgress('Dice', `Could not fetch recruiter profile ${recruiterId}: ${e.message}`);
-        return { name: 'N/A', title: null, company: null };
-    } finally {
-        await page.close();
-        await context.close();
+// Parses the body of <script id="jobDetailStructuredData">. Pure given a
+// string. Returns {data, error}: data is the parsed object on success,
+// or null with a human-readable error string. The caller turns the
+// error into a typed ParseError or DomChangedError depending on context.
+export function parseStructuredData(scriptText) {
+    if (scriptText === null || scriptText === undefined || scriptText === '') {
+        return { data: null, error: 'empty structured-data script body' };
     }
+    let parsed;
+    try { parsed = JSON.parse(scriptText); }
+    catch (e) { return { data: null, error: `JSON parse failed: ${e.message}` }; }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { data: null, error: 'structured data is not an object' };
+    }
+    return { data: parsed, error: null };
 }
 
-export async function scrapeDice(jobTitle, location) {
-    const encodedJobTitle = encodeURIComponent(jobTitle);
-    const encodedLocation = encodeURIComponent(location);
+// Parses the baseSalary block from a JobPosting JSON-LD. Handles both
+// the modern "MonetaryAmount" shape (minValue/maxValue at top level) and
+// the legacy "value.minValue" nested shape. Returns a stable object with
+// {min, max, currency, period, formatted}. The formatted string is the
+// human-readable label downstream UIs render.
+export function parseSalary(baseSalary) {
+    const fallback = { min: null, max: null, currency: 'USD', period: null, formatted: 'N/A' };
+    if (baseSalary === null || baseSalary === undefined) return fallback;
+    const min = baseSalary.minValue ?? baseSalary.value?.minValue ?? null;
+    const max = baseSalary.maxValue ?? baseSalary.value?.maxValue ?? null;
+    const currency = baseSalary.currency || 'USD';
+    const period = baseSalary.unitText || null;
+    if (min === null && max === null) return { ...fallback, currency, period };
+    const fmt = (v) => (v !== null && v !== undefined) ? `$${Number(v).toLocaleString()}` : null;
+    const suffix = period === 'HOUR' ? '/hr' : period === 'YEAR' ? '/yr' : '';
+    const formatted = [fmt(min), fmt(max)].filter(Boolean).join(' - ') + suffix;
+    return { min, max, currency, period, formatted };
+}
 
-    logProgress('Dice', `Searching for "${jobTitle}" in "${location}"`);
+const EMPLOYMENT_TYPE_MAP = Object.freeze({
+    FULL_TIME: 'full_time',
+    PART_TIME: 'part_time',
+    CONTRACTOR: 'contract',
+    TEMPORARY: 'temporary',
+    INTERN: 'internship',
+});
 
-    // CloakBrowser handles its own Chromium args internally (sandbox,
-    // shm, GPU) so we don't pass --no-sandbox etc. headless:true is
-    // enough; humanize is off because Dice has no behavioral detection.
-    const browser = await launch({ headless: true });
-
-    // All contexts created below are pushed to this array so the finally block
-    // can guarantee cleanup no matter which step throws. Previously a failure
-    // anywhere after browser launch leaked the browser + its contexts.
-    const contextsToCleanup = [];
-
-    try {
-
-    // Step 1: Scrape job URLs from the search page
-    const searchUrl = `https://www.dice.com/jobs?q=${encodedJobTitle}&location=${encodedLocation}&filters.postedDate=SEVEN`;
-    const jobUrls = [];
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        viewport: { width: 1920, height: 1080 }
-    });
-    contextsToCleanup.push(context);
-    const page = await context.newPage();
-
-    const maxPages = 5;
-    for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
-        const pageUrl = `${searchUrl}&page=${pageNum}`;
-        try {
-            await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForSelector('body', { timeout: 10000 });
-
-            const links = await page.$$eval('a[href*="/job-detail/"]', anchors => anchors.map(a => a.href));
-            jobUrls.push(...links);
-            logProgress('Dice', `Page ${pageNum}: Found ${links.length} job URLs`);
-        } catch (error) {
-            logProgress('Dice', `Error scraping page ${pageNum}: ${error.message}`);
-            break;
-        }
+// Maps Dice's employmentType (single string or array of strings) into our
+// canonical lower-snake_case form. Unknown values pass through lowercased.
+// Missing/empty → 'N/A' (matches the rest of the normalize.js defaults).
+export function parseEmploymentType(rawType) {
+    if (rawType === null || rawType === undefined || rawType === '') return 'N/A';
+    if (Array.isArray(rawType)) {
+        if (rawType.length === 0) return 'N/A';
+        return rawType.map((t) => EMPLOYMENT_TYPE_MAP[t] ?? String(t).toLowerCase()).join(', ');
     }
-    jobUrls.splice(0, jobUrls.length, ...new Set(jobUrls)); // Deduplicate
-    logProgress('Dice', `Total unique job URLs found: ${jobUrls.length}`);
-    await context.close();
+    return EMPLOYMENT_TYPE_MAP[rawType] ?? String(rawType).toLowerCase();
+}
 
-    // Limit to 100 jobs
-    const maxJobs = 100;
-    const jobsToProcess = jobUrls.slice(0, maxJobs);
+// Maps a JobPosting JSON-LD object into the flat record we pass to
+// normalizeJobData. Returns the row on success, or
+// { __domChanged: true, reason } when a load-bearing field is missing —
+// caller aggregates these and throws DomChangedError when the rate
+// crosses the batch threshold (Section E of the spec).
+export function extractJobFromStructuredData(jsonLd, requestUrl) {
+    if (!jsonLd?.title) return { __domChanged: true, reason: 'missing_title' };
+    const company = jsonLd?.hiringOrganization?.name;
+    if (!company) return { __domChanged: true, reason: 'missing_company' };
 
-    const detailedData = [];
+    const jobId = jsonLd.identifier?.value || String(requestUrl).split('/').filter(Boolean).pop();
+    const addr = jsonLd.jobLocation?.address ?? {};
+    const city = addr.addressLocality ?? null;
+    const state = addr.addressRegion ?? null;
+    const country = addr.addressCountry ?? null;
+    const locationFormatted = city && state ? `${city}, ${state}` : (city || state || 'N/A');
+    const isRemote = jsonLd.jobLocationType === 'TELECOMMUTE';
 
-    // Create contexts for parallel job scraping
-    const jobContexts = [];
-    for (let i = 0; i < 5; i++) {
-        const jobCtx = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport: { width: 1920, height: 1080 },
-            ignoreHTTPSErrors: true,
-            bypassCSP: true
-        });
-        jobContexts.push(jobCtx);
-        contextsToCleanup.push(jobCtx);
-    }
-    let jobContextIndex = 0;
-    const getJobContext = () => {
-        const ctx = jobContexts[jobContextIndex];
-        jobContextIndex = (jobContextIndex + 1) % jobContexts.length;
-        return ctx;
+    const salary = parseSalary(jsonLd.baseSalary);
+    const employmentType = parseEmploymentType(jsonLd.employmentType);
+
+    const fmtDate = (v) => {
+        if (!v) return null;
+        const d = new Date(v);
+        if (Number.isNaN(d.getTime())) return null;
+        return d.toISOString().split('T')[0];
     };
 
-    // Process jobs in parallel using CheerioCrawler
-    const jobCrawler = new CheerioCrawler({
-        maxConcurrency: 10,
-        maxRequestRetries: 2,
-        requestHandlerTimeoutSecs: 180,
-        async requestHandler({ $, request }) {
-            logProgress('Dice', `Processing job ${request.url}`);
+    return {
+        jobId,
+        title: jsonLd.title,
+        company,
+        companyProfileUrl: jsonLd.hiringOrganization?.sameAs ?? null,
+        companyLogoUrl: jsonLd.hiringOrganization?.logo ?? null,
+        locationFormatted,
+        city,
+        state,
+        country,
+        isRemote,
+        salaryFormatted: salary.formatted,
+        salaryMin: salary.min,
+        salaryMax: salary.max,
+        salaryCurrency: salary.currency,
+        salaryPeriod: salary.period,
+        employmentType,
+        postedDate: fmtDate(jsonLd.datePosted),
+        validThrough: fmtDate(jsonLd.validThrough),
+        description: jsonLd.description ?? '',
+        url: jsonLd.url || requestUrl,
+    };
+}
 
-            // Use Playwright to render the page (Next.js RSC requires JS execution)
-            let pageHtml = '';
-            const jobContext = getJobContext();
-            const jobPage = await jobContext.newPage();
-            try {
-                await jobPage.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                await jobPage.waitForTimeout(2000);
-                pageHtml = await jobPage.content();
-                await jobPage.close();
-            } catch (error) {
-                logProgress('Dice', `Error loading job page with Playwright: ${error.message}`);
-                try { await jobPage.close(); } catch (e) {}
-                return;
-            }
+// Pure page-state classifier for the search-results page.
+//   results          → real results page, anchors are extractable
+//   empty_confirmed  → real "0 results" page (no false alarm)
+//   soft_blocked     → Cloudflare / access-denied page (defensive)
+//   dom_changed      → page rendered fully but the anchors we expect are absent
+//   network_error    → page didn't render meaningfully (small body, nothing positive)
+const DICE_DOM_CHANGED_BYTES_THRESHOLD = 50_000;
 
-            // Parse the rendered HTML with Cheerio
-            const $job = cheerio.load(pageHtml);
+export function classifyDiceSearchPage({ url, bodyText, anchorCount, bytes }) {
+    const u = String(url ?? '');
+    const t = String(bodyText ?? '');
+    if (/cloudflare|access denied|please verify|ray id|verify you are human/i.test(t) ||
+        /captcha|challenge/i.test(u)) {
+        return { state: 'soft_blocked', signal: 'cloudflare-style block page' };
+    }
+    if (anchorCount > 0) {
+        return { state: 'results', signal: `anchors=${anchorCount}` };
+    }
+    if (/no jobs (found|match)|0 results/i.test(t)) {
+        return { state: 'empty_confirmed', signal: 'no-jobs-found text' };
+    }
+    if ((bytes ?? 0) >= DICE_DOM_CHANGED_BYTES_THRESHOLD) {
+        return { state: 'dom_changed', signal: `large render (${bytes}b) but 0 anchors and no empty-results text` };
+    }
+    return { state: 'network_error', signal: `small body (${bytes}b), no positive signal` };
+}
 
-            // ── Structured data (Schema.org JobPosting) ──────────────────────────
-            const structuredDataScript = $job('script[id="jobDetailStructuredData"]').html();
-            if (!structuredDataScript) {
-                logProgress('Dice', `❌ No structured data found for ${request.url}`);
-                return;
-            }
-
-            let jobData;
-            try {
-                jobData = JSON.parse(structuredDataScript);
-            } catch (e) {
-                logProgress('Dice', `❌ Error parsing structured data JSON: ${e.message}`);
-                return;
-            }
-
-            if (!jobData || jobData['@type'] !== 'JobPosting') {
-                logProgress('Dice', `❌ Invalid structured data type: ${jobData?.['@type']}`);
-                return;
-            }
-
-            logProgress('Dice', `✓ Extracted job data: ${jobData.title || 'No title'}`);
-
-            // ── Job ID ────────────────────────────────────────────────────────────
-            const jobId = jobData.identifier?.value || request.url.split('/').pop();
-
-            // ── Location ──────────────────────────────────────────────────────────
-            const addr = jobData.jobLocation?.address || {};
-            const city    = addr.addressLocality || null;
-            const state   = addr.addressRegion   || null;
-            const country = addr.addressCountry  || null;
-            const locationFormatted = city && state ? `${city}, ${state}` : (city || state || 'N/A');
-
-            // Remote: jobLocationType === 'TELECOMMUTE' signals remote/hybrid
-            const isRemote = jobData.jobLocationType === 'TELECOMMUTE';
-
-            // ── Salary ────────────────────────────────────────────────────────────
-            // baseSalary structure in Dice structured data:
-            //   { "@type": "MonetaryAmount", "currency": "USD", "minValue": 60000, "maxValue": 65000 }
-            // (minValue/maxValue are directly on baseSalary, NOT nested under .value)
-            let salaryMin = null, salaryMax = null, salaryCurrency = 'USD', salaryPeriod = null;
-            if (jobData.baseSalary) {
-                salaryMin      = jobData.baseSalary.minValue ?? jobData.baseSalary.value?.minValue ?? null;
-                salaryMax      = jobData.baseSalary.maxValue ?? jobData.baseSalary.value?.maxValue ?? null;
-                salaryCurrency = jobData.baseSalary.currency || 'USD';
-                salaryPeriod   = jobData.baseSalary.unitText || null; // 'YEAR' or 'HOUR' when present
-            }
-
-            // Fallback: parse salary period from rendered badge text (e.g. "$60,000 - $65,000/yr")
-            if (!salaryPeriod) {
-                const badgeTexts = [];
-                $job('.SeuiInfoBadge').each((_, el) => {
-                    badgeTexts.push($job(el).text().trim());
-                });
-                const salaryBadge = badgeTexts.find(t => t.includes('$'));
-                if (salaryBadge) {
-                    if (salaryBadge.includes('/hr'))   salaryPeriod = 'HOUR';
-                    else if (salaryBadge.includes('/yr')) salaryPeriod = 'YEAR';
-                }
-            }
-
-            // Build human-readable salary string
-            let salaryFormatted = 'N/A';
-            if (salaryMin || salaryMax) {
-                const fmt = (v) => v ? `$${Number(v).toLocaleString()}` : null;
-                const period = salaryPeriod === 'HOUR' ? '/hr' : salaryPeriod === 'YEAR' ? '/yr' : '';
-                salaryFormatted = [fmt(salaryMin), fmt(salaryMax)].filter(Boolean).join(' - ') + period;
-            }
-
-            // ── Employment type ───────────────────────────────────────────────────
-            const employmentTypeMap = {
-                'FULL_TIME':  'full_time',
-                'PART_TIME':  'part_time',
-                'CONTRACTOR': 'contract',
-                'TEMPORARY':  'temporary',
-                'INTERN':     'internship'
-            };
-            const rawType = jobData.employmentType;
-            // employmentType can be a single string or an array
-            const employmentType = Array.isArray(rawType)
-                ? rawType.map(t => employmentTypeMap[t] || t.toLowerCase()).join(', ')
-                : (employmentTypeMap[rawType] || rawType?.toLowerCase() || 'N/A');
-
-            // ── Skills ────────────────────────────────────────────────────────────
-            // Skills are rendered as SeuiInfoBadge items under the "Skills" heading
-            const skills = [];
-            const skillsHeading = $job('h3').filter((_, el) => $job(el).text().trim() === 'Skills');
-            if (skillsHeading.length) {
-                skillsHeading.next('ul').find('li').each((_, el) => {
-                    const skill = $job(el).text().trim();
-                    if (skill) skills.push(skill);
-                });
-            }
-
-            // ── Workplace type (On-site / Remote / Hybrid) ────────────────────────
-            let workplaceType = null;
-            const locationTypeBadge = $job('[data-testid="locationTypeBadge"]');
-            if (locationTypeBadge.length) {
-                workplaceType = locationTypeBadge.text().trim() || null;
-            }
-
-            // ── easyApply ─────────────────────────────────────────────────────────
-            // Parse from RSC payload (self.__next_f.push blocks)
-            let easyApply = false;
-            $job('script').each((_, el) => {
-                const src = $job(el).html() || '';
-                if (src.includes(jobId) && src.includes('easyApply')) {
-                    const m = src.match(/"easyApply"\s*:\s*(true|false)/);
-                    if (m) easyApply = m[1] === 'true';
-                }
-            });
-
-            // ── Recruiter ─────────────────────────────────────────────────────────
-            // recruiterId is embedded in RSC payload; fetch the profile page for name/title
-            let recruiterInfo = { name: 'N/A', title: null, company: null };
-            let recruiterId = null;
-            $job('script').each((_, el) => {
-                const src = $job(el).html() || '';
-                if (!src.includes('recruiterId')) return;
-                const m = src.match(/"recruiterId"\s*:\s*"([a-f0-9-]{36})"/);
-                if (m) recruiterId = m[1];
-            });
-            if (recruiterId) {
-                recruiterInfo = await fetchRecruiterProfile(recruiterId, browser);
-            }
-
-            // ── Company ───────────────────────────────────────────────────────────
-            const companyName        = jobData.hiringOrganization?.name || 'N/A';
-            const companyProfileUrl  = jobData.hiringOrganization?.sameAs || null;
-            const companyLogoUrl     = jobData.hiringOrganization?.logo || null;
-
-            // ── Description ───────────────────────────────────────────────────────
-            const description = stripHtmlTags(jobData.description || '');
-
-            // ── Posted date ───────────────────────────────────────────────────────
-            const postedDate = jobData.datePosted
-                ? new Date(jobData.datePosted).toISOString().split('T')[0]
-                : null;
-
-            // ── Expiry date ───────────────────────────────────────────────────────
-            const validThrough = jobData.validThrough
-                ? new Date(jobData.validThrough).toISOString().split('T')[0]
-                : null;
-
-            const normalizedJob = normalizeJobData({
-                id: jobId,
-                title: jobData.title,
-                company: companyName,
-                companyProfileUrl,
-                companyLogoUrl,
-                location: locationFormatted,
-                city,
-                state,
-                country,
-                isRemote,
-                workplaceType,
-                salary: salaryFormatted,
-                salary_min: salaryMin,
-                salary_max: salaryMax,
-                salary_currency: salaryCurrency,
-                salary_period: salaryPeriod,
-                postedDate,
-                validThrough,
-                description,
-                employmentType,
-                easyApply,
-                skills,
-                url: jobData.url || request.url,
-                recruiter: {
-                    name: recruiterInfo.name,
-                    title: recruiterInfo.title,
-                    company: recruiterInfo.company,
-                    profileUrl: recruiterId ? `https://www.dice.com/recruiter-profile/${recruiterId}` : null
-                }
-            }, 'Dice');
-
-            detailedData.push(normalizedJob);
-            logProgress('Dice', `✅ Job saved: ${jobData.title} at ${companyName} (Total: ${detailedData.length})`);
-        }
+// Reads the skills list from the rendered detail page. The Skills heading
+// is an <h3>; the list is the immediately-following <ul>. Returns [] when
+// the heading is absent (Dice has been known to ship pages without it).
+export function extractSkills($job) {
+    const skills = [];
+    const heading = $job('h3').filter((_, el) => $job(el).text().trim() === 'Skills');
+    if (!heading.length) return skills;
+    heading.next('ul').find('li').each((_, el) => {
+        const v = $job(el).text().trim();
+        if (v) skills.push(v);
     });
+    return skills;
+}
 
-    await jobCrawler.run(jobsToProcess.map(url => ({ url })));
+// Reads the workplace-type badge text (e.g. "Remote", "Hybrid", "On-site").
+// Returns null when absent.
+export function extractWorkplaceType($job) {
+    const badge = $job('[data-testid="locationTypeBadge"]');
+    if (!badge.length) return null;
+    return badge.text().trim() || null;
+}
 
-    logProgress('Dice', `Crawler finished. Jobs in detailedData array: ${detailedData.length}`);
+const CONFIG = {
+    MAX_PAGES: 5,
+    MAX_JOBS: 100,
+    SEARCH_NAV_TIMEOUT_MS: 30000,
+    SEARCH_RENDER_WAIT_MS: 2000,
+    DETAIL_NAV_TIMEOUT_MS: 30000,
+    DETAIL_RENDER_WAIT_MS: 2000,
+    DETAIL_CONCURRENCY: 10,
+    DETAIL_CONTEXTS: 5,
+    DETAIL_DOM_CHANGED_THRESHOLD: 0.30,  // > 30% bad rows = batch DOM changed
+};
 
-    logProgress('Dice', `Completed! Saved ${detailedData.length} detailed jobs`);
-    return detailedData;
+export function buildSearchUrl(jobTitle, location, pageNum) {
+    const q = encodeURIComponent(jobTitle);
+    const w = encodeURIComponent(location);
+    return `https://www.dice.com/jobs?q=${q}&location=${w}&filters.postedDate=SEVEN&page=${pageNum}`;
+}
 
-    } finally {
-        // Guaranteed cleanup — runs whether scraping succeeded or threw.
-        for (const ctx of contextsToCleanup) {
-            try { await ctx.close(); } catch (err) {
-                log.warn(`Failed to close context: ${err.message}`);
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+export async function scrapeDice(jobTitle, location, sessionId = null) {
+    void sessionId;
+    logProgress('Dice', `Searching for "${jobTitle}" in "${location}"`);
+    const browser = await launch({ headless: true });
+    const contextsToCleanup = [];
+    const collectedJobs = [];
+    let collectedAnything = false;
+
+    try {
+        // ─── Stage 1: search-page URL collection ──────────────────────────
+        const searchContext = await browser.newContext({ userAgent: UA, viewport: { width: 1920, height: 1080 } });
+        contextsToCleanup.push(searchContext);
+        const searchPage = await searchContext.newPage();
+        const seenUrls = new Set();
+        const jobUrls = [];
+        let consecutiveEmpty = 0;
+
+        for (let pageNum = 1; pageNum <= CONFIG.MAX_PAGES && jobUrls.length < CONFIG.MAX_JOBS; pageNum++) {
+            const url = buildSearchUrl(jobTitle, location, pageNum);
+            logProgress('Dice', `Search page ${pageNum}: ${url}`);
+            try {
+                await searchPage.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.SEARCH_NAV_TIMEOUT_MS });
+            } catch (e) {
+                if (jobUrls.length === 0) throw new NetworkError(`Dice search goto failed: ${e.message}`, { platform: 'dice', cause: e });
+                logProgress('Dice', `Search page ${pageNum} nav failed — returning ${jobUrls.length} URLs collected so far`);
+                break;
+            }
+            // Soft wait for the cards (best-effort — classifier owns the verdict).
+            await searchPage.waitForSelector('a[href*="/job-detail/"]', { timeout: 5000 }).catch(() => {});
+
+            const probe = await searchPage.evaluate(() => {
+                const primary = [...new Set([...document.querySelectorAll('a[href*="/job-detail/"]')]
+                    .map((a) => a.href).filter(Boolean))];
+                const backup = [...new Set([...document.querySelectorAll('[data-testid*="job-card"] a[href*="/job-detail/"]')]
+                    .map((a) => a.href).filter(Boolean))];
+                return {
+                    bodyText: (document.body?.innerText || '').slice(0, 4000),
+                    bytes: document.documentElement?.outerHTML?.length ?? 0,
+                    primary,
+                    backup,
+                };
+            });
+            const anchors = probe.primary.length > 0 ? probe.primary : probe.backup;
+            const verdict = classifyDiceSearchPage({
+                url: searchPage.url(),
+                bodyText: probe.bodyText,
+                anchorCount: anchors.length,
+                bytes: probe.bytes,
+            });
+            logProgress('Dice', `Page ${pageNum} classified: ${verdict.state} (${verdict.signal})`);
+
+            if (verdict.state === 'soft_blocked') {
+                if (jobUrls.length === 0) throw new BlockedError(`Dice blocked: ${verdict.signal}`, { platform: 'dice', kind: 'cloudflare' });
+                break;
+            }
+            if (verdict.state === 'dom_changed') {
+                if (jobUrls.length === 0) throw new DomChangedError(`Dice DOM changed: ${verdict.signal}`, { platform: 'dice' });
+                break;
+            }
+            if (verdict.state === 'network_error') {
+                if (jobUrls.length === 0) throw new NetworkError(`Dice search didn't render: ${verdict.signal}`, { platform: 'dice' });
+                break;
+            }
+            if (verdict.state === 'empty_confirmed') {
+                consecutiveEmpty++;
+                if (consecutiveEmpty >= 2) break;
+                continue;
+            }
+            // results
+            let newCount = 0;
+            for (const u of anchors) {
+                if (seenUrls.has(u)) continue;
+                seenUrls.add(u);
+                jobUrls.push(u);
+                newCount++;
+                if (jobUrls.length >= CONFIG.MAX_JOBS) break;
+            }
+            logProgress('Dice', `Page ${pageNum}: ${anchors.length} anchors, ${newCount} new unique, total: ${jobUrls.length}`);
+            if (newCount === 0) consecutiveEmpty++; else consecutiveEmpty = 0;
+            if (consecutiveEmpty >= 2) break;
+        }
+        await searchContext.close();
+
+        if (jobUrls.length === 0) {
+            // Reached natural end-of-results without throwing — confirmed empty.
+            return { jobs: [], emptyConfirmed: true };
+        }
+
+        // ─── Stage 2: per-job detail extraction ───────────────────────────
+        const jobsToProcess = jobUrls.slice(0, CONFIG.MAX_JOBS);
+        const jobContexts = [];
+        for (let i = 0; i < CONFIG.DETAIL_CONTEXTS; i++) {
+            const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1920, height: 1080 }, ignoreHTTPSErrors: true, bypassCSP: true });
+            jobContexts.push(ctx);
+            contextsToCleanup.push(ctx);
+        }
+        let ctxRR = 0;
+        const getCtx = () => { const c = jobContexts[ctxRR]; ctxRR = (ctxRR + 1) % jobContexts.length; return c; };
+
+        let domChangedCount = 0;
+        let processedCount = 0;
+
+        const crawler = new CheerioCrawler({
+            maxConcurrency: CONFIG.DETAIL_CONCURRENCY,
+            maxRequestRetries: 2,
+            requestHandlerTimeoutSecs: 180,
+            async requestHandler({ request }) {
+                processedCount++;
+                logProgress('Dice', `Detail ${processedCount}/${jobsToProcess.length}: ${request.url}`);
+                const jobPage = await getCtx().newPage();
+                let pageHtml = '';
+                try {
+                    await jobPage.goto(request.url, { waitUntil: 'domcontentloaded', timeout: CONFIG.DETAIL_NAV_TIMEOUT_MS });
+                    await jobPage.waitForTimeout(CONFIG.DETAIL_RENDER_WAIT_MS);
+                    pageHtml = await jobPage.content();
+                } catch (e) {
+                    logProgress('Dice', `Detail nav failed: ${request.url} — ${e.message}`);
+                    try { await jobPage.close(); } catch {}
+                    return;
+                } finally {
+                    try { await jobPage.close(); } catch {}
+                }
+
+                const $job = cheerio.load(pageHtml);
+                const scriptBody = $job('script[id="jobDetailStructuredData"]').html();
+                const { data: jsonLd, error: parseErr } = parseStructuredData(scriptBody ?? '');
+                if (parseErr) {
+                    logProgress('Dice', `Detail dropped (${parseErr}): ${request.url}`);
+                    domChangedCount++;
+                    return;
+                }
+                if (jsonLd['@type'] !== 'JobPosting') {
+                    logProgress('Dice', `Detail dropped (@type=${jsonLd['@type']}): ${request.url}`);
+                    domChangedCount++;
+                    return;
+                }
+                const row = extractJobFromStructuredData(jsonLd, request.url);
+                if (row.__domChanged) {
+                    logProgress('Dice', `Detail dropped (${row.reason}): ${request.url}`);
+                    domChangedCount++;
+                    return;
+                }
+                // Skills + workplace type still pulled via Cheerio.
+                const skills = extractSkills($job);
+                const workplaceType = extractWorkplaceType($job);
+
+                const normalized = normalizeJobData({
+                    id: row.jobId,
+                    title: row.title,
+                    company: row.company,
+                    companyProfileUrl: row.companyProfileUrl,
+                    companyLogoUrl: row.companyLogoUrl,
+                    location: row.locationFormatted,
+                    city: row.city,
+                    state: row.state,
+                    country: row.country,
+                    isRemote: row.isRemote,
+                    workplaceType,
+                    salary: row.salaryFormatted,
+                    salary_min: row.salaryMin,
+                    salary_max: row.salaryMax,
+                    salary_currency: row.salaryCurrency,
+                    salary_period: row.salaryPeriod,
+                    postedDate: row.postedDate,
+                    validThrough: row.validThrough,
+                    description: stripHtmlTags(row.description),
+                    employmentType: row.employmentType,
+                    skills,
+                    url: row.url,
+                }, 'Dice');
+                collectedJobs.push(normalized);
+                collectedAnything = true;
+                logProgress('Dice', `✅ ${row.title} at ${row.company} (total ${collectedJobs.length})`);
+            },
+        });
+
+        await crawler.run(jobsToProcess.map((url) => ({ url })));
+
+        // Batch-level DOM-changed gate.
+        if (processedCount > 0) {
+            const rate = domChangedCount / processedCount;
+            if (rate > CONFIG.DETAIL_DOM_CHANGED_THRESHOLD) {
+                if (collectedAnything) {
+                    return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
+                throw new DomChangedError(
+                    `Dice detail-page DOM-changed rate too high (${domChangedCount}/${processedCount}, threshold ${CONFIG.DETAIL_DOM_CHANGED_THRESHOLD})`,
+                    { platform: 'dice' },
+                );
             }
         }
-        try { await browser.close(); } catch (err) {
-            log.warn(`Failed to close browser: ${err.message}`);
+
+        logProgress('Dice', `Completed: ${collectedJobs.length} jobs (${domChangedCount}/${processedCount} dropped)`);
+        if (collectedJobs.length === 0) return { jobs: [], emptyConfirmed: true };
+        return collectedJobs;
+    } finally {
+        for (const ctx of contextsToCleanup) {
+            try { await ctx.close(); } catch (err) { log.warn(`Failed to close context: ${err.message}`); }
         }
+        try { await browser.close(); } catch (err) { log.warn(`Failed to close browser: ${err.message}`); }
     }
 }
