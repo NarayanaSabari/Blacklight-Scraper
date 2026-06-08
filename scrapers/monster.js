@@ -16,6 +16,10 @@ import { launch } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { BlockedError, DomChangedError, NetworkError } from '../src/core/errors.js';
+import {
+    cooldownPath, cooldownMs, readCooldownMarker, writeCooldownMarker, isOnCooldown,
+    defaultReadFile, defaultWriteFile, defaultRename,
+} from '../src/core/monster-cooldown.js';
 
 const log = createLogger('monster');
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -214,6 +218,20 @@ export function searchUrl(jobTitle, location, pageNum) {
 
 export async function scrapeMonster(jobTitle, location, sessionId = null) {
     void sessionId;
+    {
+        const now = new Date();
+        const marker = readCooldownMarker({
+            readFile: defaultReadFile(),
+            now,
+            path: cooldownPath(),
+        });
+        if (isOnCooldown(marker, now)) {
+            throw new BlockedError(
+                `Monster IP cooldown active until ${marker.blockedUntil.toISOString()} — skipping scrape`,
+                { platform: 'monster', kind: 'datadome-cooldown' },
+            );
+        }
+    }
     log.info(`Searching for "${jobTitle}" in "${location}"`);
     log.info('🚀 Launching CloakBrowser stealth Chromium...');
     const browser = await launch({ headless: true, humanize: true });
@@ -274,6 +292,13 @@ export async function scrapeMonster(jobTitle, location, sessionId = null) {
             log.info(`Page ${pageNum} classified: ${verdict.state} (${verdict.signal})`);
 
             if (verdict.state === 'soft_blocked') {
+                writeCooldownMarker({
+                    writeFile: defaultWriteFile(),
+                    rename: defaultRename(),
+                    now: new Date(),
+                    cooldownMs: cooldownMs(),
+                    path: cooldownPath(),
+                });
                 if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
                 throw new BlockedError(`Monster blocked: ${verdict.signal}`, { platform: 'monster', kind: 'datadome' });
             }
