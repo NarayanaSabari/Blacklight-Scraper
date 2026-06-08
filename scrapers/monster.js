@@ -151,24 +151,30 @@ export function inspectAppsapiBody(text) {
 }
 
 // Pure page-state classifier. Caller collects {url, bodyText, cardCount,
-// sawApiResponse} from the page and asks: what happened?
+// sawApiResponse, apiResponseInspection} from the page and asks: what happened?
 //   results          → real results page, cards are extractable
 //   empty_confirmed  → real "0 results" page (no false alarm)
 //   soft_blocked     → DataDome interstitial / verify-human page
 //   dom_changed      → page rendered but the cards we expect are absent
 //   network_error    → response gate didn't fire, nothing positive to report
-export function classifyMonsterPage({ url, bodyText, cardCount, sawApiResponse }) {
+export function classifyMonsterPage({ url, bodyText, cardCount, sawApiResponse, apiResponseInspection }) {
     const u = String(url ?? '');
     const t = String(bodyText ?? '');
     if (/captcha-delivery\.com/i.test(u) ||
         /datadome|verify you are human|ray id|access denied/i.test(t)) {
         return { state: 'soft_blocked', signal: u.includes('captcha-delivery') ? 'captcha-delivery redirect' : 'datadome body text' };
     }
+    if (apiResponseInspection === 'empty-payload' && cardCount === 0 && !/no jobs (found|match)/i.test(t)) {
+        return { state: 'soft_blocked', signal: 'appsapi returned empty payload (DataDome silent suppress)' };
+    }
     if (cardCount > 0) {
         return { state: 'results', signal: `cards=${cardCount}` };
     }
     if (/no jobs (found|match)/i.test(t)) {
         return { state: 'empty_confirmed', signal: 'no-jobs-found text' };
+    }
+    if (apiResponseInspection === 'has-jobs' && cardCount === 0) {
+        return { state: 'dom_changed', signal: 'appsapi has jobs but 0 cards rendered (likely selector rename)' };
     }
     if (sawApiResponse) {
         return { state: 'dom_changed', signal: 'appsapi responded but 0 cards rendered and no empty-results text' };

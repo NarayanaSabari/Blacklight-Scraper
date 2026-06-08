@@ -72,3 +72,36 @@ test('classifyMonsterPage: cards > 0 even without explicit appsapi → results (
     });
     assert.equal(r.state, 'results');
 });
+
+test('classifyMonsterPage: apiResponseInspection="empty-payload" + cardCount=0 → soft_blocked (DataDome silent suppress)', () => {
+    const r = classifyMonsterPage({
+        url: 'https://www.monster.com/jobs/search?q=engineer&page=1',
+        bodyText: 'Search results for Software Engineer ... boilerplate',
+        cardCount: 0,
+        sawApiResponse: true,
+        apiResponseInspection: 'empty-payload',
+    });
+    assert.equal(r.state, 'soft_blocked');
+    assert.match(r.signal, /empty-payload|empty payload/i);
+});
+
+test('classifyMonsterPage: apiResponseInspection="has-jobs" + cardCount=0 → dom_changed (cards missing despite API data)', () => {
+    const r = classifyMonsterPage({
+        url: 'https://www.monster.com/jobs/search?q=engineer&page=1',
+        bodyText: 'Search results for Software Engineer in United States ... boilerplate',
+        cardCount: 0,
+        sawApiResponse: true,
+        apiResponseInspection: 'has-jobs',
+    });
+    assert.equal(r.state, 'dom_changed');
+});
+
+test('classifyMonsterPage: apiResponseInspection is optional (existing callers unaffected)', () => {
+    const r = classifyMonsterPage({
+        url: 'https://www.monster.com/jobs/search?q=engineer&page=1',
+        bodyText: 'Search results',
+        cardCount: 60,
+        sawApiResponse: true,
+    });
+    assert.equal(r.state, 'results');
+});
