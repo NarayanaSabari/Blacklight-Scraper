@@ -118,6 +118,38 @@ export function extractCardFromElement(card) {
     };
 }
 
+// Inspects the body of a Monster appsapi search-jobs POST response.
+// Returns one of:
+//   'has-jobs'      → response has at least one job in any known result array
+//   'empty-payload' → known result key present but empty, OR body empty/nullish
+//   'unparseable'   → JSON.parse threw
+//   'unknown-shape' → parses to an object but no known result key is present
+// The classifier uses this to distinguish a DataDome empty-payload soft-block
+// from a real DOM change (cards missing because Monster renamed the selector).
+export function inspectAppsapiBody(text) {
+    if (text === null || text === undefined || text === '') return 'empty-payload';
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch { return 'unparseable'; }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return 'unknown-shape';
+    }
+    const known = [
+        parsed.jobResults,
+        parsed.jobs,
+        parsed.results,
+        parsed.searchResults?.jobs,
+    ];
+    let anyKeyPresent = false;
+    for (const v of known) {
+        if (Array.isArray(v)) {
+            anyKeyPresent = true;
+            if (v.length > 0) return 'has-jobs';
+        }
+    }
+    return anyKeyPresent ? 'empty-payload' : 'unknown-shape';
+}
+
 // Pure page-state classifier. Caller collects {url, bodyText, cardCount,
 // sawApiResponse} from the page and asks: what happened?
 //   results          → real results page, cards are extractable
