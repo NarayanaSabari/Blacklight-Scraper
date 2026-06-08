@@ -240,14 +240,22 @@ export async function scrapeMonster(jobTitle, location, sessionId = null) {
             const apiResponsePromise = page.waitForResponse(
                 (r) => r.url().includes('/jobs-svx-service/v2/monster/search-jobs/') && r.request().method() === 'POST',
                 { timeout: CONFIG.API_RESPONSE_TIMEOUT_MS },
-            ).then(() => true).catch(() => false);
+            )
+                .then(async (resp) => {
+                    try { return { saw: true, body: await resp.text() }; }
+                    catch { return { saw: true, body: null }; }
+                })
+                .catch(() => ({ saw: false, body: null }));
             try {
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.NAV_TIMEOUT_MS });
             } catch (e) {
                 if (allJobs.length >= 1) return { jobs: allJobs, emptyConfirmed: false, partial: true };
                 throw new NetworkError(`Monster page.goto failed: ${e.message}`, { platform: 'monster', cause: e });
             }
-            const sawApiResponse = await apiResponsePromise;
+            const { saw: sawApiResponse, body: apiBody } = await apiResponsePromise;
+            const apiResponseInspection = sawApiResponse && apiBody !== null
+                ? inspectAppsapiBody(apiBody)
+                : null;
 
             // Soft-wait for cards to render (best effort — classifier owns the verdict).
             await page.waitForSelector('article[data-testid="JobCard"]', { timeout: CONFIG.CARD_SELECTOR_TIMEOUT_MS }).catch(() => {});
@@ -261,6 +269,7 @@ export async function scrapeMonster(jobTitle, location, sessionId = null) {
                 bodyText: probe.bodyText,
                 cardCount: probe.cardCount,
                 sawApiResponse,
+                apiResponseInspection,
             });
             log.info(`Page ${pageNum} classified: ${verdict.state} (${verdict.signal})`);
 
