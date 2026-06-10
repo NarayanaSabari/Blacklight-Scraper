@@ -307,6 +307,19 @@ export async function scrapeMonster(jobTitle, location, sessionId = null) {
                 throw new DomChangedError(`Monster DOM changed: ${verdict.signal}`, { platform: 'monster' });
             }
             if (verdict.state === 'network_error') {
+                // Mode B: DataDome silently suppressed the appsapi POST (page rendered fine but
+                // /jobs-svx-service/.../search-jobs/ never fired). This is just as much a block
+                // signal as soft_blocked — write the cooldown marker so subsequent runs short-
+                // circuit at the entry gate instead of cascading wasted timeouts. The separate
+                // goto-throw catch path (Mode D: genuine network failure) does NOT route here,
+                // so this is correctly scoped to "page worked but Monster's edge refused us".
+                writeCooldownMarker({
+                    writeFile: defaultWriteFile(),
+                    rename: defaultRename(),
+                    now: new Date(),
+                    cooldownMs: cooldownMs(),
+                    path: cooldownPath(),
+                });
                 if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
                 throw new NetworkError(`Monster page didn't load: ${verdict.signal}`, { platform: 'monster' });
             }
