@@ -251,6 +251,14 @@ export function extractJobKey($, $card) {
     return null;
 }
 
+// Builds the canonical job-detail URL for an Indeed listing. Returns
+// null when either input is missing so the caller can drop the row
+// rather than emit a broken URL.
+export function indeedJobUrl(domain, jobKey) {
+    if (!domain || !jobKey) return null;
+    return `https://${domain}/viewjob?jk=${encodeURIComponent(jobKey)}`;
+}
+
 /**
  * Extract job listings from search results page
  * @param {string} html - HTML content of search results
