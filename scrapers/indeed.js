@@ -867,11 +867,15 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
             await new Promise((r) => setTimeout(r, humanDelay(2000, 5000)));
         }
 
-        // Per-card DOM-changed batch gate.
+        // Per-card DOM-changed batch gate. Gate on collectedJobs.length (not
+        // collectedAnything) because detail enrichment hasn't run yet at this
+        // point — collectedJobs is empty, so the partial-result short-circuit
+        // would emit {jobs:[],partial:true} (silent data loss). Always throw
+        // when the rate is exceeded so the failure is loud.
         if (totalCardsProcessed > 0) {
             const rate = domChangedCardCount / totalCardsProcessed;
             if (rate > DETAIL_DOM_CHANGED_THRESHOLD) {
-                if (collectedAnything) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
                 throw new DomChangedError(
                     `Indeed card-level DOM-changed rate too high (${domChangedCardCount}/${totalCardsProcessed})`,
                     { platform: 'indeed' },
