@@ -234,6 +234,23 @@ export function indeedNoResults(html) {
     return /did not match any jobs/i.test(html);
 }
 
+// Returns the job key (Indeed's per-listing identifier) for a card.
+// Three-step fallback, preserving the historical waterfall:
+//   1. card's own data-jk attribute
+//   2. closest ancestor with data-jk
+//   3. first descendant with data-jk (today's primary path: a[data-jk] —
+//      2026 Indeed migrated the attribute from li/div onto the anchor)
+// Returns null on miss; the caller skips the row.
+export function extractJobKey($, $card) {
+    const own = $card.attr('data-jk');
+    if (own) return own;
+    const ancestor = $card.closest('[data-jk]');
+    if (ancestor.length && ancestor.attr('data-jk')) return ancestor.attr('data-jk');
+    const descendant = $card.find('[data-jk]').first();
+    if (descendant.length && descendant.attr('data-jk')) return descendant.attr('data-jk');
+    return null;
+}
+
 /**
  * Extract job listings from search results page
  * @param {string} html - HTML content of search results
