@@ -10,7 +10,13 @@ import os from 'node:os';
 import path from 'node:path';
 import nodeFs from 'node:fs';
 
-const DEFAULT_COOLDOWN_MS = 30 * 60 * 1000;
+// 60 min default. Empirically, DataDome's IP block on Monster has been
+// observed lasting at least 50+ minutes once triggered (see the 60-min
+// stress test on 2026-06-10 — 21 consecutive failures over the full
+// hour). 30 was too aggressive and burned a ~25-second probe attempt
+// every cycle while DataDome was still blocking. Operators who want to
+// retry sooner can set MONSTER_BLOCK_COOLDOWN_MIN.
+const DEFAULT_COOLDOWN_MS = 60 * 60 * 1000;
 const MARKER_FILENAME = '.blacklight-monster-cooldown';
 
 export function cooldownPath() {

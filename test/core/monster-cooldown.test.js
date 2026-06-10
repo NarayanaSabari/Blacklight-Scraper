@@ -19,8 +19,8 @@ test('cooldownPath: ends with .blacklight-monster-cooldown in the homedir', () =
 
 // --- cooldownMs -------------------------------------------------------------
 
-test('cooldownMs: defaults to 30 minutes when env unset', () => {
-    assert.equal(cooldownMs({}), 30 * 60 * 1000);
+test('cooldownMs: defaults to 60 minutes when env unset', () => {
+    assert.equal(cooldownMs({}), 60 * 60 * 1000);
 });
 
 test('cooldownMs: reads positive integer env MONSTER_BLOCK_COOLDOWN_MIN', () => {
@@ -28,11 +28,11 @@ test('cooldownMs: reads positive integer env MONSTER_BLOCK_COOLDOWN_MIN', () => 
     assert.equal(cooldownMs({ MONSTER_BLOCK_COOLDOWN_MIN: '120' }), 120 * 60 * 1000);
 });
 
-test('cooldownMs: ignores zero / negative / garbage env values', () => {
-    assert.equal(cooldownMs({ MONSTER_BLOCK_COOLDOWN_MIN: '0' }), 30 * 60 * 1000);
-    assert.equal(cooldownMs({ MONSTER_BLOCK_COOLDOWN_MIN: '-5' }), 30 * 60 * 1000);
-    assert.equal(cooldownMs({ MONSTER_BLOCK_COOLDOWN_MIN: 'abc' }), 30 * 60 * 1000);
-    assert.equal(cooldownMs({ MONSTER_BLOCK_COOLDOWN_MIN: '' }), 30 * 60 * 1000);
+test('cooldownMs: ignores zero / negative / garbage env values (falls back to 60-min default)', () => {
+    assert.equal(cooldownMs({ MONSTER_BLOCK_COOLDOWN_MIN: '0' }), 60 * 60 * 1000);
+    assert.equal(cooldownMs({ MONSTER_BLOCK_COOLDOWN_MIN: '-5' }), 60 * 60 * 1000);
+    assert.equal(cooldownMs({ MONSTER_BLOCK_COOLDOWN_MIN: 'abc' }), 60 * 60 * 1000);
+    assert.equal(cooldownMs({ MONSTER_BLOCK_COOLDOWN_MIN: '' }), 60 * 60 * 1000);
 });
 
 // --- readCooldownMarker -----------------------------------------------------
