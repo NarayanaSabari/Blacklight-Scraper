@@ -259,6 +259,74 @@ export function indeedJobUrl(domain, jobKey) {
     return `https://${domain}/viewjob?jk=${encodeURIComponent(jobKey)}`;
 }
 
+// Maps one search-result card to a flat record. Composes extractJobKey
+// + indeedJobUrl with per-field selectors. Returns:
+//   - the row on success
+//   - { __domChanged: true, reason } when load-bearing fields are missing
+//     and the card had a data-jk (indicates Indeed renamed something)
+//   - null when no data-jk exists at all (UI artifact, not a job card)
+export function parseJobCard($, $card, domain) {
+    const jobKey = extractJobKey($, $card);
+    if (!jobKey) return null;
+
+    // Title — prefer the nested span inside h3.jobTitle (Indeed's stable layout)
+    let title = $card.find('h3.jobTitle span[title]').attr('title')
+        || $card.find('h3.jobTitle span').first().text().trim()
+        || $card.find('h3.jobTitle').text().trim()
+        || $card.find('h2.jobTitle span[title]').attr('title')
+        || $card.find('h2.jobTitle span').first().text().trim()
+        || $card.find('h2.jobTitle').text().trim()
+        || $card.find('a[data-jk]').first().text().trim();
+    title = title?.trim() || '';
+
+    // Company
+    const company = (
+        $card.find('[data-testid="company-name"]').text().trim()
+        || $card.find('.companyName').text().trim()
+        || $card.find('span.companyName').text().trim()
+        || ''
+    ).trim();
+
+    if (!title || !company) {
+        return { __domChanged: true, reason: !title ? 'missing_title' : 'missing_company' };
+    }
+
+    // Location
+    const location = (
+        $card.find('[data-testid="text-location"]').text().trim()
+        || $card.find('.companyLocation').text().trim()
+        || ''
+    ).trim();
+
+    // Salary (best-effort; not load-bearing)
+    const salary = (
+        $card.find('[data-testid="attribute_snippet_testid"]:contains("$")').first().text().trim()
+        || $card.find('.salary-snippet, .estimated-salary').first().text().trim()
+        || ''
+    ).trim();
+
+    // Posted-date
+    const postedDate = (
+        $card.find('[data-testid="myJobsStateDate"]').text().trim()
+        || $card.find('.date').text().trim()
+        || ''
+    ).replace(/^Posted\s*/i, '').trim();
+
+    const url = indeedJobUrl(domain, jobKey);
+    const isPromoted = $card.attr('data-empn') ? true : $card.find('.sponsoredJob, [class*="sponsored"]').length > 0;
+
+    return {
+        jobKey,
+        title,
+        company,
+        location,
+        salary,
+        postedDate,
+        url,
+        isPromoted,
+    };
+}
+
 /**
  * Extract job listings from search results page
  * @param {string} html - HTML content of search results
