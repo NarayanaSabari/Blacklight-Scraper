@@ -45,17 +45,19 @@ test('indeed.js imports assertNotBlocked from the proven block-detection module'
     assert.match(SRC, /import\s*\{\s*assertNotBlocked\s*\}\s*from\s*['"]\.\.\/src\/core\/block-detection\.js['"]/);
 });
 
-test('block detection + I13 + I2 are all gated behind SCRAPER_STRICT_EMPTY (merge-inert when off)', () => {
+test('block detection helpers are present in the module', () => {
+    // STRICT + assertNotBlocked are preserved for legacy compatibility.
     assert.match(SRC, /const\s+STRICT\s*=\s*process\.env\.SCRAPER_STRICT_EMPTY\s*===\s*['"]true['"]/);
-    for (const m of SRC.matchAll(/assertNotBlocked\s*\(/g)) {
-        const before = SRC.slice(Math.max(0, m.index - 400), m.index);
-        assert.ok(/if\s*\(\s*STRICT\s*\)/.test(before),
-            'assertNotBlocked() call is not guarded by `if (STRICT)`');
-    }
-    assert.match(SRC, /if \(!STRICT\) loginSuccess = true;/);
-    assert.match(SRC, /if\s*\(\s*STRICT\s*&&\s*pageNum\s*===\s*0\s*&&\s*!indeedNoResults\(html\)\s*\)/, 'I2 page-0 throw must be STRICT-gated');
+    assert.match(SRC, /import\s*\{\s*assertNotBlocked\s*\}\s*from/);
+    // New classifier-based block detection is always-on (no STRICT gate).
+    assert.match(SRC, /classifyIndeedSearchPage\s*\(/);
+    // Cooldown gate fires before browser launch.
+    assert.match(SRC, /isOnCooldown\s*\(/);
+    assert.match(SRC, /BlockedError/);
 });
 
 test('scrapeIndeed returns the {jobs, emptyConfirmed} contract shape', () => {
-    assert.match(SRC, /return\s*\{\s*jobs:\s*normalizedJobs\s*,\s*emptyConfirmed/);
+    // New orchestrator returns {jobs: collectedJobs, emptyConfirmed, partial?}
+    // or the plain array on success.
+    assert.match(SRC, /return\s*\{\s*jobs:\s*collectedJobs\s*,\s*emptyConfirmed/);
 });
