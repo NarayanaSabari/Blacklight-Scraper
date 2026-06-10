@@ -5,12 +5,19 @@
 //   MONSTER_TEST_LOC="United States" npm run monster:test-scrape
 import { scrapeMonster } from '../scrapers/monster.js';
 import { classifyUrl } from '../src/core/url-quality.js';
+import fs from 'node:fs';
+import { cooldownPath } from '../src/core/monster-cooldown.js';
 
 const role = process.argv.slice(2).join(' ').trim() || 'software engineer';
 const loc  = process.env.MONSTER_TEST_LOC || 'United States';
 
 console.log(`Role     : ${role}`);
 console.log(`Location : ${loc}\n`);
+
+if (process.env.MONSTER_CLEAR_COOLDOWN === '1') {
+    try { fs.unlinkSync(cooldownPath()); console.log(`Cleared cooldown marker at ${cooldownPath()}`); }
+    catch (e) { if (e.code !== 'ENOENT') console.log(`(cooldown clear: ${e.message})`); }
+}
 
 async function main() {
     const t0 = Date.now();
@@ -19,6 +26,10 @@ async function main() {
         result = await scrapeMonster(role, loc, null);
     } catch (e) {
         console.log(`\n❌ Scrape threw ${e.name}: ${e.message}`);
+        if (e?.name === 'BlockedError' && e?.kind === 'datadome-cooldown') {
+            console.log('(in active DataDome cooldown — pass MONSTER_CLEAR_COOLDOWN=1 to override)');
+            process.exit(4);
+        }
         process.exit(2);
     }
     const elapsed = Date.now() - t0;

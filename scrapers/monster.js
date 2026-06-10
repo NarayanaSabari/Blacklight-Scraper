@@ -16,6 +16,10 @@ import { launch } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { BlockedError, DomChangedError, NetworkError } from '../src/core/errors.js';
+import {
+    cooldownPath, cooldownMs, readCooldownMarker, writeCooldownMarker, isOnCooldown,
+    defaultReadFile, defaultWriteFile, defaultRename,
+} from '../src/core/monster-cooldown.js';
 
 const log = createLogger('monster');
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -118,25 +122,63 @@ export function extractCardFromElement(card) {
     };
 }
 
+// Inspects the body of a Monster appsapi search-jobs POST response.
+// Returns one of:
+//   'has-jobs'      → response has at least one job in any known result array
+//   'empty-payload' → known result key present but empty, OR body empty/nullish
+//   'unparseable'   → JSON.parse threw
+//   'unknown-shape' → parses to an object but no known result key is present
+// The classifier uses this to distinguish a DataDome empty-payload soft-block
+// from a real DOM change (cards missing because Monster renamed the selector).
+export function inspectAppsapiBody(text) {
+    if (text === null || text === undefined || text === '') return 'empty-payload';
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch { return 'unparseable'; }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return 'unknown-shape';
+    }
+    const known = [
+        parsed.jobResults,
+        parsed.jobs,
+        parsed.results,
+        parsed.searchResults?.jobs,
+    ];
+    let anyKeyPresent = false;
+    for (const v of known) {
+        if (Array.isArray(v)) {
+            anyKeyPresent = true;
+            if (v.length > 0) return 'has-jobs';
+        }
+    }
+    return anyKeyPresent ? 'empty-payload' : 'unknown-shape';
+}
+
 // Pure page-state classifier. Caller collects {url, bodyText, cardCount,
-// sawApiResponse} from the page and asks: what happened?
+// sawApiResponse, apiResponseInspection} from the page and asks: what happened?
 //   results          → real results page, cards are extractable
 //   empty_confirmed  → real "0 results" page (no false alarm)
 //   soft_blocked     → DataDome interstitial / verify-human page
 //   dom_changed      → page rendered but the cards we expect are absent
 //   network_error    → response gate didn't fire, nothing positive to report
-export function classifyMonsterPage({ url, bodyText, cardCount, sawApiResponse }) {
+export function classifyMonsterPage({ url, bodyText, cardCount, sawApiResponse, apiResponseInspection }) {
     const u = String(url ?? '');
     const t = String(bodyText ?? '');
     if (/captcha-delivery\.com/i.test(u) ||
         /datadome|verify you are human|ray id|access denied/i.test(t)) {
         return { state: 'soft_blocked', signal: u.includes('captcha-delivery') ? 'captcha-delivery redirect' : 'datadome body text' };
     }
+    if (apiResponseInspection === 'empty-payload' && cardCount === 0 && !/no jobs (found|match)/i.test(t)) {
+        return { state: 'soft_blocked', signal: 'appsapi returned empty payload (DataDome silent suppress)' };
+    }
     if (cardCount > 0) {
         return { state: 'results', signal: `cards=${cardCount}` };
     }
     if (/no jobs (found|match)/i.test(t)) {
         return { state: 'empty_confirmed', signal: 'no-jobs-found text' };
+    }
+    if (apiResponseInspection === 'has-jobs' && cardCount === 0) {
+        return { state: 'dom_changed', signal: 'appsapi has jobs but 0 cards rendered (likely selector rename)' };
     }
     if (sawApiResponse) {
         return { state: 'dom_changed', signal: 'appsapi responded but 0 cards rendered and no empty-results text' };
@@ -176,6 +218,20 @@ export function searchUrl(jobTitle, location, pageNum) {
 
 export async function scrapeMonster(jobTitle, location, sessionId = null) {
     void sessionId;
+    {
+        const now = new Date();
+        const marker = readCooldownMarker({
+            readFile: defaultReadFile(),
+            now,
+            path: cooldownPath(),
+        });
+        if (isOnCooldown(marker, now)) {
+            throw new BlockedError(
+                `Monster IP cooldown active until ${marker.blockedUntil.toISOString()} — skipping scrape`,
+                { platform: 'monster', kind: 'datadome-cooldown' },
+            );
+        }
+    }
     log.info(`Searching for "${jobTitle}" in "${location}"`);
     log.info('🚀 Launching CloakBrowser stealth Chromium...');
     const browser = await launch({ headless: true, humanize: true });
@@ -202,14 +258,22 @@ export async function scrapeMonster(jobTitle, location, sessionId = null) {
             const apiResponsePromise = page.waitForResponse(
                 (r) => r.url().includes('/jobs-svx-service/v2/monster/search-jobs/') && r.request().method() === 'POST',
                 { timeout: CONFIG.API_RESPONSE_TIMEOUT_MS },
-            ).then(() => true).catch(() => false);
+            )
+                .then(async (resp) => {
+                    try { return { saw: true, body: await resp.text() }; }
+                    catch { return { saw: true, body: null }; }
+                })
+                .catch(() => ({ saw: false, body: null }));
             try {
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.NAV_TIMEOUT_MS });
             } catch (e) {
                 if (allJobs.length >= 1) return { jobs: allJobs, emptyConfirmed: false, partial: true };
                 throw new NetworkError(`Monster page.goto failed: ${e.message}`, { platform: 'monster', cause: e });
             }
-            const sawApiResponse = await apiResponsePromise;
+            const { saw: sawApiResponse, body: apiBody } = await apiResponsePromise;
+            const apiResponseInspection = sawApiResponse && apiBody !== null
+                ? inspectAppsapiBody(apiBody)
+                : null;
 
             // Soft-wait for cards to render (best effort — classifier owns the verdict).
             await page.waitForSelector('article[data-testid="JobCard"]', { timeout: CONFIG.CARD_SELECTOR_TIMEOUT_MS }).catch(() => {});
@@ -223,10 +287,18 @@ export async function scrapeMonster(jobTitle, location, sessionId = null) {
                 bodyText: probe.bodyText,
                 cardCount: probe.cardCount,
                 sawApiResponse,
+                apiResponseInspection,
             });
             log.info(`Page ${pageNum} classified: ${verdict.state} (${verdict.signal})`);
 
             if (verdict.state === 'soft_blocked') {
+                writeCooldownMarker({
+                    writeFile: defaultWriteFile(),
+                    rename: defaultRename(),
+                    now: new Date(),
+                    cooldownMs: cooldownMs(),
+                    path: cooldownPath(),
+                });
                 if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
                 throw new BlockedError(`Monster blocked: ${verdict.signal}`, { platform: 'monster', kind: 'datadome' });
             }
@@ -235,6 +307,19 @@ export async function scrapeMonster(jobTitle, location, sessionId = null) {
                 throw new DomChangedError(`Monster DOM changed: ${verdict.signal}`, { platform: 'monster' });
             }
             if (verdict.state === 'network_error') {
+                // Mode B: DataDome silently suppressed the appsapi POST (page rendered fine but
+                // /jobs-svx-service/.../search-jobs/ never fired). This is just as much a block
+                // signal as soft_blocked — write the cooldown marker so subsequent runs short-
+                // circuit at the entry gate instead of cascading wasted timeouts. The separate
+                // goto-throw catch path (Mode D: genuine network failure) does NOT route here,
+                // so this is correctly scoped to "page worked but Monster's edge refused us".
+                writeCooldownMarker({
+                    writeFile: defaultWriteFile(),
+                    rename: defaultRename(),
+                    now: new Date(),
+                    cooldownMs: cooldownMs(),
+                    path: cooldownPath(),
+                });
                 if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
                 throw new NetworkError(`Monster page didn't load: ${verdict.signal}`, { platform: 'monster' });
             }
