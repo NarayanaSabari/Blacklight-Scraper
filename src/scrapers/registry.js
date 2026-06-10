@@ -17,7 +17,7 @@ export const SCRAPERS = Object.freeze({
     techfetch: new BaseScraper('techfetch', scrapeTechFetch),
     linkedin: new BaseScraper('linkedin', scrapeLinkedIn),
     glassdoor: new BaseScraper('glassdoor', scrapeGlassdoor),
-    indeed: new BaseScraper('indeed', scrapeIndeed),
+    indeed: new BaseScraper('indeed', scrapeIndeed, { strictEmpty: true }),
     monster: new BaseScraper('monster', scrapeMonster, { strictEmpty: true }),
 });
 
