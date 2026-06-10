@@ -327,6 +327,38 @@ export function parseJobCard($, $card, domain) {
     };
 }
 
+// Pure page-state classifier for the Indeed search-results page.
+//   results          → real results page, anchors are extractable
+//   empty_confirmed  → real "0 results" page (indeedNoResults() matches)
+//   auth_required    → bounced to secure.indeed.com/auth (cookies invalid
+//                      OR pagination beyond anonymous cap)
+//   soft_blocked     → Cloudflare interstitial / verify-human page
+//   dom_changed      → page rendered but anchors absent and no other signal
+//   network_error    → page didn't render meaningfully
+const INDEED_DOM_CHANGED_BYTES_THRESHOLD = 50_000;
+
+export function classifyIndeedSearchPage({ url, bodyText, anchorCount, sawAuthBounce, bytes, html }) {
+    const u = String(url ?? '');
+    const t = String(bodyText ?? '');
+    if (/cloudflare|verify you are human|just a moment|ray id|additional verification|access denied/i.test(t)
+        || /captcha|challenge/i.test(u)) {
+        return { state: 'soft_blocked', signal: 'cloudflare-style block page' };
+    }
+    if (sawAuthBounce || /secure\.indeed\.com\/auth/.test(u)) {
+        return { state: 'auth_required', signal: 'bounced to secure.indeed.com/auth' };
+    }
+    if (anchorCount > 0) {
+        return { state: 'results', signal: `anchors=${anchorCount}` };
+    }
+    if (indeedNoResults(html)) {
+        return { state: 'empty_confirmed', signal: 'indeedNoResults() matched' };
+    }
+    if ((bytes ?? 0) >= INDEED_DOM_CHANGED_BYTES_THRESHOLD) {
+        return { state: 'dom_changed', signal: `large render (${bytes}b) but 0 anchors and no empty/auth/block signal` };
+    }
+    return { state: 'network_error', signal: `small body (${bytes}b), no positive page signal` };
+}
+
 /**
  * Extract job listings from search results page
  * @param {string} html - HTML content of search results
