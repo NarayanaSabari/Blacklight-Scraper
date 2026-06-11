@@ -765,6 +765,24 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
         let domChangedCardCount = 0;
         let totalCardsProcessed = 0;
 
+        // Detail enrichment is structurally end-of-loop, so the partial-result
+        // return paths used to emit collectedJobs=[] (raw cards collected but
+        // never enriched) — silent data loss. This helper runs enrichment +
+        // normalization on whatever raw cards we have, so partial-result
+        // returns carry actual jobs. Errors in enrichment are swallowed so we
+        // don't lose the original throw-context for the outer caller.
+        const enrichAndCollect = async () => {
+            if (allRawJobs.length === 0) return;
+            try {
+                await extractJobDetailsInParallel(context, allRawJobs, CONFIG.CONCURRENT_TABS);
+                for (const j of allRawJobs) {
+                    collectedJobs.push(normalizeJobData(j, 'Indeed'));
+                }
+            } catch (e) {
+                log.warn(`Indeed enrichment failed during partial-result emission: ${e.message}`);
+            }
+        };
+
         for (let pageNum = 1; pageNum <= CONFIG.MAX_PAGES && allRawJobs.length < CONFIG.MAX_JOBS; pageNum++) {
             const start = (pageNum - 1) * 10;
             const url = buildSearchUrl(domain, jobTitle, location, start);
@@ -773,7 +791,10 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
             try {
                 await page.goto(url, { waitUntil: 'load', timeout: 45000 });
             } catch (e) {
-                if (collectedAnything) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
                 throw new NetworkError(`Indeed page.goto failed: ${e.message}`, { platform: 'indeed', cause: e });
             }
             await new Promise((r) => setTimeout(r, CLOUDFLARE_GRACE_MS));
@@ -805,15 +826,24 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
                     cooldownMs: cooldownMs(),
                     path: cooldownPath(),
                 });
-                if (collectedAnything) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
                 throw new BlockedError(`Indeed blocked: ${verdict.signal}`, { platform: 'indeed', kind: 'cloudflare' });
             }
             if (verdict.state === 'auth_required') {
-                if (collectedAnything) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
                 throw new AuthError(`Indeed auth required: ${verdict.signal}`, { platform: 'indeed' });
             }
             if (verdict.state === 'dom_changed') {
-                if (collectedAnything) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
                 throw new DomChangedError(`Indeed DOM changed: ${verdict.signal}`, { platform: 'indeed' });
             }
             if (verdict.state === 'network_error') {
@@ -824,7 +854,10 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
                     cooldownMs: cooldownMs(),
                     path: cooldownPath(),
                 });
-                if (collectedAnything) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
                 throw new NetworkError(`Indeed page didn't render: ${verdict.signal}`, { platform: 'indeed' });
             }
             if (verdict.state === 'empty_confirmed') {
@@ -887,12 +920,9 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null) {
             return { jobs: [], emptyConfirmed: true };
         }
 
-        // Detail enrichment (existing path — mutates allRawJobs in-place)
-        await extractJobDetailsInParallel(context, allRawJobs, CONFIG.CONCURRENT_TABS);
-        for (const j of allRawJobs) {
-            collectedJobs.push(normalizeJobData(j, 'Indeed'));
-        }
-        collectedAnything = collectedAnything || collectedJobs.length > 0;
+        // Detail enrichment via shared helper (same path the partial-result
+        // sites use, so behavior is uniform).
+        await enrichAndCollect();
         logProgress('Indeed', `Completed: ${collectedJobs.length} jobs`);
         if (collectedJobs.length === 0) return { jobs: [], emptyConfirmed: true };
         return collectedJobs;
