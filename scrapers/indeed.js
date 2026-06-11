@@ -33,6 +33,11 @@ import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
 import { assertNotBlocked } from '../src/core/block-detection.js';
+import { AuthError, BlockedError, DomChangedError, NetworkError } from '../src/core/errors.js';
+import {
+    cooldownPath, cooldownMs, readCooldownMarker, writeCooldownMarker, isOnCooldown,
+    defaultReadFile, defaultWriteFile, defaultRename,
+} from '../src/core/indeed-cooldown.js';
 
 // Flag-gated hardening (audit I1/I13/I2). Read once. When this is NOT
 // 'true' (the default/shipped state) Indeed behaves byte-identically to
@@ -44,6 +49,9 @@ const STRICT = process.env.SCRAPER_STRICT_EMPTY === 'true';
 
 const log = createLogger('indeed');
 const logProgress = (_scope, msg) => log.info(msg);
+
+const CLOUDFLARE_GRACE_MS = 10_000;
+const DETAIL_DOM_CHANGED_THRESHOLD = 0.30;
 
 // Configuration
 const CONFIG = {
@@ -232,6 +240,131 @@ export function indeedNoResults(html) {
     if (!html || typeof html !== 'string') return false;
     if (html.includes('jobsearch-NoResult')) return true;
     return /did not match any jobs/i.test(html);
+}
+
+// Returns the job key (Indeed's per-listing identifier) for a card.
+// Three-step fallback, preserving the historical waterfall:
+//   1. card's own data-jk attribute
+//   2. closest ancestor with data-jk
+//   3. first descendant with data-jk (today's primary path: a[data-jk] —
+//      2026 Indeed migrated the attribute from li/div onto the anchor)
+// Returns null on miss; the caller skips the row.
+export function extractJobKey($, $card) {
+    const own = $card.attr('data-jk');
+    if (own) return own;
+    const ancestor = $card.closest('[data-jk]');
+    if (ancestor.length && ancestor.attr('data-jk')) return ancestor.attr('data-jk');
+    const descendant = $card.find('[data-jk]').first();
+    if (descendant.length && descendant.attr('data-jk')) return descendant.attr('data-jk');
+    return null;
+}
+
+// Builds the canonical job-detail URL for an Indeed listing. Returns
+// null when either input is missing so the caller can drop the row
+// rather than emit a broken URL.
+export function indeedJobUrl(domain, jobKey) {
+    if (!domain || !jobKey) return null;
+    return `https://${domain}/viewjob?jk=${encodeURIComponent(jobKey)}`;
+}
+
+// Maps one search-result card to a flat record. Composes extractJobKey
+// + indeedJobUrl with per-field selectors. Returns:
+//   - the row on success
+//   - { __domChanged: true, reason } when load-bearing fields are missing
+//     and the card had a data-jk (indicates Indeed renamed something)
+//   - null when no data-jk exists at all (UI artifact, not a job card)
+export function parseJobCard($, $card, domain) {
+    const jobKey = extractJobKey($, $card);
+    if (!jobKey) return null;
+
+    // Title — prefer the nested span inside h3.jobTitle (Indeed's stable layout)
+    let title = $card.find('h3.jobTitle span[title]').attr('title')
+        || $card.find('h3.jobTitle span').first().text().trim()
+        || $card.find('h3.jobTitle').text().trim()
+        || $card.find('h2.jobTitle span[title]').attr('title')
+        || $card.find('h2.jobTitle span').first().text().trim()
+        || $card.find('h2.jobTitle').text().trim()
+        || $card.find('a[data-jk]').first().text().trim();
+    title = title?.trim() || '';
+
+    // Company
+    const company = (
+        $card.find('[data-testid="company-name"]').text().trim()
+        || $card.find('.companyName').text().trim()
+        || $card.find('span.companyName').text().trim()
+        || ''
+    ).trim();
+
+    if (!title || !company) {
+        return { __domChanged: true, reason: !title ? 'missing_title' : 'missing_company' };
+    }
+
+    // Location
+    const location = (
+        $card.find('[data-testid="text-location"]').text().trim()
+        || $card.find('.companyLocation').text().trim()
+        || ''
+    ).trim();
+
+    // Salary (best-effort; not load-bearing)
+    const salary = (
+        $card.find('[data-testid="attribute_snippet_testid"]:contains("$")').first().text().trim()
+        || $card.find('.salary-snippet, .estimated-salary').first().text().trim()
+        || ''
+    ).trim();
+
+    // Posted-date
+    const postedDate = (
+        $card.find('[data-testid="myJobsStateDate"]').text().trim()
+        || $card.find('.date').text().trim()
+        || ''
+    ).replace(/^Posted\s*/i, '').trim();
+
+    const url = indeedJobUrl(domain, jobKey);
+    const isPromoted = $card.attr('data-empn') ? true : $card.find('.sponsoredJob, [class*="sponsored"]').length > 0;
+
+    return {
+        jobKey,
+        title,
+        company,
+        location,
+        salary,
+        postedDate,
+        url,
+        isPromoted,
+    };
+}
+
+// Pure page-state classifier for the Indeed search-results page.
+//   results          → real results page, anchors are extractable
+//   empty_confirmed  → real "0 results" page (indeedNoResults() matches)
+//   auth_required    → bounced to secure.indeed.com/auth (cookies invalid
+//                      OR pagination beyond anonymous cap)
+//   soft_blocked     → Cloudflare interstitial / verify-human page
+//   dom_changed      → page rendered but anchors absent and no other signal
+//   network_error    → page didn't render meaningfully
+const INDEED_DOM_CHANGED_BYTES_THRESHOLD = 50_000;
+
+export function classifyIndeedSearchPage({ url, bodyText, anchorCount, sawAuthBounce, bytes, html }) {
+    const u = String(url ?? '');
+    const t = String(bodyText ?? '');
+    if (/cloudflare|verify you are human|just a moment|ray id|additional verification|access denied/i.test(t)
+        || /captcha|challenge/i.test(u)) {
+        return { state: 'soft_blocked', signal: 'cloudflare-style block page' };
+    }
+    if (sawAuthBounce || /secure\.indeed\.com\/auth/.test(u)) {
+        return { state: 'auth_required', signal: 'bounced to secure.indeed.com/auth' };
+    }
+    if (anchorCount > 0) {
+        return { state: 'results', signal: `anchors=${anchorCount}` };
+    }
+    if (indeedNoResults(html)) {
+        return { state: 'empty_confirmed', signal: 'indeedNoResults() matched' };
+    }
+    if ((bytes ?? 0) >= INDEED_DOM_CHANGED_BYTES_THRESHOLD) {
+        return { state: 'dom_changed', signal: `large render (${bytes}b) but 0 anchors and no empty/auth/block signal` };
+    }
+    return { state: 'network_error', signal: `small body (${bytes}b), no positive page signal` };
 }
 
 /**
@@ -560,224 +693,240 @@ async function extractJobDetailsInParallel(context, jobs, concurrentTabs) {
  * @param {string} jobTitle - Job title to search
  * @param {string} location - Location to search
  * @param {string} sessionId - Optional session ID for credential tracking
- * @returns {Array} Array of normalized job objects
+ * @returns {Array|Object} Array of normalized job objects, or {jobs, emptyConfirmed, partial}
  */
 export async function scrapeIndeed(jobTitle, location, sessionId = null) {
-    logProgress('Indeed', `Searching for "${jobTitle}" in "${location}"`);
-
-    // Lease an Indeed credential — required for pagination beyond page 1.
-    //
-    // Uses the lease-based API (`acquire` → `lease.reportSuccess/Failure`)
-    // NOT the legacy platform-keyed API. The legacy `reportSuccess('indeed')`
-    // resolves through latestByPlatform which is overwritten by any later
-    // concurrent acquire — so two parallel indeed scrapes would release
-    // each other's leases. Lease-keyed reports always target the right lease.
-    const apiClient = getCredentialsAPIClient();
-    const lease = await apiClient.acquire('indeed', sessionId);
-    if (!lease) {
-        // Race-window fallback: orchestrator's pre-flight should have
-        // excluded indeed from the claim if no creds were free, but the
-        // last cred can disappear between check and acquire (concurrent
-        // scraper grabbed it first). Tag the error so the orchestrator
-        // submits status='skipped' (not 'failed') and the role goes
-        // back to the queue cleanly — no credential burn, no false
-        // failure metric.
-        const err = new Error('No Indeed credentials available from API');
-        err.skipNoCreds = true;
-        throw err;
-    }
-    const credential = lease.credential;
-    const cookies = loadCookies(credential);
-    logProgress('Indeed', `Acquired credential (${cookies.length} cookies)`);
-
-    const domain = getIndeedDomain(location);
-    logProgress('Indeed', `Using domain: ${domain}`);
-    logProgress('Indeed', `🚀 Launching CloakBrowser stealth Chromium...`);
-
-    // humanize:true is required — Cloudflare/Akamai score behavioral
-    // signals separately from fingerprints. See module header.
-    const browser = await launch({ headless: true, humanize: true });
-    logProgress('Indeed', `✅ CloakBrowser ready`);
-
-    const context = await browser.newContext({
-        viewport: { width: 1366, height: 900 },
-        locale: 'en-US',
-        timezoneId: 'America/New_York',
-    });
-
-    // Inject cookies before opening any page. Per-cookie retry: a single
-    // malformed entry from a cookie export shouldn't take down the whole
-    // batch (seen with `expirationDate` shape drift in older exports).
-    let cookiesAdded = 0;
-    try {
-        await context.addCookies(cookies);
-        cookiesAdded = cookies.length;
-    } catch (bulkErr) {
-        logProgress('Indeed', `Bulk addCookies failed (${bulkErr.message}) — falling back to per-cookie`);
-        for (const c of cookies) {
-            try { await context.addCookies([c]); cookiesAdded++; } catch { /* skip bad cookie */ }
+    // Cross-run cooldown gate. If a recent Cloudflare block wrote the
+    // marker, short-circuit immediately — no browser launch.
+    {
+        const now = new Date();
+        const marker = readCooldownMarker({
+            readFile: defaultReadFile(),
+            now,
+            path: cooldownPath(),
+        });
+        if (isOnCooldown(marker, now)) {
+            throw new BlockedError(
+                `Indeed IP cooldown active until ${marker.blockedUntil.toISOString()} — skipping scrape`,
+                { platform: 'indeed', kind: 'cloudflare-cooldown' },
+            );
         }
     }
-    logProgress('Indeed', `Cookies injected: ${cookiesAdded}/${cookies.length}`);
 
-    const page = await context.newPage();
-    let loginSuccess = false;
+    logProgress('Indeed', `Searching for "${jobTitle}" in "${location}"`);
+
+    // Credential lease — drop the silent anonymous-fallback path.
+    let credential = null;
+    try {
+        credential = await getCredentialsAPIClient().acquire('indeed', sessionId);
+    } catch (e) {
+        if (process.env.INDEED_ALLOW_ANONYMOUS !== '1') {
+            throw new AuthError(`No Indeed credential available from API: ${e.message}`, { platform: 'indeed', cause: e });
+        }
+        logProgress('Indeed', `WARN: credential acquire failed but INDEED_ALLOW_ANONYMOUS=1 — running anonymous (page 1 only)`);
+    }
+    if (!credential && process.env.INDEED_ALLOW_ANONYMOUS !== '1') {
+        throw new AuthError('No Indeed credential available from API', { platform: 'indeed' });
+    }
+
+    const domain = getIndeedDomain(location);
+    const fingerprint = getRandomFingerprint();
+    logProgress('Indeed', `🚀 Launching CloakBrowser (${fingerprint.userAgent.includes('Win') ? 'Windows' : 'other'})...`);
+    const browser = await launch({ headless: true, humanize: true });
+
+    const collectedJobs = [];
+    let collectedAnything = false;
 
     try {
-        // No homepage warmup — visiting https://www.indeed.com triggers
-        // a regional redirect (e.g. in.indeed.com from Indian IPs), which
-        // then makes the navigation back to www.indeed.com look bot-like
-        // to Cloudflare. Probe confirmed direct-to-search returns 200.
-        // I13: setting loginSuccess=true before any navigation makes the
-        // catch-block cooldown taxonomy dead code. In STRICT mode defer it
-        // to confirmed page 0 (see loop). When NOT strict keep legacy
-        // early-true so behavior is byte-identical.
-        if (!STRICT) loginSuccess = true;
-
-        const allJobs = [];
-        const seenJobIds = new Set();
-        let sawConfirmedEmpty = false;
-
-        // Scrape multiple pages
-        for (let pageNum = 0; pageNum < CONFIG.MAX_PAGES; pageNum++) {
-            const start = pageNum * 10; // Indeed uses 10 jobs per page
-            const searchUrl = buildSearchUrl(domain, jobTitle, location, start);
-            
-            logProgress('Indeed', `Fetching page ${pageNum + 1}: ${searchUrl}`);
-
-            // waitUntil:'load' gives Cloudflare's JS challenge time to run.
-            // domcontentloaded fires while still on the challenge page and
-            // we end up parsing the "Additional Verification Required" page.
-            const navResp = await page.goto(searchUrl, {
-                waitUntil: 'load',
-                timeout: 60000
-            });
-            await page.waitForTimeout(humanDelay(8000, 12000));
-
-            // Close any popups
-            await closePopups(page);
-
-            // Extract jobs from current page
-            const html = await page.content();
-
-            // STRICT: throw on a Cloudflare/DataDome/auth-wall challenge so
-            // a block becomes a loud failure (cooldown + 'blocked' metric)
-            // instead of a silent successful 0-job scrape (audit I1/F4).
-            // M5: inspects the SEARCH RESULTS document, never a job title.
-            if (STRICT) {
-                assertNotBlocked({
-                    status: typeof navResp?.status === 'function' ? navResp.status() : null,
-                    finalUrl: page.url(),
-                    title: await page.title().catch(() => ''),
-                    html,
-                    platform: 'indeed',
-                });
+        const context = await browser.newContext({
+            userAgent: fingerprint.userAgent,
+            viewport: fingerprint.viewport,
+            locale: fingerprint.locale,
+            timezoneId: fingerprint.timezone,
+        });
+        if (credential) {
+            const cookies = loadCookies(credential);
+            let cookiesAdded = 0;
+            try {
+                await context.addCookies(cookies);
+                cookiesAdded = cookies.length;
+            } catch (bulkErr) {
+                logProgress('Indeed', `Bulk addCookies failed (${bulkErr.message}) — falling back to per-cookie`);
+                for (const c of cookies) {
+                    try { await context.addCookies([c]); cookiesAdded++; } catch { /* skip bad cookie */ }
+                }
             }
+            logProgress('Indeed', `Cookies injected: ${cookiesAdded}/${cookies.length}`);
+        }
+        const page = await context.newPage();
+        await closePopups(page);
 
-            const pageJobs = extractJobsFromSearchPage(html, domain);
+        const allRawJobs = [];
+        let domChangedCardCount = 0;
+        let totalCardsProcessed = 0;
 
-            logProgress('Indeed', `Page ${pageNum + 1}: Found ${pageJobs.length} jobs`);
-
-            // I13: not blocked and page 0 — genuinely past Cloudflare.
-            if (STRICT && pageNum === 0) loginSuccess = true;
-
-            if (pageJobs.length === 0) {
-                // I2: page-0 zero is NOT "end of results" — it is a block
-                // or DOM change UNLESS Indeed positively shows its
-                // no-results marker. Later pages legitimately end here.
-                // Note: this lands the 30-min "after login" cooldown (loginSuccess=true by here) — intentional: a true CF/DataDome block was already caught above by the block-detection guard (60-min); reaching here means DOM-change-like, not a fingerprint block.
-                if (STRICT && pageNum === 0 && !indeedNoResults(html)) {
-                    throw new Error('Indeed page 1 returned 0 jobs with no "no results" marker — suspected block / DOM change');
+        // Detail enrichment is structurally end-of-loop, so the partial-result
+        // return paths used to emit collectedJobs=[] (raw cards collected but
+        // never enriched) — silent data loss. This helper runs enrichment +
+        // normalization on whatever raw cards we have, so partial-result
+        // returns carry actual jobs. Errors in enrichment are swallowed so we
+        // don't lose the original throw-context for the outer caller.
+        const enrichAndCollect = async () => {
+            if (allRawJobs.length === 0) return;
+            try {
+                await extractJobDetailsInParallel(context, allRawJobs, CONFIG.CONCURRENT_TABS);
+                for (const j of allRawJobs) {
+                    collectedJobs.push(normalizeJobData(j, 'Indeed'));
                 }
-                if (pageNum === 0 && indeedNoResults(html)) {
-                    logProgress('Indeed', 'Indeed reports no matching jobs (confirmed empty)');
-                    sawConfirmedEmpty = true;
+            } catch (e) {
+                log.warn(`Indeed enrichment failed during partial-result emission: ${e.message}`);
+            }
+        };
+
+        for (let pageNum = 1; pageNum <= CONFIG.MAX_PAGES && allRawJobs.length < CONFIG.MAX_JOBS; pageNum++) {
+            const start = (pageNum - 1) * 10;
+            const url = buildSearchUrl(domain, jobTitle, location, start);
+            logProgress('Indeed', `Page ${pageNum}: ${url}`);
+
+            try {
+                await page.goto(url, { waitUntil: 'load', timeout: 45000 });
+            } catch (e) {
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
                 }
-                logProgress('Indeed', 'No more jobs found, stopping pagination');
+                throw new NetworkError(`Indeed page.goto failed: ${e.message}`, { platform: 'indeed', cause: e });
+            }
+            await new Promise((r) => setTimeout(r, CLOUDFLARE_GRACE_MS));
+
+            const probe = await page.evaluate(() => ({
+                finalUrl: window.location.href,
+                bodyText: (document.body?.innerText || '').slice(0, 4000),
+                bytes: document.documentElement?.outerHTML?.length ?? 0,
+                anchorCount: document.querySelectorAll('.job_seen_beacon').length
+                    || document.querySelectorAll('[data-jk]').length,
+            }));
+            const html = await page.content();
+            const sawAuthBounce = /secure\.indeed\.com\/auth/.test(probe.finalUrl);
+            const verdict = classifyIndeedSearchPage({
+                url: probe.finalUrl,
+                bodyText: probe.bodyText,
+                anchorCount: probe.anchorCount,
+                sawAuthBounce,
+                bytes: probe.bytes,
+                html,
+            });
+            logProgress('Indeed', `Page ${pageNum} classified: ${verdict.state} (${verdict.signal})`);
+
+            if (verdict.state === 'soft_blocked') {
+                writeCooldownMarker({
+                    writeFile: defaultWriteFile(),
+                    rename: defaultRename(),
+                    now: new Date(),
+                    cooldownMs: cooldownMs(),
+                    path: cooldownPath(),
+                });
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
+                throw new BlockedError(`Indeed blocked: ${verdict.signal}`, { platform: 'indeed', kind: 'cloudflare' });
+            }
+            if (verdict.state === 'auth_required') {
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
+                throw new AuthError(`Indeed auth required: ${verdict.signal}`, { platform: 'indeed' });
+            }
+            if (verdict.state === 'dom_changed') {
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
+                throw new DomChangedError(`Indeed DOM changed: ${verdict.signal}`, { platform: 'indeed' });
+            }
+            if (verdict.state === 'network_error') {
+                writeCooldownMarker({
+                    writeFile: defaultWriteFile(),
+                    rename: defaultRename(),
+                    now: new Date(),
+                    cooldownMs: cooldownMs(),
+                    path: cooldownPath(),
+                });
+                if (allRawJobs.length > 0) {
+                    await enrichAndCollect();
+                    if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                }
+                throw new NetworkError(`Indeed page didn't render: ${verdict.signal}`, { platform: 'indeed' });
+            }
+            if (verdict.state === 'empty_confirmed') {
+                logProgress('Indeed', `Page ${pageNum}: confirmed no results — stopping pagination`);
                 break;
             }
 
-            // Add unique jobs
-            for (const job of pageJobs) {
-                if (!seenJobIds.has(job.jobId)) {
-                    seenJobIds.add(job.jobId);
-                    allJobs.push(job);
-                }
-                
-                if (allJobs.length >= CONFIG.MAX_JOBS) {
+            // results — extract via parseJobCard per card
+            const $ = cheerio.load(html);
+            const cardSelectors = [
+                '.job_seen_beacon', '[data-testid="job-card"]', '.resultContent',
+                'a[data-jk]', 'li[data-jk]', 'div[data-jk]',
+            ];
+            let $cards = $([]);
+            for (const sel of cardSelectors) {
+                $cards = $(sel);
+                if ($cards.length > 0) {
+                    logProgress('Indeed', `Page ${pageNum}: ${$cards.length} cards via ${sel}`);
                     break;
                 }
             }
+            let pageNewCount = 0;
+            $cards.each((_, el) => {
+                const $card = $(el);
+                totalCardsProcessed++;
+                const row = parseJobCard($, $card, domain);
+                if (!row) return;
+                if (row.__domChanged) { domChangedCardCount++; return; }
+                if (allRawJobs.some((j) => j.jobKey === row.jobKey)) return;
+                // Add jobId alias so extractJobDetails + normalizeJobData can
+                // use job.jobId (their historic field name) without changes.
+                allRawJobs.push({ ...row, jobId: row.jobKey });
+                pageNewCount++;
+            });
 
-            logProgress('Indeed', `Total unique jobs collected: ${allJobs.length}`);
+            collectedAnything = collectedAnything || allRawJobs.length > 0;
+            logProgress('Indeed', `Page ${pageNum}: ${pageNewCount} new unique, total: ${allRawJobs.length}`);
 
-            if (allJobs.length >= CONFIG.MAX_JOBS) {
-                logProgress('Indeed', `Reached max jobs limit (${CONFIG.MAX_JOBS})`);
-                break;
-            }
+            if (pageNewCount === 0) break;
+            await new Promise((r) => setTimeout(r, humanDelay(2000, 5000)));
+        }
 
-            // Small delay between pages
-            if (pageNum < CONFIG.MAX_PAGES - 1) {
-                await page.waitForTimeout(humanDelay(2000, 4000));
+        // Per-card DOM-changed batch gate. Gate on collectedJobs.length (not
+        // collectedAnything) because detail enrichment hasn't run yet at this
+        // point — collectedJobs is empty, so the partial-result short-circuit
+        // would emit {jobs:[],partial:true} (silent data loss). Always throw
+        // when the rate is exceeded so the failure is loud.
+        if (totalCardsProcessed > 0) {
+            const rate = domChangedCardCount / totalCardsProcessed;
+            if (rate > DETAIL_DOM_CHANGED_THRESHOLD) {
+                if (collectedJobs.length > 0) return { jobs: collectedJobs, emptyConfirmed: false, partial: true };
+                throw new DomChangedError(
+                    `Indeed card-level DOM-changed rate too high (${domChangedCardCount}/${totalCardsProcessed})`,
+                    { platform: 'indeed' },
+                );
             }
         }
 
-        // Limit to max jobs
-        const jobsToProcess = allJobs.slice(0, CONFIG.MAX_JOBS);
-        
-        logProgress('Indeed', `Extracting details for ${jobsToProcess.length} jobs with ${CONFIG.CONCURRENT_TABS} parallel tabs...`);
-        
-        // Extract detailed information for each job
-        await extractJobDetailsInParallel(context, jobsToProcess, CONFIG.CONCURRENT_TABS);
-
-        // Normalize job data
-        const normalizedJobs = jobsToProcess.map(job => normalizeJobData({
-            id: job.jobId,
-            title: job.title,
-            company: job.company,
-            location: job.location,
-            description: job.description || job.snippet,
-            salary: job.salary,
-            url: job.url,
-            postedDate: job.postedDate,
-            employmentType: job.employmentType,
-            easyApply: job.easyApply,
-            isRemote: job.isRemote,
-            rating: job.companyRating,
-            skills: job.skills
-        }, 'Indeed'));
-
-        try { await browser.close(); } catch { /* already closed */ }
-        logProgress('Indeed', `Completed! Found ${normalizedJobs.length} jobs with details`);
-
-        await lease.reportSuccess(`Scraped ${normalizedJobs.length} jobs successfully`);
-
-        // BaseScraper (Plan 1A) accepts Array OR { jobs, emptyConfirmed }.
-        // emptyConfirmed only when Indeed positively showed its no-results
-        // marker. Scrape FLOW is byte-identical when STRICT off; emptyConfirmed may be
-        // true on a genuine no-results page (intended: suppresses the
-        // Plan 1B unconfirmed-zero warning for real empties).
-        return { jobs: normalizedJobs, emptyConfirmed: sawConfirmedEmpty && normalizedJobs.length === 0 };
-
-    } catch (error) {
-        try { await browser.close(); } catch { /* already closed */ }
-
-        // Map error to a cooldown so a flaky cookie doesn't keep getting
-        // handed out to fresh scrape sessions. Cooldowns from prior CDP-
-        // path: auth=0min (cookie immediately re-checked next acquire),
-        // rate-limit=60min (back off this IP/cookie pair), other=30min.
-        const msg = error.message || '';
-        if (!loginSuccess) {
-            if (/cookie|login|auth|sign in/i.test(msg)) {
-                await lease.reportFailure(`Authentication failed: ${msg}`, 0);
-            } else if (/rate limit|blocked|captcha|cloudflare|verification/i.test(msg)) {
-                await lease.reportFailure(`Rate limited or blocked: ${msg}`, 60);
-            } else {
-                await lease.reportFailure(`Scraping error: ${msg}`, 30);
-            }
-        } else {
-            await lease.reportFailure(`Scraping error after login: ${msg}`, 30);
+        if (allRawJobs.length === 0) {
+            return { jobs: [], emptyConfirmed: true };
         }
-        throw error;
+
+        // Detail enrichment via shared helper (same path the partial-result
+        // sites use, so behavior is uniform).
+        await enrichAndCollect();
+        logProgress('Indeed', `Completed: ${collectedJobs.length} jobs`);
+        if (collectedJobs.length === 0) return { jobs: [], emptyConfirmed: true };
+        return collectedJobs;
+    } finally {
+        try { await browser.close(); } catch { /* already closed */ }
     }
 }
