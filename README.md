@@ -1,3 +1,7 @@
+> ⚠️ **Read-only mirror.** The source of truth for this code is the **Blacklight monorepo** at `scraper/`.
+> Direct commits to this repository are **overwritten** by CI on the next mirror push.
+> Make all changes in the monorepo and let the mirror propagate them.
+
 # Unified Job Scraper
 
 Node.js scraper that pulls job postings from Monster, Dice, TechFetch,
