@@ -1,0 +1,323 @@
+// Scraper Credentials Queue API client.
+//
+// Two APIs are exposed:
+//
+//  1. Legacy (platform-keyed) — DEPRECATED, kept only for callers
+//     outside scrapers/ that haven't migrated yet:
+//       const api = getCredentialsClient();
+//       const cred = await api.getCredential('linkedin');
+//       await api.reportSuccess('linkedin');
+//
+//  2. Lease-based (race-safe) — REQUIRED for production scrapers:
+//       const api = getCredentialsClient();
+//       const lease = await api.acquire('linkedin', sessionId);
+//       try { ... lease.credential ... await lease.reportSuccess('...') }
+//       catch (e) { await lease.reportFailure(e.message, cooldownMin) }
+//
+// All scrapers in scrapers/ (indeed, linkedin, techfetch) use the
+// lease-based API. The QueueOrchestrator runs platforms in PARALLEL
+// within an assignment AND fires multiple assignments concurrently, so
+// the legacy `reportSuccess('linkedin')` path is unsafe — its
+// latestByPlatform resolution gets overwritten by the second of any
+// pair of concurrent acquires for the same platform, causing
+// scrape-1's success report to release scrape-2's lease.
+
+import { requestWithRetry } from '../http/client.js';
+import { getConfig } from '../config/env.js';
+import { createLogger } from '../logger/index.js';
+import { NetworkError, AuthError } from '../core/errors.js';
+import { getMetrics } from '../metrics/registry.js';
+
+const log = createLogger('credentials');
+
+// Pure decision for the cookie-jar write-back (handoff §3/§4). No I/O.
+// Mirrors the backend's reject rules so we never POST a guaranteed-400:
+// local → no-op; jar must be a non-empty array containing a non-empty
+// `li_at`; serialized body must be ≤ 64 KB.
+export function planCookieRefresh({ isLocal, sessionId, cookies }) {
+    if (isLocal) return { action: 'skip', outcome: 'skipped_local' };
+    const hasAuth = Array.isArray(cookies) && cookies.length > 0
+        && cookies.some((c) => c && c.name === 'li_at'
+            && typeof c.value === 'string' && c.value.length > 0);
+    if (!hasAuth) return { action: 'skip', outcome: 'skipped_no_li_at' };
+    const body = { session_id: sessionId ?? null, cookies };
+    if (Buffer.byteLength(JSON.stringify(body), 'utf8') > 64 * 1024) {
+        return { action: 'skip', outcome: 'skipped_too_large' };
+    }
+    return { action: 'post', outcome: 'refreshed', body };
+}
+
+export class CredentialsClient {
+    constructor({ apiUrl, apiKey }) {
+        this.apiUrl = apiUrl ? apiUrl.replace(/\/$/, '') : null;
+        this.apiKey = apiKey ?? null;
+        this.isLocal = !apiUrl || !apiKey;
+        this.headers = this.isLocal ? null : Object.freeze({
+            'X-Scraper-API-Key': apiKey,
+            'Content-Type': 'application/json',
+        });
+        // Map<leaseKey, lease>
+        this.leases = new Map();
+        // Legacy: per-platform pointer to the most recently issued lease.
+        this.latestByPlatform = new Map();
+        this.nextNonce = 1;
+    }
+
+    // ----- lease bookkeeping ------------------------------------------------
+
+    #issueLease(platform, id, data, sessionId = null) {
+        const nonce = this.nextNonce++;
+        const leaseKey = `${platform}:${id}:${nonce}`;
+        const lease = { leaseKey, platform, id, data, sessionId };
+        this.leases.set(leaseKey, lease);
+        this.latestByPlatform.set(platform, leaseKey);
+        return lease;
+    }
+
+    // Test-only: construct a lease + facade without network/config.
+    _issueLeaseForTest(platform, id, data, sessionId = null) {
+        return this.#wrapLease(this.#issueLease(platform, id, data, sessionId));
+    }
+
+    // Test-only: is this leaseKey still tracked? Used to pin the
+    // invariant that refreshCookies must NEVER forget the lease (the
+    // verdict report still has to resolve it afterwards).
+    _hasActiveLease(leaseKey) {
+        return this.leases.has(leaseKey);
+    }
+
+    #resolveLease(leaseKeyOrPlatform) {
+        if (!leaseKeyOrPlatform) return null;
+        // Direct leaseKey hit
+        if (this.leases.has(leaseKeyOrPlatform)) return this.leases.get(leaseKeyOrPlatform);
+        // Legacy platform name lookup
+        const key = this.latestByPlatform.get(leaseKeyOrPlatform);
+        return key ? this.leases.get(key) : null;
+    }
+
+    #forgetLease(lease) {
+        this.leases.delete(lease.leaseKey);
+        if (this.latestByPlatform.get(lease.platform) === lease.leaseKey) {
+            this.latestByPlatform.delete(lease.platform);
+        }
+    }
+
+    // ----- remote HTTP helpers ---------------------------------------------
+
+    async #postLeaseAction(lease, action, body = {}) {
+        const url = `${this.apiUrl}/api/scraper-credentials/queue/${lease.id}/${action}`;
+        const response = await requestWithRetry(url, {
+            method: 'POST',
+            headers: this.headers,
+            body: JSON.stringify(body),
+        });
+        if (!response.ok) {
+            throw new NetworkError(
+                `Credentials API ${action} failed: ${response.status} ${response.statusText}`,
+                { statusCode: response.status },
+            );
+        }
+        return response.json();
+    }
+
+    // ----- acquire ----------------------------------------------------------
+
+    async acquire(platform, sessionId = null) {
+        const metrics = getMetrics();
+        if (this.isLocal) {
+            const raw = getConfig().rawCredentials ?? {};
+            const cred = raw[platform.toLowerCase()];
+            if (!cred) {
+                log.warn('No local credential found', { platform });
+                metrics.recordCredentialsFetch(platform, 'none');
+                return null;
+            }
+            const id = `local-${platform}`;
+            const lease = this.#issueLease(platform, id, { id, ...cred }, sessionId);
+            metrics.recordCredentialsFetch(platform, 'found');
+            return this.#wrapLease(lease);
+        }
+
+        const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+        const url = `${this.apiUrl}/api/scraper-credentials/queue/${platform}/next${query}`;
+
+        log.info('Fetching credential from API', { platform });
+        let response;
+        try {
+            response = await requestWithRetry(url, { method: 'GET', headers: this.headers });
+        } catch (error) {
+            metrics.recordCredentialsFetch(platform, 'error');
+            throw error;
+        }
+
+        if (response.status === 204) {
+            log.warn('No credentials available', { platform });
+            metrics.recordCredentialsFetch(platform, 'none');
+            return null;
+        }
+        if (response.status === 401 || response.status === 403) {
+            metrics.recordCredentialsFetch(platform, 'error');
+            throw new AuthError(`Credentials API denied access (${response.status})`, { platform });
+        }
+        if (!response.ok) {
+            metrics.recordCredentialsFetch(platform, 'error');
+            throw new NetworkError(
+                `Credentials API returned ${response.status} ${response.statusText}`,
+                { statusCode: response.status, platform },
+            );
+        }
+
+        const credential = await response.json();
+        const lease = this.#issueLease(platform, credential.id, credential, sessionId);
+        log.info('Credential acquired', {
+            platform,
+            name: credential.name ?? credential.email ?? `id=${credential.id}`,
+        });
+        metrics.recordCredentialsFetch(platform, 'found');
+        return this.#wrapLease(lease);
+    }
+
+    #wrapLease(lease) {
+        return {
+            get leaseKey() { return lease.leaseKey; },
+            get credential() { return lease.data; },
+            get platform() { return lease.platform; },
+            get sessionId() { return lease.sessionId; },
+            reportSuccess: (message) => this.reportSuccess(lease.leaseKey, message),
+            reportFailure: (msg, cooldownMinutes) => this.reportFailure(lease.leaseKey, msg, cooldownMinutes),
+            refreshCookies: (cookies) => this.refreshCookies(lease.leaseKey, cookies),
+            release: () => this.release(lease.leaseKey),
+        };
+    }
+
+    // ----- legacy-compatible methods ---------------------------------------
+
+    async getCredential(platform, sessionId = null) {
+        const lease = await this.acquire(platform, sessionId);
+        return lease ? lease.credential : null;
+    }
+
+    async reportSuccess(leaseKeyOrPlatform, message = null) {
+        const lease = this.#resolveLease(leaseKeyOrPlatform);
+        if (!lease) {
+            log.warn('No active credential to report success for', { key: leaseKeyOrPlatform });
+            return;
+        }
+        if (this.isLocal || String(lease.id).startsWith('local-')) {
+            this.#forgetLease(lease);
+            return;
+        }
+        try {
+            await this.#postLeaseAction(lease, 'success', message ? { message } : {});
+            log.info('Credential released (success)', { platform: lease.platform });
+        } catch (error) {
+            log.error('Failed to report credential success', { platform: lease.platform, err: error.message });
+        } finally {
+            this.#forgetLease(lease);
+        }
+    }
+
+    async refreshCookies(leaseKeyOrPlatform, cookies) {
+        const lease = this.#resolveLease(leaseKeyOrPlatform);
+        if (!lease) {
+            log.warn('No active credential to refresh cookies for', { key: leaseKeyOrPlatform });
+            return;
+        }
+        const metrics = getMetrics();
+        const isLocal = this.isLocal || String(lease.id).startsWith('local-');
+        const plan = planCookieRefresh({ isLocal, sessionId: lease.sessionId, cookies });
+        if (plan.action === 'skip') {
+            metrics.recordCredentialRefresh(lease.platform, plan.outcome);
+            log.info('Cookie write-back skipped', { platform: lease.platform, reason: plan.outcome });
+            return;
+        }
+        try {
+            await this.#postLeaseAction(lease, 'refresh', plan.body);
+            metrics.recordCredentialRefresh(lease.platform, 'refreshed');
+            log.info('Credential jar refreshed', { platform: lease.platform });
+        } catch (error) {
+            metrics.recordCredentialRefresh(lease.platform, 'error');
+            log.warn('Credential refresh failed (best-effort, ignored)', { platform: lease.platform, err: error.message });
+        }
+        // NOTE: never #forgetLease — refresh is non-terminal; success/
+        // failure/release still own lease lifecycle (handoff §4).
+    }
+
+    async reportFailure(leaseKeyOrPlatform, errorMessage, cooldownMinutes = 0) {
+        const lease = this.#resolveLease(leaseKeyOrPlatform);
+        if (!lease) {
+            log.warn('No active credential to report failure for', { key: leaseKeyOrPlatform });
+            return;
+        }
+        if (this.isLocal || String(lease.id).startsWith('local-')) {
+            this.#forgetLease(lease);
+            return;
+        }
+        try {
+            await this.#postLeaseAction(lease, 'failure', {
+                error_message: errorMessage,
+                cooldown_minutes: cooldownMinutes,
+            });
+            log.warn('Credential marked failed', { platform: lease.platform, cooldownMinutes });
+        } catch (error) {
+            log.error('Failed to report credential failure', { platform: lease.platform, err: error.message });
+        } finally {
+            this.#forgetLease(lease);
+        }
+    }
+
+    async release(leaseKeyOrPlatform) {
+        const lease = this.#resolveLease(leaseKeyOrPlatform);
+        if (!lease) return;
+        if (this.isLocal || String(lease.id).startsWith('local-')) {
+            this.#forgetLease(lease);
+            return;
+        }
+        try {
+            await this.#postLeaseAction(lease, 'release');
+        } catch (error) {
+            log.error('Failed to release credential', { platform: lease.platform, err: error.message });
+        } finally {
+            this.#forgetLease(lease);
+        }
+    }
+
+    getActiveCredential(platform) {
+        const lease = this.#resolveLease(platform);
+        return lease ? lease.data : null;
+    }
+
+    async releaseAll() {
+        const keys = Array.from(this.leases.keys());
+        for (const key of keys) {
+            await this.release(key);
+        }
+    }
+}
+
+// Singleton — initialised at startup.
+let client = null;
+
+export function initializeCredentialsClient() {
+    const cfg = getConfig();
+    const api = cfg.scraperCredentialsApi;
+    if (cfg.isDevelopment || !api) {
+        log.info('Using LOCAL credentials (credentials.json)');
+        client = new CredentialsClient({ apiUrl: null, apiKey: null });
+    } else {
+        log.info('Using REMOTE credentials API');
+        client = new CredentialsClient({ apiUrl: api.apiUrl, apiKey: api.apiKey });
+    }
+    return client;
+}
+
+export function getCredentialsClient() {
+    if (!client) {
+        client = new CredentialsClient({ apiUrl: null, apiKey: null });
+    }
+    return client;
+}
+
+// Legacy alias — lets existing scrapers keep using `getCredentialsAPIClient()`
+// from the old common/credentialsAPI.js path without code churn.
+export const getCredentialsAPIClient = getCredentialsClient;

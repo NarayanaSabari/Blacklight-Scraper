@@ -1,0 +1,70 @@
+{
+  "totalSize": 18,
+  "estimatedTotalSize": 48385,
+  "jobResults": [],
+  "jobRequest": {
+    "offset": 0,
+    "pageSize": 18,
+    "jobQuery": {
+      "query": "software engineer",
+      "locations": [
+        {
+          "address": "United States",
+          "country": "us",
+          "radius": {
+            "unit": "mi",
+            "value": 30
+          }
+        }
+      ],
+      "disableSpellCheck": false,
+      "queryLanguageCode": "en-us"
+    },
+    "orderBy": "relevance",
+    "debug": false,
+    "overrideOptions": false,
+    "enableDiversification": false,
+    "disableKeywordMatch": false,
+    "enableBroadening": false,
+    "freeJobsOnly": true,
+    "paidJobsOnly": false,
+    "gctsJobCount": 0,
+    "jobAdsRequest": {
+      "placement": {
+        "channel": "WEB",
+        "location": "JobSearchPage",
+        "property": "monster.com",
+        "type": "JOB_SEARCH",
+        "view": "SPLIT"
+      },
+      "position": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18
+      ]
+    },
+    "searchId": "9124a66c-f234-4125-bb7a-a97a9b011010",
+    "includeJobs": [],
+    "fingerprintId": "ze3dfb2560ca554935b983d5a964a76b1",
+    "siteId": "monster.com"
+  },
+  "searchId": "9124a66c-f234-4125-bb7a-a97a9b011010",
+  "meta": {
+    "@type": "SearchMeta"
+  }
+}

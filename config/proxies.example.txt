@@ -1,0 +1,20 @@
+# Proxy pool for the 5 anti-bot-gated scrapers (dice/monster/indeed/glassdoor/
+# techfetch). LinkedIn does NOT use these — it runs direct on a logged-in profile.
+#
+# SETUP: copy this file to  config/proxies.txt  (git-ignored) and put ONE proxy
+# per line in the format your provider gives:
+#
+#     host:port:username:password
+#
+# Decodo ISP example (each port = a distinct static residential IP):
+#     isp.decodo.com:10001:user-XXXXXXXX-country-us:YOURPASSWORD
+#     isp.decodo.com:10002:user-XXXXXXXX-country-us:YOURPASSWORD
+#     ...up to your 10 ports...
+#
+# Notes:
+#   - Blank lines and lines starting with '#' are ignored.
+#   - host:port with no user/pass is allowed (IP-whitelisted pools).
+#   - The scrapers round-robin across all lines, one IP per scrape, and cool an
+#     IP down for ~10 min (PROXY_BLOCK_COOLDOWN_MS) if it gets a block.
+#   - No config/proxies.txt present → scrapers run direct (current behavior).
+#   - Alternatively set env PROXY_LIST="line1,line2,..." instead of the file.
