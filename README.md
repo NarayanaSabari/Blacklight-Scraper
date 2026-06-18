@@ -589,5 +589,3 @@ For issues, questions, or contributions:
 ---
 
 **Happy Scraping! 🎉**
-
-<!-- mirror-smoke-test 2026-06-18T14:47:16Z — temporary, reverted next commit -->
