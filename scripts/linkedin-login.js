@@ -12,6 +12,7 @@
 import readline from 'readline';
 import { launchPersistentContext } from 'cloakbrowser';
 import { linkedInProfileDir } from '../scrapers/linkedin.js';
+import { saveLinkedinCredential } from '../src/setup/linkedin-credential.js';
 
 async function main() {
     const userDataDir = linkedInProfileDir();
@@ -34,8 +35,23 @@ async function main() {
         rl.question('Press Enter when logged in... ', () => { rl.close(); resolve(); });
     });
 
+    // Pull the session cookies from the logged-in profile BEFORE closing, so we
+    // can verify the login and register the local `linkedin` credential the
+    // scraper's per-scrape lease needs. Without it, scrapes fail with
+    // "No LinkedIn credential available from API" despite a valid profile.
+    let cookies = [];
+    try {
+        cookies = await context.cookies();
+    } catch (err) {
+        console.warn(`Could not read cookies from the profile: ${err.message}`);
+    }
     await context.close();
     console.log('Profile saved. The scraper will reuse this logged-in session.');
+
+    const result = saveLinkedinCredential({ cwd: process.cwd(), cookies });
+    if (!result.saved) {
+        process.exit(1);
+    }
 }
 
 main().catch((err) => { console.error('linkedin:login failed:', err); process.exit(1); });
