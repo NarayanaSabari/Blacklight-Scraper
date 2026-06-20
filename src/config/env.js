@@ -151,6 +151,16 @@ export function getConfig() {
     return cached;
 }
 
+// Invalidate the singleton and rebuild from disk. Used at startup after the
+// first-run preflight (src/setup/ensure-api-key.js) writes a fresh
+// config/credentials.json — another module may already have triggered
+// getConfig() at import time (src/http/client.js reads it at module scope),
+// so a plain getConfig() would return the stale pre-write config.
+export function reloadConfig() {
+    cached = null;
+    return getConfig();
+}
+
 // Test-only helper; not used in production code paths.
 export function resetConfigForTest() {
     cached = null;

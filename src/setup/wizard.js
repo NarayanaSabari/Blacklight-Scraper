@@ -2,49 +2,10 @@
 // testable without a TTY/browser/network. Defaults wire the real ones.
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { createInterface } from 'node:readline/promises';
 import { parseCookieInput, validateLinkedinCookies } from './cookie-input.js';
 import { buildCredentialsJson, buildDotEnv, mergeCredentials, mergeDotEnv } from './config-writer.js';
 import { verifyLocal, verifyRemote } from './verify.js';
-
-// Real readline wrapper. Two hardening properties beyond a bare question():
-//  (1) EOF-safe: on Ctrl-D / closed stdin, rl.question() never settles, so
-//      we race it against the interface 'close' event and resolve null.
-//      Callers treat null as "cancel — write nothing".
-//  (2) .secret(q): masks keystroke echo for API keys / passwords.
-function defaultAsk() {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    let closed = false;
-    let muted = false;
-    const onClose = new Promise((resolve) => rl.once('close', () => { closed = true; resolve(null); }));
-    const origWrite = typeof rl._writeToOutput === 'function' ? rl._writeToOutput.bind(rl) : null;
-    if (origWrite) {
-        rl._writeToOutput = (s) => { if (!muted) origWrite(s); else if (/\n/.test(s)) origWrite('\n'); };
-    }
-    const core = async (q) => {
-        if (closed) return null;
-        try {
-            return await Promise.race([rl.question(q + ' ').then((a) => a.trim()), onClose]);
-        } catch (e) {
-            if (e && e.code === 'ERR_USE_AFTER_CLOSE') return null;
-            throw e;
-        }
-    };
-    const fn = async (q) => core(q);
-    fn.secret = async (q) => {
-        process.stdout.write(q + ' ');
-        muted = true;
-        try { return await core(''); } finally { muted = false; }
-    };
-    fn.close = () => rl.close();
-    return fn;
-}
-
-function realIsIgnored(p) {
-    try { execFileSync('git', ['check-ignore', '-q', p], { stdio: 'ignore' }); return true; }
-    catch (e) { return e.status === 1 ? false : null; } // 1 = not ignored; other/no-git = null (unknown)
-}
+import { defaultAsk, realIsIgnored, writeSecret } from './io.js';
 
 // Mask a top-level credentials section for the idempotency preview. For an
 // object we show only its key names (structure, never values); for a scalar
@@ -90,21 +51,6 @@ export async function runSetupWizard(deps = {}) {
             out('  ✗ must start with http:// or https:// — try again');
         }
     };
-    // Write a secret file atomically (temp + rename) and lock it to 0600.
-    // Never silently degrade: if chmod fails on a POSIX host, warn loudly.
-    const writeSecret = (p, data) => {
-        const tmp = `${p}.tmp`;
-        fs.writeFileSync(tmp, data);
-        try {
-            fs.chmodSync(tmp, 0o600);
-        } catch (e) {
-            if (process.platform !== 'win32') {
-                out(`⚠️ Could not chmod ${path.basename(p)} to 0600 (${e.code || e.message}); secrets may be world-readable — fix the file permissions manually.`);
-            }
-        }
-        fs.renameSync(tmp, p);
-    };
-
     try {
         out('── Unified Job Scraper — setup ──');
         out('Run via: `npm run setup`  (note: `npm start --setup` will NOT work — npm consumes the flag; use `npm run setup` or `npm start -- --setup`).');
@@ -212,8 +158,8 @@ export async function runSetupWizard(deps = {}) {
             catch { out(`✗ Could not merge existing ${envPath} — nothing written.`); return 1; }
         }
         fs.mkdirSync(path.dirname(credPath), { recursive: true });
-        writeSecret(credPath, JSON.stringify(credObj, null, 2) + '\n');
-        writeSecret(envPath, envText);
+        writeSecret(credPath, JSON.stringify(credObj, null, 2) + '\n', out);
+        writeSecret(envPath, envText, out);
         out(`✓ Wrote ${credPath}`);
         out(`✓ Wrote ${envPath}`);
 

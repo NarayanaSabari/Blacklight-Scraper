@@ -16,7 +16,8 @@
 // starts telemetry, starts listening, and handles graceful shutdown.
 
 import express from 'express';
-import { getConfig } from './src/config/env.js';
+import { getConfig, reloadConfig } from './src/config/env.js';
+import { ensureApiKey } from './src/setup/ensure-api-key.js';
 import { createLogger, attachLokiSink, attachMetricsSink } from './src/logger/index.js';
 import { initializeCredentialsClient, getCredentialsClient } from './src/api/credentials.js';
 import { getLinkedInSession } from './src/scrapers/linkedin-session.js';
@@ -83,7 +84,13 @@ async function main() {
         const { runSetupWizard } = await import('./src/setup/wizard.js');
         process.exit(await runSetupWizard());
     }
-    const config = getConfig();
+
+    // First-run preflight: if the Blacklight API key isn't configured and we
+    // have an interactive terminal, prompt for it and save it to
+    // config/credentials.json before boot. No-op when the key is already set;
+    // never blocks when there's no TTY (daemon/CI) — boots queue-disabled.
+    const keyResult = await ensureApiKey();
+    const config = keyResult.wrote ? reloadConfig() : getConfig();
 
     const bootInfo = resolveBootInfo({ profileDir: () => linkedInProfileDir() });
 
