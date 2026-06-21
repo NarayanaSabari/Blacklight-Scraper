@@ -8,7 +8,7 @@
 // and the behavioral overhead would slow the 5-page-then-100-detail
 // scrape pattern down meaningfully.
 import { launch } from 'cloakbrowser';
-import { CheerioCrawler } from 'crawlee';
+import { CheerioCrawler, RequestQueue } from 'crawlee';
 import * as cheerio from 'cheerio';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
@@ -197,7 +197,6 @@ export function buildSearchUrl(jobTitle, location, pageNum) {
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 export async function scrapeDice(jobTitle, location, sessionId = null) {
-    void sessionId;
     logProgress('Dice', `Searching for "${jobTitle}" in "${location}"`);
     // Dice has no real anti-bot layer (vanilla Playwright works 100%), so it
     // runs DIRECT — no proxy. Keeps the limited proxy quota for the
@@ -206,6 +205,7 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
     const contextsToCleanup = [];
     const collectedJobs = [];
     let collectedAnything = false;
+    let detailQueue = null;
 
     try {
         // ─── Stage 1: search-page URL collection ──────────────────────────
@@ -303,7 +303,18 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
         let domChangedCount = 0;
         let processedCount = 0;
 
+        // Fresh per-run queue. crawlee's DEFAULT RequestQueue is process-
+        // persistent and dedups by URL, so across the daemon's many Dice
+        // sessions repeat job URLs were silently skipped — the detail handler
+        // never ran (processedCount stayed 0) and a 20-anchor page yielded
+        // 0 jobs ("confirmed empty"). An ephemeral per-session queue (dropped
+        // in finally) gives every run a clean slate.
+        detailQueue = await RequestQueue.open(
+            `dice-detail-${sessionId ?? Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        );
+
         const crawler = new CheerioCrawler({
+            requestQueue: detailQueue,
             maxConcurrency: CONFIG.DETAIL_CONCURRENCY,
             maxRequestRetries: 2,
             requestHandlerTimeoutSecs: 180,
@@ -397,6 +408,11 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
         if (collectedJobs.length === 0) return { jobs: [], emptyConfirmed: true };
         return collectedJobs;
     } finally {
+        // Drop the ephemeral detail queue so it can't accumulate on disk or
+        // dedup a future run.
+        if (detailQueue) {
+            try { await detailQueue.drop(); } catch (err) { log.warn(`Failed to drop detail queue: ${err.message}`); }
+        }
         for (const ctx of contextsToCleanup) {
             try { await ctx.close(); } catch (err) { log.warn(`Failed to close context: ${err.message}`); }
         }
