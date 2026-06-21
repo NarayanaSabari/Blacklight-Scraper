@@ -9,10 +9,14 @@ import * as monster from './monster-cooldown.js';
 import * as indeed from './indeed-cooldown.js';
 import * as glassdoor from './glassdoor-cooldown.js';
 import * as techfetch from './techfetch-cooldown.js';
+import * as linkedin from './linkedin-cooldown.js';
 
 // Platform name → its cooldown module. Only platforms with a cooldown marker
-// appear here; others (dice, linkedin) are never cooled-down.
-const MODULES = Object.freeze({ monster, indeed, glassdoor, techfetch });
+// appear here; others (dice) are never cooled-down. LinkedIn cools down on
+// auth/cookie-expiry (set in scrapers/linkedin.js) so the orchestrator stops
+// claiming it while the session is dead, instead of storming concurrent
+// re-establish failures until the operator re-runs `npm run linkedin:login`.
+const MODULES = Object.freeze({ monster, indeed, glassdoor, techfetch, linkedin });
 
 // Returns the platform names whose local cooldown marker is currently active.
 // Each check is isolated — a cooldown-read failure must never break the claim.

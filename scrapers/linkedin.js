@@ -26,6 +26,7 @@ import { getLinkedInSession } from '../src/scrapers/linkedin-session.js';
 import { getMetrics } from '../src/metrics/registry.js';
 import { assertNotBlocked } from '../src/core/block-detection.js';
 import { DomChangedError, BlockedError, AuthError, NetworkError } from '../src/core/errors.js';
+import * as linkedinCooldown from '../src/core/linkedin-cooldown.js';
 
 // Flag-gated hardening (audit L1/L2/D1). OFF (default/shipped) = byte-
 // identical to today's LinkedIn scraper (empirically: 100 posts/~193s
@@ -1638,6 +1639,28 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         // Always re-throw so BaseScraper records + classifies the role.
         if (error instanceof AuthError) {
             logProgress('LinkedIn', '📤 Auth-wall / cookies expired — cooldown + reestablishing session...');
+            // Local PLATFORM cooldown so the orchestrator STOPS claiming
+            // LinkedIn while the session is dead. Without it, a queue full of
+            // LinkedIn roles makes the orchestrator fire dozens of concurrent
+            // scrapes that all instant-fail with "session lease unavailable
+            // (concurrent re-establish)" — ~5,000 fast-fails over 12h observed
+            // 2026-06-21. Recovery is manual: `npm run linkedin:login`.
+            try {
+                linkedinCooldown.writeCooldownMarker({
+                    writeFile: linkedinCooldown.defaultWriteFile(),
+                    rename: linkedinCooldown.defaultRename(),
+                    now: new Date(),
+                    cooldownMs: linkedinCooldown.cooldownMs(),
+                    path: linkedinCooldown.cooldownPath(),
+                });
+                log.warn('LinkedIn auth dead — platform cooled down; run `npm run linkedin:login` to recover', {
+                    platform: 'linkedin',
+                    scraper_alert: 'linkedin_auth_cooldown',
+                    cooldownMin: Math.round(linkedinCooldown.cooldownMs() / 60000),
+                });
+            } catch (cdErr) {
+                logProgress('LinkedIn', `   cooldown write failed: ${cdErr.message}`);
+            }
             try {
                 await session.lease?.reportFailure(`Auth/cookies expired: ${error.message}`, COOKIES_EXPIRED_COOLDOWN_MIN);
             } catch (repErr) {
