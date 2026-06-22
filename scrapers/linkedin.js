@@ -21,6 +21,7 @@ import path from 'path';
 import { launch, launchPersistentContext } from 'cloakbrowser';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
+import { parseProxyLine } from '../src/core/proxy-pool.js';
 import { getCredentialsAPIClient } from '../src/api/credentials.js';
 import { getLinkedInSession } from '../src/scrapers/linkedin-session.js';
 import { getMetrics } from '../src/metrics/registry.js';
@@ -278,8 +279,21 @@ export async function launchPersistentProfile({ profileKey = null, proxy = null 
         timezoneId: 'America/New_York',
     };
     // Only attach a proxy when one is actually present — absent proxy MUST
-    // leave the launch options identical to the legacy path.
-    if (proxy) opts.proxy = { server: proxy };
+    // leave the launch options identical to the legacy path. Pool proxies are
+    // stored as "host:port:user:pass"; parseProxyLine turns that into
+    // Playwright's { server: "http://host:port", username, password }. A raw
+    // colon string passed straight as { server } is an Invalid URL to the
+    // browser. URL-form proxies (scheme://…) parse to null → pass through.
+    if (proxy) {
+        const rec = parseProxyLine(proxy);
+        if (rec) {
+            opts.proxy = { server: rec.server };
+            if (rec.username) opts.proxy.username = rec.username;
+            if (rec.password) opts.proxy.password = rec.password;
+        } else {
+            opts.proxy = { server: proxy };
+        }
+    }
     const context = await launcher(opts);
     logProgress('LinkedIn', '✅ CloakBrowser persistent profile ready');
     return context;

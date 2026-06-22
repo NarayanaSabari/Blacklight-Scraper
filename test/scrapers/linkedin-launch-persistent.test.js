@@ -51,6 +51,19 @@ test('launchPersistentProfile({ profileKey, proxy }): both threaded together', a
     assert.deepEqual(opts.proxy, { server: 'socks5://1.2.3.4:1080' });
 });
 
+test('launchPersistentProfile({ proxy }): parses pool "host:port:user:pass" into Playwright shape', async () => {
+    const spy = spyLauncher();
+    // The format stored in the credential pool (e.g. Decodo). Passing this raw
+    // as { server } is an Invalid URL — it must be parsed into server/user/pass.
+    await launchPersistentProfile({ proxy: 'isp.decodo.com:10001:sp0ac3m6sp:secretpass' }, spy.fn);
+    const opts = spy.calls[0];
+    assert.deepEqual(opts.proxy, {
+        server: 'http://isp.decodo.com:10001',
+        username: 'sp0ac3m6sp',
+        password: 'secretpass',
+    });
+});
+
 test('launchPersistentProfile: preserves the standard launch knobs', async () => {
     const spy = spyLauncher();
     await launchPersistentProfile({}, spy.fn);
