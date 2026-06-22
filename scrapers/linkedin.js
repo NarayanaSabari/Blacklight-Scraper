@@ -42,6 +42,24 @@ const COOKIES_EXPIRED_COOLDOWN_MIN = 60;
 const log = createLogger('linkedin');
 const logProgress = (_scope, msg) => log.info(msg);
 
+// Phase 3b — Task B: local↔pool cooldown reconciliation. Pure decision for
+// what a SINGLE account's AuthError (cookies expired / auth-wall) should do to
+// the PLATFORM-WIDE local cooldown marker:
+//  • LOCAL mode (isLocal === true — the live single-account box): write the
+//    marker. This is PR #310 storm-protection: with one account there is no
+//    other account to rotate to, so a dead session must pause the platform or
+//    the orchestrator fires dozens of concurrent instant-fail scrapes.
+//  • REMOTE mode (isLocal === false): do NOT write the platform marker. The
+//    pool cools just this ACCOUNT (lease.reportFailure) so the next lease
+//    rotates to a healthy account. The platform-wide marker is reserved for
+//    pool-exhausted (204) / pool-unreachable (Task A) — i.e. genuinely no
+//    account left to rotate to.
+// Fail-safe: anything other than a positive remote signal (isLocal !== false)
+// keeps the live local behavior so storm-protection is never silently dropped.
+export function authFailCooldownPlan({ isLocal } = {}) {
+    return { writePlatformMarker: isLocal !== false };
+}
+
 // Anti-bot pacing knobs (env-tunable, read once at module load). Mirrors
 // env.js::toInt discipline — absent/garbage → default; never throws.
 export function readPacingConfig(env = process.env) {
@@ -1667,27 +1685,41 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         // Always re-throw so BaseScraper records + classifies the role.
         if (error instanceof AuthError) {
             logProgress('LinkedIn', '📤 Auth-wall / cookies expired — cooldown + reestablishing session...');
-            // Local PLATFORM cooldown so the orchestrator STOPS claiming
-            // LinkedIn while the session is dead. Without it, a queue full of
-            // LinkedIn roles makes the orchestrator fire dozens of concurrent
-            // scrapes that all instant-fail with "session lease unavailable
-            // (concurrent re-establish)" — ~5,000 fast-fails over 12h observed
-            // 2026-06-21. Recovery is manual: `npm run linkedin:login`.
-            try {
-                linkedinCooldown.writeCooldownMarker({
-                    writeFile: linkedinCooldown.defaultWriteFile(),
-                    rename: linkedinCooldown.defaultRename(),
-                    now: new Date(),
-                    cooldownMs: linkedinCooldown.cooldownMs(),
-                    path: linkedinCooldown.cooldownPath(),
-                });
-                log.warn('LinkedIn auth dead — platform cooled down; run `npm run linkedin:login` to recover', {
+            // Phase 3b — Task B: only the LIVE single-account (LOCAL) box writes
+            // the PLATFORM-WIDE cooldown marker on a single account's auth-fail.
+            // In REMOTE mode the pool has other accounts, so a single dead
+            // account just gets cooled via reportFailure (below) and the next
+            // lease rotates onto a healthy one — writing the platform marker
+            // would needlessly pause ALL of LinkedIn. The platform marker is
+            // reserved for pool-exhausted / pool-unreachable (#acquireLease).
+            //
+            // LOCAL rationale (UNCHANGED, PR #310): without the marker a queue
+            // full of LinkedIn roles makes the orchestrator fire dozens of
+            // concurrent scrapes that all instant-fail with "session lease
+            // unavailable (concurrent re-establish)" — ~5,000 fast-fails over
+            // 12h observed 2026-06-21. Recovery is manual: `npm run linkedin:login`.
+            const { writePlatformMarker } = authFailCooldownPlan({ isLocal: session.isLocal });
+            if (writePlatformMarker) {
+                try {
+                    linkedinCooldown.writeCooldownMarker({
+                        writeFile: linkedinCooldown.defaultWriteFile(),
+                        rename: linkedinCooldown.defaultRename(),
+                        now: new Date(),
+                        cooldownMs: linkedinCooldown.cooldownMs(),
+                        path: linkedinCooldown.cooldownPath(),
+                    });
+                    log.warn('LinkedIn auth dead — platform cooled down; run `npm run linkedin:login` to recover', {
+                        platform: 'linkedin',
+                        scraper_alert: 'linkedin_auth_cooldown',
+                        cooldownMin: Math.round(linkedinCooldown.cooldownMs() / 60000),
+                    });
+                } catch (cdErr) {
+                    logProgress('LinkedIn', `   cooldown write failed: ${cdErr.message}`);
+                }
+            } else {
+                log.info('LinkedIn account auth-fail in REMOTE mode — cooling the account only (pool will rotate), no platform pause', {
                     platform: 'linkedin',
-                    scraper_alert: 'linkedin_auth_cooldown',
-                    cooldownMin: Math.round(linkedinCooldown.cooldownMs() / 60000),
                 });
-            } catch (cdErr) {
-                logProgress('LinkedIn', `   cooldown write failed: ${cdErr.message}`);
             }
             try {
                 await session.lease?.reportFailure(`Auth/cookies expired: ${error.message}`, COOKIES_EXPIRED_COOLDOWN_MIN);

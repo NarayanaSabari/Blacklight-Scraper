@@ -9,8 +9,25 @@ import { launchPersistentProfile, hasLiAt } from '../../scrapers/linkedin.js';
 import { getCredentialsAPIClient } from '../api/credentials.js';
 import { createLogger } from '../logger/index.js';
 import { Semaphore } from '../core/semaphore.js';
+import { NetworkError } from '../core/errors.js';
+import * as linkedinCooldown from '../core/linkedin-cooldown.js';
 
 const log = createLogger('linkedin-session');
+
+// SHORT platform cooldown written when the credentials POOL is UNREACHABLE in
+// REMOTE mode (Task A / spec decision 3). Distinct from the 30-min auth-dead
+// cooldown: an unreachable pool is usually a transient outage, so we pause
+// LinkedIn for one short window and let the next cycle re-probe rather than
+// firing an uncoordinated local fallback. Override via env for tuning.
+const DEFAULT_POOL_UNREACHABLE_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
+
+export function poolUnreachableCooldownMs(env = process.env) {
+    const raw = env?.LINKEDIN_POOL_UNREACHABLE_COOLDOWN_MIN;
+    if (raw === undefined || raw === null || raw === '') return DEFAULT_POOL_UNREACHABLE_COOLDOWN_MS;
+    const n = Number.parseInt(String(raw), 10);
+    if (!Number.isFinite(n) || n <= 0) return DEFAULT_POOL_UNREACHABLE_COOLDOWN_MS;
+    return n * 60 * 1000;
+}
 
 // Concurrency cap for parallel LinkedIn tabs on the single account. Default 2
 // (conservative — one session running many concurrent searches gets
@@ -61,8 +78,15 @@ export class LinkedInSession {
                   // rotationJitter returns [0,1) for the ±20% cap jitter.
                   now = () => Date.now(),
                   rotateHours = linkedinLeaseRotateHours(),
-                  rotationJitter = defaultRotationJitter } = {}) {
+                  rotationJitter = defaultRotationJitter,
+                  // Task A seam: the cooldown module (injectable so the
+                  // pool-unreachable marker write is unit-testable without
+                  // touching the real homedir filesystem).
+                  cooldown = linkedinCooldown,
+                  poolUnreachableCooldownMs: poolCooldownMs = poolUnreachableCooldownMs() } = {}) {
         this._apiClient = apiClient ?? getCredentialsAPIClient();
+        this._cooldown = cooldown;
+        this._poolUnreachableCooldownMs = poolCooldownMs;
         this._launch = launcher;
         this._platform = platform;
         this._maxLeaseRetries = maxLeaseRetries;
@@ -86,6 +110,13 @@ export class LinkedInSession {
 
     get lease() { return this._lease; }
     isAlive() { return !!this._context; }
+
+    // Mode signal for the auth-fail site (Task B) and pool-unreachable pause
+    // (Task A). Reads the credentials client's local/remote flag. Treated as
+    // LOCAL unless we can positively tell we're remote, so the live single-
+    // account box's storm-protection is never silently dropped.
+    get isLocal() { return this._apiClient?.isLocal !== false; }
+    get isRemote() { return this._apiClient?.isLocal === false; }
 
     async ensureReady(sessionId) {
         if (this._context) return;
@@ -160,14 +191,60 @@ export class LinkedInSession {
     }
 
     async #acquireLease(sessionId) {
+        // Distinguish two failure shapes from the pool:
+        //  • acquire() returns null  → HTTP 204 "no account available". Retry
+        //    across the window; if still none, return null → #establish throws
+        //    "No LinkedIn credential available". No platform marker (today's
+        //    behavior — there may simply be no free account this instant).
+        //  • acquire() throws NetworkError → the pool itself is UNREACHABLE.
+        //    Retry across the window; if still unreachable, in REMOTE mode
+        //    write a SHORT platform cooldown so the orchestrator PAUSES
+        //    LinkedIn next cycle (no uncoordinated local fallback — spec
+        //    decision 3), then re-throw. In LOCAL mode behavior is unchanged:
+        //    no marker, the error propagates as before.
+        let lastNetworkError = null;
         for (let i = 0; i < this._maxLeaseRetries; i++) {
-            const lease = await this._apiClient.acquire(this._platform, sessionId);
-            if (lease) return lease;
+            try {
+                const lease = await this._apiClient.acquire(this._platform, sessionId);
+                if (lease) return lease;
+                lastNetworkError = null; // a clean 204 supersedes an earlier blip
+            } catch (error) {
+                if (!(error instanceof NetworkError)) throw error;
+                lastNetworkError = error;
+            }
             if (i < this._maxLeaseRetries - 1 && this._leaseRetryDelayMs > 0) {
                 await new Promise(r => setTimeout(r, this._leaseRetryDelayMs));
             }
         }
+        if (lastNetworkError) {
+            // Pool unreachable after all retries.
+            if (this.isRemote) this.#pausePlatformOnPoolUnreachable();
+            throw lastNetworkError;
+        }
         return null;
+    }
+
+    // REMOTE-only: write a SHORT local platform cooldown marker so the
+    // orchestrator excludes LinkedIn next cycle (platform-cooldowns.js reads
+    // it). Best-effort: a marker-write failure must never mask the underlying
+    // NetworkError the caller is about to re-throw.
+    #pausePlatformOnPoolUnreachable() {
+        try {
+            this._cooldown.writeCooldownMarker({
+                writeFile: this._cooldown.defaultWriteFile(),
+                rename: this._cooldown.defaultRename(),
+                now: new Date(),
+                cooldownMs: this._poolUnreachableCooldownMs,
+                path: this._cooldown.cooldownPath(),
+            });
+            log.warn('LinkedIn credentials pool unreachable — platform paused for one short cycle', {
+                platform: this._platform,
+                scraper_alert: 'linkedin_pool_unreachable_cooldown',
+                cooldownMin: Math.round(this._poolUnreachableCooldownMs / 60000),
+            });
+        } catch (cdErr) {
+            log.error('Pool-unreachable cooldown write failed', { err: cdErr.message });
+        }
     }
 
     async withPage(sessionId, fn) {
@@ -263,3 +340,7 @@ export class LinkedInSession {
 let _singleton = null;
 export function getLinkedInSession() { return (_singleton ??= new LinkedInSession()); }
 export function __resetLinkedInSessionForTest() { _singleton = null; }
+// Test-only: install a fake/stub session so callers that read the singleton
+// (e.g. scrapeLinkedIn) can exercise the auth-fail wiring without a real
+// browser. Pair with __resetLinkedInSessionForTest() in test teardown.
+export function __setLinkedInSessionForTest(session) { _singleton = session; }
