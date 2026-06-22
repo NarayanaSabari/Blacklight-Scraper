@@ -220,21 +220,49 @@ export function linkedInProfileDir() {
         || path.join(os.homedir(), '.blacklight-linkedin-profile');
 }
 
-// Launch the persistent stealth profile (D1b, manual-login model). Returns a
-// Playwright BrowserContext directly (cloakbrowser.launchPersistentContext
-// has no separate Browser handle — close the context to tear down). No cookie
-// injection: the profile already holds the operator's logged-in session.
-export async function launchPersistentProfile() {
-    const userDataDir = linkedInProfileDir();
+// Resolve the on-disk persistent-profile directory for a given account.
+// Pure + deterministic. A falsy profileKey (null/undefined/'') → the legacy
+// single fixed dir (byte-identical to the pre-rotation behavior). A truthy
+// profileKey → a sibling per-account dir derived from the base
+// (`<base>-<sanitized key>`). The key is sanitized so it can never inject a
+// path separator or `..` traversal into the resolved path.
+export function profileDirFor(profileKey) {
+    const base = linkedInProfileDir();
+    if (!profileKey) return base;
+    const safe = String(profileKey).replace(/[^A-Za-z0-9._-]/g, '_').replace(/\.\./g, '__');
+    return `${base}-${safe}`;
+}
+
+// Launch the persistent stealth profile. Returns a Playwright BrowserContext
+// directly (cloakbrowser.launchPersistentContext has no separate Browser
+// handle — close the context to tear down).
+//
+// Default (no args / legacy local accounts): launches the single fixed
+// `linkedInProfileDir()` with NO proxy — byte-identical to the manual-login
+// D1b model. No cookie injection: the profile already holds the operator's
+// logged-in session.
+//
+// Per-account (rotation, future A3 accounts): pass `{ profileKey, proxy }`.
+// `profileKey` selects the per-account dir (profileDirFor); a truthy `proxy`
+// (a URL string from the lease) is threaded into cloakbrowser as the
+// `{ server }` proxy option so all traffic routes through the account's static
+// proxy. The launcher is injectable (last arg) for unit tests so the option
+// wiring is verifiable without a real browser.
+export async function launchPersistentProfile({ profileKey = null, proxy = null } = {}, launcher = launchPersistentContext) {
+    const userDataDir = profileDirFor(profileKey);
     logProgress('LinkedIn', `🚀 Launching CloakBrowser persistent profile (${userDataDir})...`);
-    const context = await launchPersistentContext({
+    const opts = {
         userDataDir,
         headless: process.env.LINKEDIN_HEADLESS === 'true',
         humanize: true,
         viewport: { width: 1366, height: 900 },
         locale: 'en-US',
         timezoneId: 'America/New_York',
-    });
+    };
+    // Only attach a proxy when one is actually present — absent proxy MUST
+    // leave the launch options identical to the legacy path.
+    if (proxy) opts.proxy = { server: proxy };
+    const context = await launcher(opts);
     logProgress('LinkedIn', '✅ CloakBrowser persistent profile ready');
     return context;
 }

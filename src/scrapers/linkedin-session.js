@@ -5,7 +5,7 @@
 // on-disk profile the operator logged into once (`npm run linkedin:login`) —
 // no per-run cookie injection. The lease is still acquired as a slot/lock for
 // the orchestrator's availability gate + email/password re-login fallback.
-import { launchPersistentProfile } from '../../scrapers/linkedin.js';
+import { launchPersistentProfile, hasLiAt } from '../../scrapers/linkedin.js';
 import { getCredentialsAPIClient } from '../api/credentials.js';
 import { createLogger } from '../logger/index.js';
 import { Semaphore } from '../core/semaphore.js';
@@ -31,7 +31,11 @@ function defaultJitter() {
 export class LinkedInSession {
     constructor({ apiClient = null, launcher = launchPersistentProfile, platform = 'linkedin',
                   maxLeaseRetries = 10, leaseRetryDelayMs = 60000,
-                  maxConcurrency = linkedinMaxConcurrency(), jitter = defaultJitter } = {}) {
+                  maxConcurrency = linkedinMaxConcurrency(), jitter = defaultJitter,
+                  // Seams for unit-testing the seed-vs-reuse decision without a
+                  // real browser: readCookies pulls the context's current jar,
+                  // isAuthed classifies it (li_at present).
+                  readCookies = (ctx) => ctx.cookies(), isAuthed = hasLiAt } = {}) {
         this._apiClient = apiClient ?? getCredentialsAPIClient();
         this._launch = launcher;
         this._platform = platform;
@@ -42,6 +46,8 @@ export class LinkedInSession {
         this._establishing = null; // single-flight promise
         this._sem = new Semaphore(maxConcurrency);
         this._jitter = jitter;
+        this._readCookies = readCookies;
+        this._isAuthed = isAuthed;
     }
 
     get lease() { return this._lease; }
@@ -58,11 +64,43 @@ export class LinkedInSession {
         const lease = await this.#acquireLease(sessionId);
         if (!lease) throw new Error('No LinkedIn credential available from API');
         this._lease = lease;
-        // launchPersistentProfile returns a BrowserContext directly (no
-        // separate Browser handle); the operator's logged-in session lives in
-        // the on-disk profile, so we do NOT inject the lease's cookies.
-        this._context = await this._launch();
-        log.info('Persistent LinkedIn session established', { credentialId: lease.credential?.id });
+
+        const cred = lease.credential || {};
+        const cookies = cred.cookies;
+        const profileKey = cred.profile_key;
+        // Per-account seed+proxy path activates ONLY when the lease carries
+        // BOTH a non-empty cookie jar AND a profile_key (future A3 accounts).
+        // When either is absent (local mode / current accounts) the behavior is
+        // byte-identical to before: launchPersistentProfile() with NO args
+        // (fixed dir, no proxy) and NO cookie injection.
+        const perAccount = Array.isArray(cookies) && cookies.length > 0 && !!profileKey;
+
+        if (perAccount) {
+            // Launch the per-account on-disk profile, routed through the
+            // account's static proxy (Task 2 threads profileKey + proxy).
+            this._context = await this._launch({ profileKey, proxy: cred.proxy ?? null });
+            // Seed-vs-reuse: only seed when the aged profile lacks valid auth
+            // (no li_at). An already-authed profile is reused (organic aging) —
+            // reseeding would clobber a fresher in-profile session.
+            let authed = false;
+            try {
+                authed = this._isAuthed(await this._readCookies(this._context));
+            } catch { authed = false; }
+            if (!authed) {
+                await this._context.addCookies(cookies);
+                log.info('Seeded LinkedIn profile from leased cookie jar', {
+                    credentialId: cred.id, profileKey, cookies: cookies.length });
+            } else {
+                log.info('Reusing authed LinkedIn profile (no reseed)', {
+                    credentialId: cred.id, profileKey });
+            }
+        } else {
+            // launchPersistentProfile returns a BrowserContext directly (no
+            // separate Browser handle); the operator's logged-in session lives
+            // in the on-disk profile, so we do NOT inject the lease's cookies.
+            this._context = await this._launch();
+        }
+        log.info('Persistent LinkedIn session established', { credentialId: cred.id });
     }
 
     async #acquireLease(sessionId) {
