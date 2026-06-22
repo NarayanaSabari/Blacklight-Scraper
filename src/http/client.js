@@ -7,21 +7,12 @@
 //   • Exponential backoff with full jitter
 //   • Circuit breaker per host (opens after N consecutive failures)
 //   • Request timeout via AbortController
-//   • Dev-only TLS bypass (rejectUnauthorized=false) — gated on NODE_ENV.
 
-import https from 'https';
-import { getConfig } from '../config/env.js';
 import { createLogger } from '../logger/index.js';
 import { NetworkError, TimeoutError } from '../core/errors.js';
 import { sleepBackoff } from '../core/delays.js';
 
 const log = createLogger('http');
-
-// Shared dev-only HTTPS agent. null in production so Node uses its default
-// (certificate-validating) agent.
-const devHttpsAgent = getConfig().isDevelopment
-    ? new https.Agent({ rejectUnauthorized: false })
-    : null;
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_RETRIES = 4;
@@ -70,17 +61,12 @@ function recordFailure(host) {
     }
 }
 
-function applyDevAgent(url, fetchOptions) {
-    if (!devHttpsAgent || !url.startsWith('https://')) return fetchOptions;
-    return { ...fetchOptions, agent: devHttpsAgent };
-}
-
 async function fetchOnce(url, options, timeoutMs) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
         const response = await fetch(url, {
-            ...applyDevAgent(url, options),
+            ...options,
             signal: controller.signal,
         });
         return response;

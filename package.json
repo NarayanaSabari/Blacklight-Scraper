@@ -7,7 +7,6 @@
   "scripts": {
     "start": "node server.js",
     "start:prod": "node --max-old-space-size=4096 server.js",
-    "dev": "NODE_ENV=development node --watch server.js",
     "creds:clean": "node scripts/clean-credentials.js",
     "linkedin:login": "node scripts/linkedin-login.js",
     "linkedin:test-scrape": "node scripts/test-linkedin-scrape.js",

@@ -301,7 +301,7 @@ let client = null;
 export function initializeCredentialsClient() {
     const cfg = getConfig();
     const api = cfg.scraperCredentialsApi;
-    if (cfg.isDevelopment || !api) {
+    if (!api) {
         log.info('Using LOCAL credentials (credentials.json)');
         client = new CredentialsClient({ apiUrl: null, apiKey: null });
     } else {

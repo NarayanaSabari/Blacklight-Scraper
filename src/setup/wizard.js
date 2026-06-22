@@ -2,9 +2,8 @@
 // testable without a TTY/browser/network. Defaults wire the real ones.
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseCookieInput, validateLinkedinCookies } from './cookie-input.js';
 import { buildCredentialsJson, buildDotEnv, mergeCredentials, mergeDotEnv } from './config-writer.js';
-import { verifyLocal, verifyRemote } from './verify.js';
+import { verifyRemote } from './verify.js';
 import { defaultAsk, realIsIgnored, writeSecret } from './io.js';
 
 // Mask a top-level credentials section for the idempotency preview. For an
@@ -23,8 +22,6 @@ export async function runSetupWizard(deps = {}) {
     const cwd = deps.cwd || process.cwd();
     const ask = deps.ask || defaultAsk();
     const out = deps.out || ((s) => process.stdout.write(s + '\n'));
-    const readFile = deps.readFile || ((p) => fs.readFileSync(p, 'utf-8'));
-    const launchFn = deps.launchFn || (async (o) => (await import('cloakbrowser')).launch(o));
     const fetchFn = deps.fetchFn || globalThis.fetch;
     const isIgnored = deps.isIgnored || realIsIgnored;
 
@@ -71,64 +68,14 @@ export async function runSetupWizard(deps = {}) {
             if (mode !== 'merge' && mode !== 'overwrite') { out('Cancelled — nothing written.'); return 1; }
         }
 
-        const runMode = (await ask1('Run mode? 1) Local single-host  2) Production/queue [1/2]:')) === '2' ? 'remote' : 'local';
-        const answers = { mode: runMode };
-        let liFailed = false;
-
-        if (runMode === 'local') {
-            answers.platforms = {};
-            // LinkedIn (primary)
-            for (let attempt = 1; attempt <= 3; attempt++) {
-                const inp = await ask1('Paste LinkedIn cookie JSON (one line) OR a file path. For a multi-line paste, finish with a lone "." on its own line:');
-                let blob = inp;
-                const looksJson = inp.trimStart().startsWith('[') || inp.trimStart().startsWith('{');
-                if (looksJson) {
-                    let complete = true;
-                    try { JSON.parse(inp); } catch { complete = false; }
-                    if (!complete) {
-                        const more = [];
-                        let line;
-                        while ((line = await ask('')) !== '.') {
-                            if (line == null) break; // stdin EOF — stop accumulating, use what we have
-                            more.push(line);
-                        }
-                        blob = [inp, ...more].join('\n');
-                    }
-                }
-                try {
-                    const cookies = parseCookieInput(blob, { readFile });
-                    const v = validateLinkedinCookies(cookies);
-                    if (!v.ok) { out(`  ✗ ${v.reason}`); if (attempt === 3) out('  (continuing without LinkedIn; re-run setup with a fresh export)'); continue; }
-                    answers.platforms.linkedin = { credentials: cookies };
-                    break;
-                } catch (e) { out(`  ✗ ${e.message}`); if (attempt === 3) out('  (continuing without LinkedIn; re-run setup with a fresh export)'); }
-            }
-            liFailed = !answers.platforms.linkedin;
-            // Optional extra platforms
-            for (;;) {
-                const more = (await ask1('Add another platform? [indeed/glassdoor/techfetch/done]:')).toLowerCase();
-                if (more === '' || more === 'done') break;
-                if (more === 'techfetch') {
-                    const email = await ask1('  techfetch email:');
-                    const password = await askSecret('  techfetch password:');
-                    answers.platforms.techfetch = { email, password };
-                } else if (more === 'indeed' || more === 'glassdoor') {
-                    try { answers.platforms[more] = { credentials: parseCookieInput(await ask1(`  paste ${more} cookie JSON or path:`), { readFile }) }; }
-                    catch (e) { out(`  ✗ ${e.message}`); }
-                } else { out('  (unknown — choose indeed/glassdoor/techfetch/done)'); }
-            }
-            answers.headless = (await ask1('Run the browser HEADLESS? (LinkedIn default is headed) [y/N]:')).toLowerCase().startsWith('y');
-            answers.strictEmpty = (await ask1('Enable loud block-detection now (SCRAPER_STRICT_EMPTY)? [y/N]:')).toLowerCase().startsWith('y');
-            answers.scraperMode = (await ask1('SCRAPER_MODE [interactive/daemon] (default interactive):')) || 'interactive';
-            answers.port = (await ask1('PORT (default 3001):')) || '3001';
-        } else {
-            answers.blacklight = { apiUrl: await askUrl('blacklight'), apiKey: await askSecret('blacklight apiKey:') };
-            answers.scraperCredentials = { apiUrl: await askUrl('scraperCredentials'), apiKey: await askSecret('scraperCredentials apiKey:') };
-            answers.scraperMode = (await ask1('SCRAPER_MODE [interactive/daemon] (default daemon):')) || 'daemon';
-            answers.headless = (await ask1('Run the browser HEADLESS? [y/N]:')).toLowerCase().startsWith('y');
-            answers.strictEmpty = (await ask1('Enable SCRAPER_STRICT_EMPTY now? [y/N]:')).toLowerCase().startsWith('y');
-            answers.port = (await ask1('PORT (default 3001):')) || '3001';
-        }
+        // The scraper always runs as production against the remote queue.
+        const answers = { mode: 'remote' };
+        answers.blacklight = { apiUrl: await askUrl('blacklight'), apiKey: await askSecret('blacklight apiKey:') };
+        answers.scraperCredentials = { apiUrl: await askUrl('scraperCredentials'), apiKey: await askSecret('scraperCredentials apiKey:') };
+        answers.scraperMode = (await ask1('SCRAPER_MODE [interactive/daemon] (default daemon):')) || 'daemon';
+        answers.headless = (await ask1('Run the browser HEADLESS? [y/N]:')).toLowerCase().startsWith('y');
+        answers.strictEmpty = (await ask1('Enable SCRAPER_STRICT_EMPTY now? [y/N]:')).toLowerCase().startsWith('y');
+        answers.port = (await ask1('PORT (default 3001):')) || '3001';
 
         // git-ignore guard — fail closed on a confirmed-not-ignored path;
         // on unknown status (no git / not a repo) warn loudly and confirm.
@@ -164,21 +111,8 @@ export async function runSetupWizard(deps = {}) {
         out(`✓ Wrote ${envPath}`);
 
         // Verify
-        let result;
-        if (runMode === 'local' && answers.platforms?.linkedin?.credentials) {
-            out('Verifying LinkedIn cookies…');
-            result = await verifyLocal({ launch: launchFn, cookies: answers.platforms.linkedin.credentials, headless: !!answers.headless });
-        } else if (runMode === 'remote') {
-            out('Verifying APIs…');
-            result = await verifyRemote({ fetchFn, blacklight: answers.blacklight, scraperCredentials: answers.scraperCredentials });
-        } else {
-            result = {
-                status: 'warn',
-                message: liFailed
-                    ? '⚠️ LinkedIn cookies failed validation; wrote config WITHOUT them — re-run `npm run setup` with a fresh export.'
-                    : '⚠️ No LinkedIn cookies provided; skipped verify. Config written.',
-            };
-        }
+        out('Verifying APIs…');
+        const result = await verifyRemote({ fetchFn, blacklight: answers.blacklight, scraperCredentials: answers.scraperCredentials });
         out(result.message);
         out('─────────────────────────────────────────────────────────────────────');
         out('IMPORTANT — next step (do not skip):');
@@ -193,9 +127,7 @@ export async function runSetupWizard(deps = {}) {
         out('');
         out('      npm start');
         out('─────────────────────────────────────────────────────────────────────');
-        out(runMode === 'remote'
-            ? 'Setup complete. To run it as a managed service, see docs/MAC_SETUP.md or docs/WINDOWS_SETUP.md.'
-            : 'Setup complete.');
+        out('Setup complete. To run it as a managed service, see docs/MAC_SETUP.md or docs/WINDOWS_SETUP.md.');
         return 0;
     } catch (e) {
         if (e === CANCEL) return 1;

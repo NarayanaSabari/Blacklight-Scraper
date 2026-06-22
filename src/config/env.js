@@ -6,7 +6,6 @@ import os from 'os';
 import path from 'path';
 
 const DEFAULTS = Object.freeze({
-    NODE_ENV: 'production',
     PORT: 3001,
     LOG_LEVEL: 'info',
     QUEUE_CHECK_INTERVAL_MS: 30_000,
@@ -81,16 +80,15 @@ function loadCredentialsFile() {
 
 function buildConfig() {
     loadDotEnvFile();
-    const nodeEnv = process.env.NODE_ENV || DEFAULTS.NODE_ENV;
     const credentials = loadCredentialsFile();
 
     const blacklight = credentials?.blacklight ?? null;
-    const scraperCredentials = credentials?.scraperCredentials ?? null;
+    // The credentials API is the same backend + same scraper key as blacklight
+    // ({apiUrl, apiKey} shape). When no dedicated scraperCredentials section is
+    // present, fall back to the blacklight config so the REMOTE pool is used.
+    const scraperCredentials = credentials?.scraperCredentials ?? credentials?.blacklight ?? null;
 
     return Object.freeze({
-        nodeEnv,
-        isDevelopment: nodeEnv === 'development',
-        isProduction: nodeEnv === 'production',
         port: toInt(process.env.PORT, DEFAULTS.PORT),
         logLevel: process.env.LOG_LEVEL || DEFAULTS.LOG_LEVEL,
 
@@ -114,7 +112,8 @@ function buildConfig() {
             : null,
 
         // Raw credentials file — only the platform sections (linkedin/glassdoor/indeed/techfetch).
-        // Consumed by the credential-api client when running in local mode.
+        // Consumed by the credential-api client's no-config LOCAL fallback (when
+        // neither blacklight nor scraperCredentials API config is present).
         rawCredentials: credentials ? Object.freeze(credentials) : null,
 
         // Observability — telemetry is proxied through the Blacklight API

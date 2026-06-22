@@ -53,7 +53,7 @@ class MetricsRegistry {
             os: detectOs(),
             version: '2.0.0',
             mode: telemetry.mode || defaultMode(),
-            node_env: cfg.nodeEnv,
+            node_env: 'production',
         });
         this.registry.setDefaultLabels(this.defaultLabels);
 

@@ -5,18 +5,8 @@ import { buildCredentialsJson, buildDotEnv, mergeCredentials, mergeDotEnv }
 
 const LI = [{ name: 'li_at', value: 'x' }];
 
-test('LOCAL: credentials.json has only the supplied platform sections', () => {
+test('REMOTE (always): credentials.json has blacklight + scraperCredentials, no cookies', () => {
     const c = buildCredentialsJson({
-        mode: 'local',
-        platforms: { linkedin: { credentials: LI }, techfetch: { email: 'a@b.c', password: 'p' } },
-    });
-    assert.deepEqual(c, { linkedin: { credentials: LI }, techfetch: { email: 'a@b.c', password: 'p' } });
-    assert.equal(c.blacklight, undefined);
-});
-
-test('REMOTE: credentials.json has blacklight + scraperCredentials, no cookies', () => {
-    const c = buildCredentialsJson({
-        mode: 'remote',
         blacklight: { apiUrl: 'https://b', apiKey: 'bk' },
         scraperCredentials: { apiUrl: 'https://c', apiKey: 'ck' },
     });
@@ -26,17 +16,17 @@ test('REMOTE: credentials.json has blacklight + scraperCredentials, no cookies',
     });
 });
 
-test('buildDotEnv LOCAL: NODE_ENV=development; only chosen flags; omits unset', () => {
-    const env = buildDotEnv({ mode: 'local', headless: false, strictEmpty: false, scraperMode: 'interactive', port: 3001 });
-    assert.match(env, /^NODE_ENV=development$/m);
+test('buildDotEnv: NODE_ENV=production always; only chosen flags; omits unset', () => {
+    const env = buildDotEnv({ headless: false, strictEmpty: false, scraperMode: 'interactive', port: 3001 });
+    assert.match(env, /^NODE_ENV=production$/m);
     assert.doesNotMatch(env, /LINKEDIN_HEADLESS/);
     assert.doesNotMatch(env, /SCRAPER_STRICT_EMPTY/);
     assert.doesNotMatch(env, /^PORT=/m);
     assert.match(env, /^SCRAPER_MODE=interactive$/m);
 });
 
-test('buildDotEnv: sets flags when chosen', () => {
-    const env = buildDotEnv({ mode: 'remote', headless: true, strictEmpty: true, scraperMode: 'daemon', port: 8080 });
+test('buildDotEnv: NODE_ENV=production; sets flags when chosen', () => {
+    const env = buildDotEnv({ headless: true, strictEmpty: true, scraperMode: 'daemon', port: 8080 });
     assert.match(env, /^NODE_ENV=production$/m);
     assert.match(env, /^LINKEDIN_HEADLESS=true$/m);
     assert.match(env, /^SCRAPER_STRICT_EMPTY=true$/m);
@@ -52,11 +42,11 @@ test('mergeCredentials: shallow top-level — next replaces matching key, others
 });
 
 test('mergeDotEnv: next keys overwrite their lines; unrelated existing lines/comments kept', () => {
-    const out = mergeDotEnv('# hdr\nNODE_ENV=production\nKEEP=1\n', 'NODE_ENV=development\nPORT=8080\n');
+    const out = mergeDotEnv('# hdr\nLOG_LEVEL=info\nKEEP=1\n', 'LOG_LEVEL=debug\nPORT=8080\n');
     assert.match(out, /# hdr/);
     assert.match(out, /^KEEP=1$/m);
-    assert.match(out, /^NODE_ENV=development$/m);
-    assert.doesNotMatch(out, /^NODE_ENV=production$/m);
+    assert.match(out, /^LOG_LEVEL=debug$/m);
+    assert.doesNotMatch(out, /^LOG_LEVEL=info$/m);
     assert.match(out, /^PORT=8080$/m);
 });
 

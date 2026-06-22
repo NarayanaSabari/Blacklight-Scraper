@@ -7,33 +7,35 @@ import { runSetupWizard } from '../../src/setup/wizard.js';
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'setupw-')); }
 function scriptedAsk(answers) { let i = 0; return async () => answers[i++]; }
-const okBrowser = async () => ({
-    newContext: async () => ({ addCookies: async () => {}, newPage: async () => ({ goto: async () => {}, url: () => 'https://www.linkedin.com/feed/' }) }),
-    close: async () => {},
+const okFetch = async () => ({
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => ({ ok: true }),
 });
-// Distinctive so the "never echo a cookie value" assertion has teeth.
-const LI = JSON.stringify([{ name: 'li_at', value: 'SEKRIT-LI-AT-7Z', domain: '.www.linkedin.com' }]);
+// The remote/prod flow asks (in order): blacklight apiUrl, blacklight apiKey,
+// scraperCredentials apiUrl, scraperCredentials apiKey, SCRAPER_MODE, headless,
+// strictEmpty, PORT. There is no "run mode" prompt — the scraper is always prod.
+const REMOTE = ['https://b', 'bkey', 'https://c', 'ckey', 'daemon', 'yes', 'no', '3001'];
 
-test('LOCAL: writes credentials.json + .env, returns 0, NEVER echoes the cookie value', async () => {
-    const cwd = tmp(); const out = [];
+test('writes blacklight+scraperCredentials, NODE_ENV=production, returns 0', async () => {
+    const cwd = tmp();
     const code = await runSetupWizard({
         cwd,
-        ask: scriptedAsk(['1', LI, 'done', 'yes', 'no', 'interactive', '3001']),
-        launchFn: okBrowser,
-        isIgnored: () => true,
-        out: (s) => out.push(String(s)),
+        ask: scriptedAsk([...REMOTE]),
+        fetchFn: okFetch,
+        isIgnored: () => true, out: () => {},
     });
     assert.equal(code, 0);
     const cred = JSON.parse(fs.readFileSync(path.join(cwd, 'config', 'credentials.json'), 'utf-8'));
-    assert.ok(Array.isArray(cred.linkedin.credentials) && cred.linkedin.credentials[0].name === 'li_at');
-    assert.match(fs.readFileSync(path.join(cwd, '.env'), 'utf-8'), /^NODE_ENV=development$/m);
-    // Strong AND-style guarantee: the actual secret cookie value must never appear in any output line.
-    assert.ok(!out.join('\n').includes('SEKRIT-LI-AT-7Z'), 'cookie value must never be echoed');
+    assert.equal(cred.blacklight.apiUrl, 'https://b');
+    assert.equal(cred.scraperCredentials.apiKey, 'ckey');
+    assert.ok(cred.linkedin === undefined);
+    assert.match(fs.readFileSync(path.join(cwd, '.env'), 'utf-8'), /^NODE_ENV=production$/m);
 });
 
 test('credentials.json is written 0600 (POSIX)', { skip: process.platform === 'win32' }, async () => {
     const cwd = tmp();
-    await runSetupWizard({ cwd, ask: scriptedAsk(['1', LI, 'done', 'no', 'no', 'interactive', '3001']), launchFn: okBrowser, isIgnored: () => true, out: () => {} });
+    await runSetupWizard({ cwd, ask: scriptedAsk([...REMOTE]), fetchFn: okFetch, isIgnored: () => true, out: () => {} });
     const mode = fs.statSync(path.join(cwd, 'config', 'credentials.json')).mode & 0o777;
     assert.equal(mode, 0o600);
 });
@@ -49,28 +51,25 @@ test('cancel on existing-file prompt writes nothing and returns 1', async () => 
     assert.ok(!out.join('\n').includes('SECRET99'), 'existing secret must not be echoed by the preview');
 });
 
-test('REMOTE: writes blacklight+scraperCredentials, NODE_ENV=production, returns 0', async () => {
-    const cwd = tmp();
+test('NEVER echoes the apiKey secret', async () => {
+    const cwd = tmp(); const out = [];
     const code = await runSetupWizard({
         cwd,
-        ask: scriptedAsk(['2', 'https://b', 'bkey', 'https://c', 'ckey', 'daemon', 'yes', 'no', '3001']),
-        fetchFn: async () => ({ status: 200 }),
-        isIgnored: () => true, out: () => {},
+        ask: scriptedAsk(['https://b', 'SEKRIT-API-KEY-7Z', 'https://c', 'ckey', 'daemon', 'no', 'no', '3001']),
+        fetchFn: okFetch,
+        isIgnored: () => true,
+        out: (s) => out.push(String(s)),
     });
     assert.equal(code, 0);
-    const cred = JSON.parse(fs.readFileSync(path.join(cwd, 'config', 'credentials.json'), 'utf-8'));
-    assert.equal(cred.blacklight.apiUrl, 'https://b');
-    assert.equal(cred.scraperCredentials.apiKey, 'ckey');
-    assert.ok(cred.linkedin === undefined);
-    assert.match(fs.readFileSync(path.join(cwd, '.env'), 'utf-8'), /^NODE_ENV=production$/m);
+    assert.ok(!out.join('\n').includes('SEKRIT-API-KEY-7Z'), 'apiKey value must never be echoed');
 });
 
-test('REMOTE: re-prompts on a non-http(s) apiUrl until valid', async () => {
+test('re-prompts on a non-http(s) apiUrl until valid', async () => {
     const cwd = tmp();
     const code = await runSetupWizard({
         cwd,
-        ask: scriptedAsk(['2', 'ftp://nope', 'https://good', 'bkey', 'https://c', 'ckey', 'daemon', 'yes', 'no', '3001']),
-        fetchFn: async () => ({ status: 200 }),
+        ask: scriptedAsk(['ftp://nope', 'https://good', 'bkey', 'https://c', 'ckey', 'daemon', 'yes', 'no', '3001']),
+        fetchFn: okFetch,
         isIgnored: () => true, out: () => {},
     });
     assert.equal(code, 0);
@@ -85,8 +84,8 @@ test('overwrite replaces an existing config (no merge)', async () => {
     fs.writeFileSync(path.join(cwd, '.env'), 'OLD=1\n');
     const code = await runSetupWizard({
         cwd,
-        ask: scriptedAsk(['overwrite', '2', 'https://b', 'bkey', 'https://c', 'ckey', 'daemon', 'yes', 'no', '3001']),
-        fetchFn: async () => ({ status: 200 }),
+        ask: scriptedAsk(['overwrite', ...REMOTE]),
+        fetchFn: okFetch,
         isIgnored: () => true, out: () => {},
     });
     assert.equal(code, 0);
@@ -103,13 +102,13 @@ test('merge preserves an unrelated existing credential section', async () => {
     fs.writeFileSync(path.join(cwd, 'config', 'credentials.json'), '{"glassdoor":{"credentials":[{"name":"gid"}]}}');
     const code = await runSetupWizard({
         cwd,
-        ask: scriptedAsk(['merge', '1', LI, 'done', 'no', 'no', 'interactive', '3001']),
-        launchFn: okBrowser, isIgnored: () => true, out: () => {},
+        ask: scriptedAsk(['merge', ...REMOTE]),
+        fetchFn: okFetch, isIgnored: () => true, out: () => {},
     });
     assert.equal(code, 0);
     const cred = JSON.parse(fs.readFileSync(path.join(cwd, 'config', 'credentials.json'), 'utf-8'));
     assert.ok(cred.glassdoor && cred.glassdoor.credentials[0].name === 'gid', 'unrelated section preserved');
-    assert.ok(cred.linkedin && cred.linkedin.credentials[0].name === 'li_at', 'new section merged in');
+    assert.ok(cred.blacklight && cred.blacklight.apiUrl === 'https://b', 'new section merged in');
 });
 
 test('merge ABORTS (writes nothing) when the existing credentials file is unparseable', async () => {
@@ -119,8 +118,8 @@ test('merge ABORTS (writes nothing) when the existing credentials file is unpars
     fs.writeFileSync(path.join(cwd, 'config', 'credentials.json'), broken);
     const code = await runSetupWizard({
         cwd,
-        ask: scriptedAsk(['merge', '1', LI, 'done', 'no', 'no', 'interactive', '3001']),
-        launchFn: okBrowser, isIgnored: () => true, out: () => {},
+        ask: scriptedAsk(['merge', ...REMOTE]),
+        fetchFn: okFetch, isIgnored: () => true, out: () => {},
     });
     assert.equal(code, 1);
     assert.equal(fs.readFileSync(path.join(cwd, 'config', 'credentials.json'), 'utf-8'), broken, 'must not destroy the operator file');
@@ -131,8 +130,8 @@ test('git-ignore guard: refuses to write when the target is NOT ignored', async 
     const cwd = tmp();
     const code = await runSetupWizard({
         cwd,
-        ask: scriptedAsk(['2', 'https://b', 'bkey', 'https://c', 'ckey', 'daemon', 'yes', 'no', '3001']),
-        fetchFn: async () => ({ status: 200 }),
+        ask: scriptedAsk([...REMOTE]),
+        fetchFn: okFetch,
         isIgnored: () => false, out: () => {},
     });
     assert.equal(code, 1);
@@ -145,8 +144,8 @@ test('git-ignore guard: unknown status (null) warns + requires confirm; declinin
     const out = [];
     const code = await runSetupWizard({
         cwd,
-        ask: scriptedAsk(['2', 'https://b', 'bkey', 'https://c', 'ckey', 'daemon', 'yes', 'no', '3001', 'n']),
-        fetchFn: async () => ({ status: 200 }),
+        ask: scriptedAsk([...REMOTE, 'n']),
+        fetchFn: okFetch,
         isIgnored: () => null, out: (s) => out.push(String(s)),
     });
     assert.equal(code, 1);

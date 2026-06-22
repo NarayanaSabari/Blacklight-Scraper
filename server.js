@@ -96,7 +96,7 @@ async function main() {
 
     log.info('boot', {
         ...bootInfo,
-        nodeEnv: config.nodeEnv,
+        nodeEnv: 'production',
         port: config.port,
         logLevel: config.logLevel,
         instance: config.telemetry.instance,
@@ -125,11 +125,7 @@ async function main() {
 
     const server = app.listen(config.port, () => {
         log.info('Server listening', { port: config.port, ...bootInfo });
-        if (orchestrator && !config.isDevelopment) {
-            orchestrator.startAutoChecker();
-        } else if (config.isDevelopment) {
-            log.info('Auto queue checker disabled in development mode');
-        }
+        if (orchestrator) orchestrator.startAutoChecker();
     });
 
     // Hard-exit budget: regardless of what goes wrong in shutdown, the
