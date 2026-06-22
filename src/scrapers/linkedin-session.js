@@ -28,6 +28,25 @@ function defaultJitter() {
     return new Promise((r) => setTimeout(r, 500 + Math.floor(Math.random() * 1500)));
 }
 
+// Max-lease rotation window (hours, float) from LINKEDIN_LEASE_ROTATE_HOURS.
+// UNSET / 0 / NaN / <=0 ⇒ null ⇒ time-driven rotation DISABLED (default — the
+// live single-account box is byte-unchanged). H > 0 ⇒ rotate after ~H hours so
+// the scraper never camps one account (the pool hands out the next available
+// account on the re-lease). Reads env unless an explicit value is injected.
+export function linkedinLeaseRotateHours(raw = process.env.LINKEDIN_LEASE_ROTATE_HOURS) {
+    if (raw === undefined || raw === null || raw === '') return null;
+    const h = Number.parseFloat(String(raw));
+    if (!Number.isFinite(h) || h <= 0) return null;
+    return h;
+}
+
+// Returns a multiplier in [0, 1) used to jitter the lease cap by ±20% so a
+// fleet of scrapers doesn't rotate in lockstep. Injectable for deterministic
+// tests; defaults to Math.random.
+function defaultRotationJitter() {
+    return Math.random();
+}
+
 export class LinkedInSession {
     constructor({ apiClient = null, launcher = launchPersistentProfile, platform = 'linkedin',
                   maxLeaseRetries = 10, leaseRetryDelayMs = 60000,
@@ -35,7 +54,14 @@ export class LinkedInSession {
                   // Seams for unit-testing the seed-vs-reuse decision without a
                   // real browser: readCookies pulls the context's current jar,
                   // isAuthed classifies it (li_at present).
-                  readCookies = (ctx) => ctx.cookies(), isAuthed = hasLiAt } = {}) {
+                  readCookies = (ctx) => ctx.cookies(), isAuthed = hasLiAt,
+                  // Time-driven rotation seams. now() is the clock (injectable
+                  // so tests advance time without real timers). rotateHours is
+                  // the configured window (defaults to reading the env);
+                  // rotationJitter returns [0,1) for the ±20% cap jitter.
+                  now = () => Date.now(),
+                  rotateHours = linkedinLeaseRotateHours(),
+                  rotationJitter = defaultRotationJitter } = {}) {
         this._apiClient = apiClient ?? getCredentialsAPIClient();
         this._launch = launcher;
         this._platform = platform;
@@ -48,6 +74,14 @@ export class LinkedInSession {
         this._jitter = jitter;
         this._readCookies = readCookies;
         this._isAuthed = isAuthed;
+        // Rotation state. _rotateHours null ⇒ rotation OFF (default). _maxLeaseMs
+        // is the jittered per-lease deadline, (re)computed in #establish so each
+        // lease has its own stable cap. _establishedAt is the lease birth time.
+        this._now = now;
+        this._rotateHours = linkedinLeaseRotateHours(rotateHours);
+        this._rotationJitter = rotationJitter;
+        this._maxLeaseMs = null;
+        this._establishedAt = 0;
     }
 
     get lease() { return this._lease; }
@@ -64,6 +98,10 @@ export class LinkedInSession {
         const lease = await this.#acquireLease(sessionId);
         if (!lease) throw new Error('No LinkedIn credential available from API');
         this._lease = lease;
+        // Stamp the lease birth time and (re)compute its jittered rotation cap.
+        // Done per (re)establish so every lease gets its own stable deadline.
+        this._establishedAt = this._now();
+        this._maxLeaseMs = this.#computeMaxLeaseMs();
 
         const cred = lease.credential || {};
         const cookies = cred.cookies;
@@ -103,6 +141,24 @@ export class LinkedInSession {
         log.info('Persistent LinkedIn session established', { credentialId: cred.id });
     }
 
+    // Jittered max-lease window in ms, or null when rotation is disabled. Base
+    // is H hours, scaled by 0.8–1.2 (±20%) via the injectable jitter seam.
+    #computeMaxLeaseMs() {
+        if (this._rotateHours == null) return null;
+        const baseMs = this._rotateHours * 60 * 60 * 1000;
+        const r = this._rotationJitter(); // [0, 1)
+        const factor = 0.8 + 0.4 * (Number.isFinite(r) ? r : 0); // 0.8 .. 1.2
+        return baseMs * factor;
+    }
+
+    // True when time-driven rotation is enabled AND the live lease has outlived
+    // its jittered cap. Only meaningful for an already-established context.
+    #leaseExpired() {
+        return this._maxLeaseMs != null
+            && this._context != null
+            && (this._now() - this._establishedAt) > this._maxLeaseMs;
+    }
+
     async #acquireLease(sessionId) {
         for (let i = 0; i < this._maxLeaseRetries; i++) {
             const lease = await this._apiClient.acquire(this._platform, sessionId);
@@ -118,6 +174,17 @@ export class LinkedInSession {
         const release = await this._sem.acquire();
         try {
             await this.ensureReady(sessionId);
+            // Time-driven rotation: if the live lease has aged past its jittered
+            // cap, release + re-lease BEFORE borrowing a page so the pool rotates
+            // us onto the next available account (never camp one account).
+            // Single-flight-safe: we hold the ONLY semaphore slot here
+            // (inUse === 1 ⇒ no sibling is mid-scrape), so tearing down the
+            // shared context can't cascade "context closed" into a sibling; and
+            // the re-establish inside #rotateLease goes through ensureReady's
+            // _establishing guard. With rotation disabled (default) this is inert.
+            if (this._sem.inUse === 1 && this.#leaseExpired()) {
+                await this.#rotateLease(sessionId);
+            }
             // Capture the lease atomically (no await between this and ensureReady)
             // as a stable per-borrower reference: a sibling scrape's reestablish()
             // can null this._lease mid-flight, so the callback uses this captured
@@ -152,6 +219,23 @@ export class LinkedInSession {
         if (this._sem && this._sem.inUse > 0) {
             return;
         }
+        await this.#dropAndReacquire(sessionId);
+    }
+
+    // Time-driven rotation: release the aged lease and re-acquire (the pool
+    // hands out the NEXT available account). Called from withPage ONLY when the
+    // caller holds the sole semaphore slot (inUse === 1), so — unlike
+    // reestablish's AuthError path — there's no busy guard to honor: no sibling
+    // borrower can be disrupted by tearing down the shared context.
+    async #rotateLease(sessionId) {
+        await this.#dropAndReacquire(sessionId);
+    }
+
+    // Shared teardown → release → re-establish. ensureReady's _establishing
+    // guard keeps the re-establish single-flight; #establish re-stamps
+    // _establishedAt + recomputes the jittered cap so the fresh lease isn't
+    // immediately re-rotated.
+    async #dropAndReacquire(sessionId) {
         await this.#teardown();
         try { await this._lease?.release?.(); } catch { /* best-effort */ }
         this._lease = null;
