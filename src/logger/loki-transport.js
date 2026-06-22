@@ -15,6 +15,7 @@
 
 import os from 'os';
 import { createLogger } from './index.js';
+import { getMetrics } from '../metrics/registry.js';
 
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 const DEFAULT_BATCH_MAX = 200;
@@ -187,6 +188,9 @@ export class LokiTransport {
 
         if (this.droppedCount > 0) {
             this.log.warn('log buffer overflow — lines dropped', { dropped: this.droppedCount });
+            // audit L3: surface dropped lines as a metric so a Loki outage /
+            // backpressure is visible on the dashboard, not just in a local warn.
+            try { getMetrics().recordLogLinesDropped(this.droppedCount); } catch { /* metrics best-effort */ }
             this.droppedCount = 0;
         }
     }

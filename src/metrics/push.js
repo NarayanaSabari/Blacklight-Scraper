@@ -87,6 +87,41 @@ export class MetricsPusher {
                 log.warn('final push failed', { err: error.message });
             });
         }
+        // audit M1: opt-in Pushgateway group cleanup. OFF by default so routine
+        // daemon restarts keep their counter history and stay visible on the
+        // dashboard; set TELEMETRY_DELETE_ON_EXIT=true on a host you are
+        // RETIRING so it stops lingering as scraper_up=1 forever (which would
+        // otherwise inflate "Scrapers online" and the lifetime-sum panels).
+        if (this.enabled && process.env.TELEMETRY_DELETE_ON_EXIT === 'true') {
+            log.info('Deleting Pushgateway group on exit (TELEMETRY_DELETE_ON_EXIT)');
+            await this.#deleteGroup().catch((error) => {
+                log.warn('group delete failed', { err: error.message });
+            });
+        }
+    }
+
+    // Ask the telemetry proxy to DELETE this instance's Pushgateway group. The
+    // proxy rebuilds the grouping key from the authenticated API key, so this
+    // can only ever clear THIS scraper's own series.
+    async #deleteGroup() {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), PUSH_TIMEOUT_MS);
+        try {
+            const response = await fetch(buildUrl(this.baseUrl), {
+                method: 'DELETE',
+                headers: {
+                    'X-Scraper-API-Key': this.apiKey,
+                    'X-Scraper-Instance': this.instance,
+                    'X-Scraper-Mode': this.mode,
+                },
+                signal: controller.signal,
+            });
+            if (!response.ok) {
+                log.warn('telemetry proxy delete non-2xx', { status: response.status });
+            }
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     async pushOnce() {
