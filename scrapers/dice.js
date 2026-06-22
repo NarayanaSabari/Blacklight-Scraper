@@ -15,6 +15,7 @@ import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
 import { BlockedError, DomChangedError, NetworkError } from '../src/core/errors.js';
 import { applyResourceBlocking } from '../src/core/resource-blocking.js';
+import { getMetrics } from '../src/metrics/registry.js';
 
 const log = createLogger('dice');
 const logProgress = (_scope, msg) => log.info(msg);
@@ -414,8 +415,14 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
             try { await detailQueue.drop(); } catch (err) { log.warn(`Failed to drop detail queue: ${err.message}`); }
         }
         for (const ctx of contextsToCleanup) {
-            try { await ctx.close(); } catch (err) { log.warn(`Failed to close context: ${err.message}`); }
+            try { await ctx.close(); } catch (err) {
+                log.warn(`Failed to close context: ${err.message}`);
+                getMetrics().recordBrowserCleanupFailure('dice');  // feeds BrowserLeakDetected (audit H1)
+            }
         }
-        try { await browser.close(); } catch (err) { log.warn(`Failed to close browser: ${err.message}`); }
+        try { await browser.close(); } catch (err) {
+            log.warn(`Failed to close browser: ${err.message}`);
+            getMetrics().recordBrowserCleanupFailure('dice');  // feeds BrowserLeakDetected (audit H1)
+        }
     }
 }

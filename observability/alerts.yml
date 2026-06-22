@@ -1,10 +1,17 @@
-# Prometheus alerting rules — committed so the metric↔alert contract is
-# code-reviewable and versioned (audit finding O4). Load into the
-# Prometheus/Alertmanager that scrapes this fleet's Pushgateway.
+# ⚠️ NOT LOADED ANYWHERE — reference copy only (audit finding C2).
 #
-# These fire on the SILENT failure modes Plan 1A/1B make observable: a
-# scraper that returns 0 jobs without throwing, or has not produced a
-# job in hours, while scraper_up is still 1.
+# This file is Prometheus/Alertmanager-native format, but the stack has NO
+# Alertmanager and nothing loads these rules, so as committed they NEVER
+# fired. The four rules below have been ported to Grafana unified-alerting
+# (which DOES have a working email path) at:
+#   hetzner-deployment/production/configs/grafana/provisioning/alerting/job-scraper-alerts.yml
+# Edit the alerts THERE. This file is kept only as the human-readable
+# PromQL reference and as the seed if an Alertmanager is ever stood up.
+#
+# Original intent: committed so the metric↔alert contract is code-reviewable
+# and versioned (audit finding O4). These fire on the SILENT failure modes
+# Plan 1A/1B make observable: a scraper that returns 0 jobs without throwing,
+# or has not produced a job in hours, while scraper_up is still 1.
 groups:
   - name: scraper-anti-bot-durability
     rules:

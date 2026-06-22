@@ -246,6 +246,12 @@ class MetricsRegistry {
             labelNames: ['level', 'scope'],
             registers: reg,
         });
+
+        this.logLinesDroppedTotal = new Counter({
+            name: 'scraper_log_lines_dropped_total',
+            help: 'Log lines dropped before reaching Loki (ring-buffer overflow or sustained push failure). A nonzero rate means logs are being LOST — Loki outage or backpressure — and the live-log panels are incomplete (audit L3).',
+            registers: reg,
+        });
     }
 
     // ---------------------------------------------------------------------
@@ -360,6 +366,11 @@ class MetricsRegistry {
 
     recordLogLine(level, scope) {
         this.#safe(() => this.logLinesTotal.labels(level, scope || 'root').inc());
+    }
+
+    recordLogLinesDropped(count) {
+        if (!count || count < 0) return;
+        this.#safe(() => this.logLinesDroppedTotal.inc(count));
     }
 
     markHeartbeat() {

@@ -9,6 +9,7 @@ import { chromium as chromiumExtra } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { DEFAULT_USER_AGENT, DEFAULT_VIEWPORT } from './fingerprints.js';
 import { createLogger } from '../logger/index.js';
+import { getMetrics } from '../metrics/registry.js';
 
 const log = createLogger('browser');
 
@@ -54,10 +55,14 @@ export async function newDefaultContext(browser, overrides = {}) {
  *
  * @template T
  * @param {(ctx: {browser: import('playwright').Browser, contexts: Array<import('playwright').BrowserContext>}) => Promise<T>} callback
- * @param {{stealth?: boolean, headless?: boolean, launchArgs?: Array<string>}} [opts]
+ * @param {{stealth?: boolean, headless?: boolean, launchArgs?: Array<string>, platform?: string}} [opts]
  * @returns {Promise<T>}
  */
 export async function withBrowser(callback, opts = {}) {
+    // `platform` labels the cleanup-failure metric so BrowserLeakDetected can
+    // point at the offending scraper; defaults to 'unknown' when a caller
+    // doesn't supply it (the alert still fires on the aggregate).
+    const platform = opts.platform ?? 'unknown';
     const browser = await launchBrowser({
         stealth: opts.stealth ?? false,
         headless: opts.headless ?? true,
@@ -70,10 +75,12 @@ export async function withBrowser(callback, opts = {}) {
         for (const ctx of contexts) {
             try { await ctx.close(); } catch (err) {
                 log.warn('Failed to close context during cleanup', { err: err.message });
+                getMetrics().recordBrowserCleanupFailure(platform);
             }
         }
         try { await browser.close(); } catch (err) {
             log.warn('Failed to close browser during cleanup', { err: err.message });
+            getMetrics().recordBrowserCleanupFailure(platform);
         }
     }
 }
