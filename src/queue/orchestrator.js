@@ -18,6 +18,7 @@ import { getScraper } from '../scrapers/registry.js';
 import { Mutex } from './mutex.js';
 import { getMetrics } from '../metrics/registry.js';
 import { platformsOnCooldown } from '../core/platform-cooldowns.js';
+import { TimeoutError } from '../core/errors.js';
 
 const log = createLogger('orchestrator');
 
@@ -184,6 +185,16 @@ export class QueueOrchestrator {
             queueResult = await this.client.getNextRole({ platforms: usablePlatforms });
         } catch (error) {
             metrics.recordQueueCheck('error');
+            // A claim that times out client-side may already have been
+            // COMMITTED by the backend (session + RPQ claim created before our
+            // HTTP read timed out). That orphans the session — the backend
+            // won't issue new work for those platforms until the 1-hour
+            // stale-session sweep. Recover by resuming our active session
+            // instead of stranding it. See incident 2026-06-23.
+            if (error instanceof TimeoutError) {
+                const recovered = await this.#recoverOrphanedSession();
+                if (recovered) return { assignments: [recovered] };
+            }
             throw error;
         }
 
@@ -201,6 +212,44 @@ export class QueueOrchestrator {
             totalPlatforms: assignments.reduce((sum, a) => sum + a.platforms.length, 0),
         });
         return queueResult;
+    }
+
+    /**
+     * Recover an orphaned in-progress session after a claim times out.
+     *
+     * When getNextRole times out, the backend may have already created the
+     * session + claim (the HTTP response was lost in transit). Ask the backend
+     * for our current active session; if it still has pending platforms,
+     * return it as an assignment so runOnce resumes it — finishing the work
+     * rather than stranding it for the 1-hour stale-session sweep. Returns null
+     * when there's nothing to resume (no active session, no pending platforms,
+     * or the lookup itself fails). See incident 2026-06-23.
+     */
+    async #recoverOrphanedSession() {
+        let active;
+        try {
+            active = await this.client.checkActiveSession();
+        } catch (err) {
+            log.warn('Orphaned-session recovery check failed', { err: err.message });
+            return null;
+        }
+        const session = active?.has_active_session ? active.session : null;
+        const platforms = session?.platforms;
+        if (!session || !Array.isArray(platforms) || platforms.length === 0) {
+            return null;
+        }
+        log.warn('Recovered orphaned session after claim timeout — resuming', {
+            sessionId: session.session_id,
+            role: session.role_name,
+            platforms: platforms.map((p) => p.name),
+            scraper_alert: 'orphan_recovered',
+        });
+        this.#metrics().recordQueueCheck('recovered_orphan');
+        return {
+            session_id: session.session_id,
+            role: { name: session.role_name, search_queries: session.search_queries ?? null },
+            platforms,
+        };
     }
 
     /**

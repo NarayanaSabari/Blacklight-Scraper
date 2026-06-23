@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { QueueOrchestrator } from '../../src/queue/orchestrator.js';
+import { TimeoutError } from '../../src/core/errors.js';
 
 function fakeMetrics() {
     const calls = { allFailed: 0, queueCheck: [], jobsSubmitted: [] };
@@ -105,6 +106,53 @@ test('C3: when at least one platform succeeds, recordSessionAllFailed does NOT f
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(m.calls.allFailed, 0, 'recordSessionAllFailed must not fire when a platform succeeded');
     assert.deepEqual(c.calls.completeSession, ['sess-AF']);
+});
+
+test('B: a claim that times out recovers and RESUMES the orphaned active session', async () => {
+    // Incident 2026-06-23: getNextRole timed out client-side AFTER the backend
+    // committed the claim, orphaning the session. The orchestrator must detect
+    // a TimeoutError, ask the backend for its active session, and resume it —
+    // scraping its pending platforms and completing it.
+    const m = fakeMetrics();
+    let claimCalls = 0;
+    let activeChecks = 0;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => ({ indeed: 1 }),
+        getNextRole: async () => {
+            claimCalls += 1;
+            if (claimCalls === 1) throw new TimeoutError('Request timed out after 30000ms');
+            return { assignments: [] };
+        },
+        checkActiveSession: async () => {
+            activeChecks += 1;
+            return {
+                has_active_session: true,
+                session: {
+                    session_id: 'sess-ORPHAN',
+                    role_name: 'Backend Engineer',
+                    search_queries: ['backend engineer'],
+                    platforms: [{ id: 1, name: 'indeed' }],
+                },
+            };
+        },
+    });
+    const resolver = () => ({ execute: async () => [{ id: 1 }] });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: m,
+        scraperResolver: resolver,
+    });
+    // .catch keeps the RED a clean assertion failure: pre-fix runOnce rejects
+    // with the TimeoutError; post-fix it resolves after resuming.
+    await o.runOnce().catch(() => {});
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.ok(activeChecks >= 1, 'should ask the backend for its active session after a claim timeout');
+    const sub = c.calls.submitJobs.find((s) => s.sid === 'sess-ORPHAN');
+    assert.ok(sub, 'orphaned session should be resumed — submitJobs called for its pending platform');
+    assert.equal(sub.p, 'indeed');
+    assert.deepEqual(c.calls.completeSession, ['sess-ORPHAN'], 'resumed session must be completed');
 });
 
 test('O9: a platform returning 0 jobs still submits success but is recorded distinctly', async () => {
