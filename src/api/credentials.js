@@ -34,6 +34,18 @@ const log = createLogger('credentials');
 // Mirrors the backend's reject rules so we never POST a guaranteed-400:
 // local → no-op; jar must be a non-empty array containing a non-empty
 // `li_at`; serialized body must be ≤ 64 KB.
+// Pure decision for the failure-report body. No I/O.
+// Preserves the existing body fields (error_message, cooldown_minutes) and
+// adds auth_dead so the backend can pause a dead account without callers
+// having to construct the body themselves.
+export function planFailureBody({ errorMessage, cooldownMinutes = 0, authDead = false }) {
+    return {
+        error_message: errorMessage,
+        cooldown_minutes: cooldownMinutes,
+        auth_dead: !!authDead,
+    };
+}
+
 export function planCookieRefresh({ isLocal, sessionId, cookies }) {
     if (isLocal) return { action: 'skip', outcome: 'skipped_local' };
     const hasAuth = Array.isArray(cookies) && cookies.length > 0
@@ -184,7 +196,7 @@ export class CredentialsClient {
             get platform() { return lease.platform; },
             get sessionId() { return lease.sessionId; },
             reportSuccess: (message) => this.reportSuccess(lease.leaseKey, message),
-            reportFailure: (msg, cooldownMinutes) => this.reportFailure(lease.leaseKey, msg, cooldownMinutes),
+            reportFailure: (msg, cooldownMinutes, opts) => this.reportFailure(lease.leaseKey, msg, cooldownMinutes, opts),
             refreshCookies: (cookies) => this.refreshCookies(lease.leaseKey, cookies),
             release: () => this.release(lease.leaseKey),
         };
@@ -243,7 +255,7 @@ export class CredentialsClient {
         // failure/release still own lease lifecycle (handoff §4).
     }
 
-    async reportFailure(leaseKeyOrPlatform, errorMessage, cooldownMinutes = 0) {
+    async reportFailure(leaseKeyOrPlatform, errorMessage, cooldownMinutes = 0, { authDead = false } = {}) {
         const lease = this.#resolveLease(leaseKeyOrPlatform);
         if (!lease) {
             log.warn('No active credential to report failure for', { key: leaseKeyOrPlatform });
@@ -254,11 +266,8 @@ export class CredentialsClient {
             return;
         }
         try {
-            await this.#postLeaseAction(lease, 'failure', {
-                error_message: errorMessage,
-                cooldown_minutes: cooldownMinutes,
-            });
-            log.warn('Credential marked failed', { platform: lease.platform, cooldownMinutes });
+            await this.#postLeaseAction(lease, 'failure', planFailureBody({ errorMessage, cooldownMinutes, authDead }));
+            log.warn('Credential marked failed', { platform: lease.platform, cooldownMinutes, authDead });
         } catch (error) {
             log.error('Failed to report credential failure', { platform: lease.platform, err: error.message });
         } finally {
