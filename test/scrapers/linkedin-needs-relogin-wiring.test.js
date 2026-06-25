@@ -16,7 +16,7 @@ import { AuthError } from '../../src/core/errors.js';
 // logged in: launcher returns a context whose cookies() contains no li_at, so
 // #establish throws NEEDS_RELOGIN.  The lease has a reportFailure spy so we
 // can assert exactly how it is called.
-function makeNeeedsReloginSession() {
+function makeNeedsReloginSession() {
     const calls = { launches: 0, reportFailure: [] };
 
     // Context: no li_at cookie → #establish detects "not authed"
@@ -63,7 +63,7 @@ function makeNeeedsReloginSession() {
 }
 
 test('NEEDS_RELOGIN: withPage rejects with NEEDS_RELOGIN error code', async () => {
-    const { session } = makeNeeedsReloginSession();
+    const { session } = makeNeedsReloginSession();
 
     await assert.rejects(
         () => session.withPage('sid', async () => 'x'),
@@ -73,7 +73,7 @@ test('NEEDS_RELOGIN: withPage rejects with NEEDS_RELOGIN error code', async () =
 });
 
 test('NEEDS_RELOGIN: reportFailure called exactly once with authDead: true', async () => {
-    const { session, calls } = makeNeeedsReloginSession();
+    const { session, calls } = makeNeedsReloginSession();
 
     await assert.rejects(
         () => session.withPage('sid', async () => 'x'),
@@ -94,7 +94,7 @@ test('NEEDS_RELOGIN: reportFailure called exactly once with authDead: true', asy
 });
 
 test('NEEDS_RELOGIN: launcher invoked only ONCE — no rotate/retry', async () => {
-    const { session, calls } = makeNeeedsReloginSession();
+    const { session, calls } = makeNeedsReloginSession();
 
     await assert.rejects(
         () => session.withPage('sid', async () => 'x'),

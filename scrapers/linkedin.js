@@ -1750,6 +1750,12 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         //    role failed: keep the warm session, do NOT cool the credential.
         // Always re-throw so BaseScraper records + classifies the role.
         if (error instanceof AuthError) {
+            if (error.code === 'NEEDS_RELOGIN') {
+                // Already handled at the withPage boundary (account reported auth_dead +
+                // paused). Don't write a platform marker, re-report, or reestablish here.
+                logProgress('LinkedIn', '🔒 Account needs re-login — paused; skipping cooldown/reestablish');
+                throw error;
+            }
             logProgress('LinkedIn', '📤 Auth-wall / cookies expired — cooldown + reestablishing session...');
             // Phase 3b — Task B: only the LIVE single-account (LOCAL) box writes
             // the PLATFORM-WIDE cooldown marker on a single account's auth-fail.
