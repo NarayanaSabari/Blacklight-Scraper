@@ -111,7 +111,7 @@ Ephemeral container → volume-mount these. Otherwise: re-download the 350 MB br
 
 ## 7. Environment variables (optional; safe defaults)
 
-`PORT` (3001) · `NODE_ENV` (production) · `SCRAPER_MODE` (`daemon` = offline alerts) · `LOG_LEVEL` · `INSTANCE_ID` · `QUEUE_CHECK_INTERVAL_MS` (30000) · `MONSTER_BLOCK_COOLDOWN_MIN` / `INDEED_BLOCK_COOLDOWN_MIN` / `GLASSDOOR_BLOCK_COOLDOWN_MIN` / `TECHFETCH_BLOCK_COOLDOWN_MIN` (60) · `INDEED_ALLOW_ANONYMOUS` (`1` = Indeed page-1 without a credential) · `LINKEDIN_MAX_CONCURRENCY` (2 — concurrent LinkedIn tabs on the one account; 1 = serialize, 3 = push harder/ban-risk; read at process start) · `SCRAPER_DEFAULT_LOCATION` · CloakBrowser vars (§2).
+`PORT` (3001) · `NODE_ENV` (production) · `SCRAPER_MODE` (`daemon` = offline alerts) · `LOG_LEVEL` · `INSTANCE_ID` · `QUEUE_CHECK_INTERVAL_MS` (30000) · `MONSTER_BLOCK_COOLDOWN_MIN` / `INDEED_BLOCK_COOLDOWN_MIN` / `GLASSDOOR_BLOCK_COOLDOWN_MIN` / `TECHFETCH_BLOCK_COOLDOWN_MIN` (60) · `INDEED_ALLOW_ANONYMOUS` (`1` = Indeed page-1 without a credential) · `LINKEDIN_MAX_CONCURRENCY` (2 — concurrent LinkedIn tabs on the one account; 1 = serialize, 3 = push harder/ban-risk; read at process start) · `LINKEDIN_SINGLEFLIGHT_RELOGIN` (off by default; `1`/`true` = on. When a LinkedIn cookie dies mid-scrape, run ONE coordinated re-login that rotates to a fresh pool account while concurrent tabs wait + retry, instead of wedging the session into a "lease unavailable" storm until a process restart. REMOTE pool mode only — needs ≥1 spare healthy account to rotate to) · `SCRAPER_DEFAULT_LOCATION` · CloakBrowser vars (§2).
 
 ---
 

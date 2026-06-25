@@ -9,7 +9,7 @@ import { launchPersistentProfile, hasLiAt } from '../../scrapers/linkedin.js';
 import { getCredentialsAPIClient } from '../api/credentials.js';
 import { createLogger } from '../logger/index.js';
 import { Semaphore } from '../core/semaphore.js';
-import { NetworkError } from '../core/errors.js';
+import { AuthError, NetworkError } from '../core/errors.js';
 import * as linkedinCooldown from '../core/linkedin-cooldown.js';
 
 const log = createLogger('linkedin-session');
@@ -38,6 +38,17 @@ export function linkedinMaxConcurrency(env = process.env) {
     const n = Number.parseInt(String(raw), 10);
     if (!Number.isFinite(n) || n <= 0) return 2;
     return n;
+}
+
+// Gate for the coordinated single-flight re-login (off by default). When ON, an
+// AuthError mid-scrape triggers ONE coordinated re-login (rotate to a fresh pool
+// account) that concurrent tabs wait on + retry, instead of the legacy
+// bail-when-busy reestablish that wedges the session until a process restart.
+// Override with LINKEDIN_SINGLEFLIGHT_RELOGIN (1/true/yes → on).
+export function linkedinSingleFlightRelogin(env = process.env) {
+    const raw = env?.LINKEDIN_SINGLEFLIGHT_RELOGIN;
+    if (raw === undefined || raw === null) return false;
+    return ['1', 'true', 'yes'].includes(String(raw).trim().toLowerCase());
 }
 
 // Staggered start so the N tabs don't hit LinkedIn in lockstep. 500–2000ms.
@@ -83,7 +94,12 @@ export class LinkedInSession {
                   // pool-unreachable marker write is unit-testable without
                   // touching the real homedir filesystem).
                   cooldown = linkedinCooldown,
-                  poolUnreachableCooldownMs: poolCooldownMs = poolUnreachableCooldownMs() } = {}) {
+                  poolUnreachableCooldownMs: poolCooldownMs = poolUnreachableCooldownMs(),
+                  // Coordinated single-flight re-login (off by default). isAuthFailure
+                  // classifies an in-scrape error as "credential dead → re-login" (an
+                  // AuthError by default); injectable for tests.
+                  singleFlightRelogin = linkedinSingleFlightRelogin(),
+                  isAuthFailure = (e) => e instanceof AuthError } = {}) {
         this._apiClient = apiClient ?? getCredentialsAPIClient();
         this._cooldown = cooldown;
         this._poolUnreachableCooldownMs = poolCooldownMs;
@@ -106,6 +122,16 @@ export class LinkedInSession {
         this._rotationJitter = rotationJitter;
         this._maxLeaseMs = null;
         this._establishedAt = 0;
+        // Single-flight re-login state. _relogin holds the in-flight re-login
+        // promise (so concurrent tabs coordinate on ONE re-login); _openPages
+        // counts live borrowed pages so the re-login can quiesce (never tear
+        // down the shared context under a live tab); _idleWaiters wake when the
+        // last page closes.
+        this._singleFlightRelogin = singleFlightRelogin;
+        this._isAuthFailure = isAuthFailure;
+        this._relogin = null;
+        this._openPages = 0;
+        this._idleWaiters = [];
     }
 
     get lease() { return this._lease; }
@@ -250,49 +276,154 @@ export class LinkedInSession {
     async withPage(sessionId, fn) {
         const release = await this._sem.acquire();
         try {
-            await this.ensureReady(sessionId);
-            // Time-driven rotation: if the live lease has aged past its jittered
-            // cap, release + re-lease BEFORE borrowing a page so the pool rotates
-            // us onto the next available account (never camp one account).
-            // Single-flight-safe: we hold the ONLY semaphore slot here
-            // (inUse === 1 ⇒ no sibling is mid-scrape), so tearing down the
-            // shared context can't cascade "context closed" into a sibling; and
-            // the re-establish inside #rotateLease goes through ensureReady's
-            // _establishing guard. With rotation disabled (default) this is inert.
-            if (this._sem.inUse === 1 && this.#leaseExpired()) {
-                await this.#rotateLease(sessionId);
+            if (this._singleFlightRelogin) {
+                return await this.#borrowWithRelogin(sessionId, fn, 1);
             }
-            // Capture the lease atomically (no await between this and ensureReady)
-            // as a stable per-borrower reference: a sibling scrape's reestablish()
-            // can null this._lease mid-flight, so the callback uses this captured
-            // ref instead of re-reading the shared singleton lease.
-            const lease = this._lease;
-            await this._jitter();            // staggered start (no-op in tests)
-            let page;
-            try {
-                page = await this._context.newPage();
-            } catch {
-                // The shared context was closed (a sibling's reestablish, or a
-                // genuine browser crash). Drop it, re-establish (single-flight),
-                // and retry once so this borrower self-heals instead of failing.
-                this._context = null;
-                await this.ensureReady(sessionId);
-                page = await this._context.newPage();
-            }
-            try { return await fn(page, lease); }
-            finally { await page.close().catch(() => {}); }
+            return await this.#legacyBorrowPage(sessionId, fn);
         } finally {
             release();
         }
     }
 
+    // Legacy borrow-a-page path (single-flight re-login OFF). Byte-unchanged
+    // behavior: an AuthError mid-scrape is NOT retried here — the caller's
+    // reestablish() (bail-when-busy) handles it.
+    async #legacyBorrowPage(sessionId, fn) {
+        await this.ensureReady(sessionId);
+        // Time-driven rotation: if the live lease has aged past its jittered
+        // cap, release + re-lease BEFORE borrowing a page so the pool rotates
+        // us onto the next available account (never camp one account).
+        // Single-flight-safe: we hold the ONLY semaphore slot here
+        // (inUse === 1 ⇒ no sibling is mid-scrape), so tearing down the
+        // shared context can't cascade "context closed" into a sibling; and
+        // the re-establish inside #rotateLease goes through ensureReady's
+        // _establishing guard. With rotation disabled (default) this is inert.
+        if (this._sem.inUse === 1 && this.#leaseExpired()) {
+            await this.#rotateLease(sessionId);
+        }
+        // Capture the lease atomically (no await between this and ensureReady)
+        // as a stable per-borrower reference: a sibling scrape's reestablish()
+        // can null this._lease mid-flight, so the callback uses this captured
+        // ref instead of re-reading the shared singleton lease.
+        const lease = this._lease;
+        await this._jitter();            // staggered start (no-op in tests)
+        let page;
+        try {
+            page = await this._context.newPage();
+        } catch {
+            // The shared context was closed (a sibling's reestablish, or a
+            // genuine browser crash). Drop it, re-establish (single-flight),
+            // and retry once so this borrower self-heals instead of failing.
+            this._context = null;
+            await this.ensureReady(sessionId);
+            page = await this._context.newPage();
+        }
+        try { return await fn(page, lease); }
+        finally { await page.close().catch(() => {}); }
+    }
+
+    // Borrow-a-page path WITH coordinated single-flight re-login. On an AuthError
+    // mid-scrape, trigger ONE re-login (rotate to a fresh pool account) that all
+    // concurrent tabs wait on, then retry the role once on the fresh session —
+    // instead of the legacy wedge-until-restart.
+    async #borrowWithRelogin(sessionId, fn, retriesLeft) {
+        // Park while a re-login is in flight so we proceed on the FRESH session,
+        // not the dead one. A re-login failure rejects _relogin → fall through
+        // and let our own ensureReady surface the real error.
+        while (this._relogin) {
+            try { await this._relogin; } catch { /* handled on our own path */ }
+        }
+        await this.ensureReady(sessionId);
+        if (this._sem.inUse === 1 && this.#leaseExpired()) {
+            await this.#rotateLease(sessionId);
+        }
+        const lease = this._lease;
+        await this._jitter();
+        const page = await this.#openPage(sessionId);
+        let result;
+        let caught = null;
+        try {
+            result = await fn(page, lease);
+        } catch (err) {
+            caught = err;
+        } finally {
+            await this.#closePage(page);
+        }
+        if (!caught) return result;
+        if (retriesLeft > 0 && this._isAuthFailure(caught)) {
+            await this.reloginOnce(sessionId);
+            return await this.#borrowWithRelogin(sessionId, fn, retriesLeft - 1);
+        }
+        throw caught;
+    }
+
+    // Open a borrowed page, tracking it so a concurrent re-login can quiesce.
+    // Keeps the legacy closed-context self-heal (re-establish + retry once).
+    async #openPage(sessionId) {
+        let page;
+        try {
+            page = await this._context.newPage();
+        } catch {
+            this._context = null;
+            await this.ensureReady(sessionId);
+            page = await this._context.newPage();
+        }
+        this._openPages++;
+        return page;
+    }
+
+    // Close a borrowed page and, when the last one closes, wake any re-login
+    // waiting to quiesce.
+    async #closePage(page) {
+        try { await page.close(); } catch { /* best-effort */ }
+        this._openPages--;
+        if (this._openPages === 0) this.#fireIdle();
+    }
+
+    // Single-flight re-login: the FIRST caller performs the re-login; concurrent
+    // callers await the SAME promise. Clears on completion so a later auth death
+    // can re-login again.
+    async reloginOnce(sessionId) {
+        this._relogin ??= this.#performRelogin(sessionId).finally(() => { this._relogin = null; });
+        return this._relogin;
+    }
+
+    // Quiesce (wait for live pages to drain) → drop the dead lease + context →
+    // re-acquire a FRESH pool account → relaunch. Quiescing first guarantees we
+    // never tear down the shared context under a live tab.
+    async #performRelogin(sessionId) {
+        await this.#whenPagesIdle();
+        await this.#dropAndReacquire(sessionId);
+    }
+
+    // Resolves once no page is borrowed (immediately if already idle).
+    #whenPagesIdle() {
+        if (this._openPages === 0) return Promise.resolve();
+        return new Promise((resolve) => { this._idleWaiters.push(resolve); });
+    }
+
+    #fireIdle() {
+        const waiters = this._idleWaiters;
+        this._idleWaiters = [];
+        for (const w of waiters) w();
+    }
+
     async reestablish(sessionId) {
-        // Don't tear down the SHARED context while sibling borrowers are
-        // mid-scrape (concurrent LinkedIn roles) — closing it cascades
-        // "context has been closed" failures into every sibling. Re-launching
-        // the persistent profile can't fix expired cookies anyway (that needs a
-        // manual `npm run linkedin:login`), so when busy we just keep the warm
-        // context; the AuthError caller already applied the credential cooldown.
+        // Single-flight re-login ON: this is a NO-OP. linkedin.js calls
+        // reestablish() from INSIDE the withPage callback (the borrower's page is
+        // still open), so tearing down here would close the shared context under
+        // a live tab. The coordinated re-login instead runs in #borrowWithRelogin
+        // AFTER fn throws + the page closes (quiesced, single-flight, retried).
+        if (this._singleFlightRelogin) {
+            return;
+        }
+        // Legacy (flag OFF): don't tear down the SHARED context while sibling
+        // borrowers are mid-scrape (concurrent LinkedIn roles) — closing it
+        // cascades "context has been closed" failures into every sibling.
+        // Re-launching the persistent profile can't fix expired cookies anyway
+        // (that needs a manual `npm run linkedin:login`), so when busy we just
+        // keep the warm context; the AuthError caller already applied the
+        // credential cooldown.
         if (this._sem && this._sem.inUse > 0) {
             return;
         }
