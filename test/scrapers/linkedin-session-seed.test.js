@@ -33,20 +33,17 @@ function harness({ credential, contextJar = [] } = {}) {
     return { apiClient, launcher, ctx, launchOpts };
 }
 
-test('SEED: per-account lease (cookies + profile_key) + unauthed context → addCookies + profileKey/proxy threaded', async () => {
+test('per-account lease + unauthed profile → throws NEEDS_RELOGIN, never seeds cookies', async () => {
     const credential = {
         id: 42, profile_key: 'acct-42', proxy: 'http://u:p@host:8080', cookies: SEED_COOKIES,
     };
     const h = harness({ credential, contextJar: [] }); // empty/unauthed context
     const s = new LinkedInSession({ apiClient: h.apiClient, launcher: h.launcher });
-    await s.ensureReady('sess-seed');
-
-    // profile_key + proxy threaded into the launch
-    assert.equal(h.launchOpts.length, 1);
+    await assert.rejects(s.ensureReady('sess-seed'), (e) => e?.code === 'NEEDS_RELOGIN');
+    // profile_key + proxy were still threaded into the launch (before the auth check)
     assert.deepEqual(h.launchOpts[0], { profileKey: 'acct-42', proxy: 'http://u:p@host:8080' });
-    // unauthed → seeded exactly once with the lease cookies
-    assert.equal(h.ctx.addCookiesCalls.length, 1);
-    assert.deepEqual(h.ctx.addCookiesCalls[0], SEED_COOKIES);
+    // warm-profile model NEVER injects leased cookies
+    assert.equal(h.ctx.addCookiesCalls.length, 0, 'warm-profile model never injects cookies');
 });
 
 test('REUSE: per-account lease but context already has li_at → NO addCookies (age the context)', async () => {
@@ -75,13 +72,14 @@ test('LEGACY: no profile_key → exact current behavior (fixed dir, no proxy, no
     assert.equal(h.ctx.addCookiesCalls.length, 0, 'legacy path never seeds cookies');
 });
 
-test('LEGACY: profile_key present but cookies absent → legacy path (no addCookies, no per-account launch)', async () => {
+test('per-account lease (profile_key, no leased cookies) + authed profile → per-account launch, no injection', async () => {
     const credential = { id: 12, profile_key: 'acct-12', proxy: 'http://p', cookies: null };
-    const h = harness({ credential, contextJar: [] });
+    const authedJar = [{ name: 'li_at', value: 'EXISTING-VALID', domain: '.linkedin.com', path: '/' }];
+    const h = harness({ credential, contextJar: authedJar });
     const s = new LinkedInSession({ apiClient: h.apiClient, launcher: h.launcher });
     await s.ensureReady('sess-half-1');
-
-    assert.equal(h.launchOpts[0], undefined, 'no cookies → must not activate per-account launch');
+    // profile_key ALONE activates the per-account launch (cookies no longer required)
+    assert.deepEqual(h.launchOpts[0], { profileKey: 'acct-12', proxy: 'http://p' });
     assert.equal(h.ctx.addCookiesCalls.length, 0);
 });
 
