@@ -252,6 +252,17 @@ export function profileDirFor(profileKey) {
     return `${base}-${safe}`;
 }
 
+// Deterministic CloakBrowser fingerprint seed per account. Same profile_key
+// always maps to the same synthetic device, so the one-time login and every
+// scrape present an IDENTICAL device to LinkedIn (CloakBrowser otherwise
+// randomizes --fingerprint per launch — see config.js:184).
+export function fingerprintSeedFor(profileKey) {
+    const s = String(profileKey ?? 'default');
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return 10000 + (h % 90000);
+}
+
 // Launch the persistent stealth profile. Returns a Playwright BrowserContext
 // directly (cloakbrowser.launchPersistentContext has no separate Browser
 // handle — close the context to tear down).
