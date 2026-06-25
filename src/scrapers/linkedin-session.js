@@ -272,6 +272,16 @@ export class LinkedInSession {
                 return await this.#borrowWithRelogin(sessionId, fn, 1);
             }
             return await this.#legacyBorrowPage(sessionId, fn);
+        } catch (err) {
+            if (err?.code === 'NEEDS_RELOGIN') {
+                // Pause this account: report it dead so the backend flips it to
+                // needs_relogin and excludes it from claim. Best-effort; never mask
+                // the original error. Do NOT trigger a re-login/rotate — that would
+                // just storm onto other un-logged-in accounts.
+                try { await this._lease?.reportFailure?.(err.message, 0, { authDead: true }); }
+                catch { /* reporting is best-effort */ }
+            }
+            throw err;
         } finally {
             release();
         }
