@@ -289,6 +289,17 @@ export async function launchPersistentProfile({ profileKey = null, proxy = null 
         locale: 'en-US',
         timezoneId: 'America/New_York',
     };
+    // Pin a STABLE per-account device. Without this CloakBrowser randomizes the
+    // fingerprint each launch (config.js:184) → LinkedIn sees a new device at
+    // login and challenges. buildArgs dedups by flag key (defaults < user args),
+    // so these override the random default. Legacy (no profileKey) left as-is.
+    if (profileKey) {
+        opts.args = [
+            ...(opts.args ?? []),
+            `--fingerprint=${fingerprintSeedFor(profileKey)}`,
+            '--fingerprint-platform=windows',
+        ];
+    }
     // Only attach a proxy when one is actually present — absent proxy MUST
     // leave the launch options identical to the legacy path. Pool proxies are
     // stored as "host:port:user:pass"; parseProxyLine turns that into
