@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { LinkedInSession } from '../../src/scrapers/linkedin-session.js';
+import { AuthError } from '../../src/core/errors.js';
 
 function warmDeps({ authed }) {
     const calls = { launchedWith: null, addCookies: 0 };
@@ -27,4 +28,18 @@ test('per-account establish reuses the warm profile and NEVER injects cookies', 
     assert.deepEqual(d.calls.launchedWith, { profileKey: 'li-acct-1', proxy: 'host:1:u:p' });
     assert.equal(d.calls.addCookies, 0, 'no cookie injection in the warm-profile model');
     assert.ok(s.isAlive());
+});
+
+test('per-account establish with a NOT-logged-in profile throws NEEDS_RELOGIN, never injects/logs in', async () => {
+    const d = warmDeps({ authed: false });
+    const s = new LinkedInSession({
+        apiClient: d.apiClient, launcher: d.launcher, maxConcurrency: 1,
+        jitter: () => Promise.resolve(), readCookies: (c) => c.cookies(), isAuthed: d.isAuthed,
+    });
+    await assert.rejects(
+        s.ensureReady('sid'),
+        (e) => e instanceof AuthError && e.code === 'NEEDS_RELOGIN',
+    );
+    assert.equal(d.calls.addCookies, 0, 'never injects');
+    assert.equal(s.isAlive(), false, 'probe context torn down');
 });

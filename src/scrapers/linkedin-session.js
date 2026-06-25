@@ -176,8 +176,10 @@ export class LinkedInSession {
             if (authed) {
                 log.info('Reusing warm LinkedIn profile', { credentialId: cred.id, profileKey });
             } else {
-                // Handled in Task 4 (throw needs-relogin). Temporary for this task:
-                log.warn('Warm LinkedIn profile not authed', { credentialId: cred.id, profileKey });
+                await this.#teardown(); // don't leave a dead context alive
+                throw new AuthError(
+                    'LinkedIn account not logged in — needs re-login',
+                    { platform: 'linkedin', code: 'NEEDS_RELOGIN' });
             }
         } else {
             // launchPersistentProfile returns a BrowserContext directly (no
