@@ -410,22 +410,52 @@ export function canPasswordLogin(cred) {
         && typeof cred.password === 'string' && cred.password.length > 0;
 }
 
+// LinkedIn cookie-auth doesn't settle instantly: navigating to /feed/ can bounce
+// through a sign-in interstitial for 5–10s before the session hydrates and lands
+// back on the feed. Override the wait window with LINKEDIN_AUTH_SETTLE_MS (ms).
+export function authSettleTimeoutMs(env = process.env) {
+    const n = Number.parseInt(String(env?.LINKEDIN_AUTH_SETTLE_MS ?? ''), 10);
+    return Number.isFinite(n) && n > 0 ? n : 15000;
+}
+
+// Poll for the authenticated URL across the settle window instead of checking
+// ONCE after a fixed delay. A still-redirecting page must NOT be misread as
+// "cookies expired" — that wrongly cools a healthy cookie-only account (prod
+// 2026-06-25: the 3–5s fixed check fired before LinkedIn's redirect settled).
+// Returns true the instant the feed settles; false only after the full window.
+export async function waitForAuthenticated(page, {
+    timeoutMs = authSettleTimeoutMs(),
+    pollMs = 1000,
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    now = () => Date.now(),
+} = {}) {
+    const deadline = now() + timeoutMs;
+    for (;;) {
+        if (isAuthenticatedPage(page.url())) return true;
+        if (now() >= deadline) return false;
+        await sleep(pollMs);
+    }
+}
+
 async function ensureLoggedIn(page) {
     logProgress('LinkedIn', '🔐 Verifying authentication status...');
-    
+
     // Navigate to feed to reliably check login state
     await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await randomDelay(3000, 5000);
-    
-    const currentUrl = page.url();
-    logProgress('LinkedIn', `   Current URL after feed navigation: ${currentUrl}`);
-    
+
+    // Poll for the redirect to settle (up to ~15s) rather than checking once
+    // after a fixed 3–5s wait — LinkedIn's cookie session can take 5–10s to
+    // hydrate and bounce /feed/ → /login → back to /feed/. Checking too early
+    // misreads a mid-redirect page as "cookies expired" and cools the account.
+    const authed = await waitForAuthenticated(page);
+    logProgress('LinkedIn', `   URL after feed navigation settled: ${page.url()}`);
+
     // If we landed on the feed, we're logged in
-    if (isAuthenticatedPage(currentUrl)) {
+    if (authed) {
         logProgress('LinkedIn', '✅ Already logged in (verified via feed navigation)');
         return true;
     }
-    
+
     // §5: a cookie-only credential cannot password-login. Fail typed &
     // recoverable instead of crashing on `for (const c of CONFIG.email)`.
     // CONFIG.{email,password} are set from the leased credential in
