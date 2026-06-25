@@ -161,33 +161,23 @@ export class LinkedInSession {
         this._maxLeaseMs = this.#computeMaxLeaseMs();
 
         const cred = lease.credential || {};
-        const cookies = cred.cookies;
         const profileKey = cred.profile_key;
-        // Per-account seed+proxy path activates ONLY when the lease carries
-        // BOTH a non-empty cookie jar AND a profile_key (future A3 accounts).
-        // When either is absent (local mode / current accounts) the behavior is
-        // byte-identical to before: launchPersistentProfile() with NO args
-        // (fixed dir, no proxy) and NO cookie injection.
-        const perAccount = Array.isArray(cookies) && cookies.length > 0 && !!profileKey;
+        // Per-account warm-profile model: gate on profile_key ALONE. The on-disk
+        // profile (logged in once via the per-account login command) is the only
+        // session source — we NEVER inject leased cookies (that mismatches the
+        // device fingerprint and triggers LinkedIn's security-code challenge).
+        const perAccount = !!profileKey;
 
         if (perAccount) {
-            // Launch the per-account on-disk profile, routed through the
-            // account's static proxy (Task 2 threads profileKey + proxy).
             this._context = await this._launch({ profileKey, proxy: cred.proxy ?? null });
-            // Seed-vs-reuse: only seed when the aged profile lacks valid auth
-            // (no li_at). An already-authed profile is reused (organic aging) —
-            // reseeding would clobber a fresher in-profile session.
             let authed = false;
-            try {
-                authed = this._isAuthed(await this._readCookies(this._context));
-            } catch { authed = false; }
-            if (!authed) {
-                await this._context.addCookies(cookies);
-                log.info('Seeded LinkedIn profile from leased cookie jar', {
-                    credentialId: cred.id, profileKey, cookies: cookies.length });
+            try { authed = this._isAuthed(await this._readCookies(this._context)); }
+            catch { authed = false; }
+            if (authed) {
+                log.info('Reusing warm LinkedIn profile', { credentialId: cred.id, profileKey });
             } else {
-                log.info('Reusing authed LinkedIn profile (no reseed)', {
-                    credentialId: cred.id, profileKey });
+                // Handled in Task 4 (throw needs-relogin). Temporary for this task:
+                log.warn('Warm LinkedIn profile not authed', { credentialId: cred.id, profileKey });
             }
         } else {
             // launchPersistentProfile returns a BrowserContext directly (no
