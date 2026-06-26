@@ -263,6 +263,19 @@ export function fingerprintSeedFor(profileKey) {
     return 10000 + (h % 90000);
 }
 
+// Which OS the fingerprint should present. Default to the HOST OS — macos on a
+// Mac, windows elsewhere (mirrors CloakBrowser's own getDefaultStealthArgs). A
+// host-matched platform keeps GPU/UA consistent; spoofing windows on Mac
+// hardware leaks the real Apple GPU and gets flagged. Since the warm profile is
+// machine-local (login + scrape on the SAME host), the host OS is self-consistent.
+// Override with LINKEDIN_FINGERPRINT_PLATFORM (macos|windows|linux) if a host
+// must spoof a different OS.
+export function fingerprintPlatform(env = process.env, platform = process.platform) {
+    const override = env?.LINKEDIN_FINGERPRINT_PLATFORM;
+    if (override && String(override).trim()) return String(override).trim().toLowerCase();
+    return platform === 'darwin' ? 'macos' : 'windows';
+}
+
 // Launch the persistent stealth profile. Returns a Playwright BrowserContext
 // directly (cloakbrowser.launchPersistentContext has no separate Browser
 // handle — close the context to tear down).
@@ -292,12 +305,14 @@ export async function launchPersistentProfile({ profileKey = null, proxy = null 
     // Pin a STABLE per-account device. Without this CloakBrowser randomizes the
     // fingerprint each launch (config.js:184) → LinkedIn sees a new device at
     // login and challenges. buildArgs dedups by flag key (defaults < user args),
-    // so these override the random default. Legacy (no profileKey) left as-is.
+    // so these override the random default. The platform tracks the HOST OS
+    // (fingerprintPlatform) so a Mac presents a native Mac device and a Windows
+    // box a native Windows one. Legacy (no profileKey) left as-is.
     if (profileKey) {
         opts.args = [
             ...(opts.args ?? []),
             `--fingerprint=${fingerprintSeedFor(profileKey)}`,
-            '--fingerprint-platform=windows',
+            `--fingerprint-platform=${fingerprintPlatform()}`,
         ];
     }
     // Only attach a proxy when one is actually present — absent proxy MUST
