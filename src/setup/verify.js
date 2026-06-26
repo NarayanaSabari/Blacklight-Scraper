@@ -91,9 +91,16 @@ export async function verifyRemote({ fetchFn, blacklight, scraperCredentials }) 
             let body;
             try { body = await x.response.json(); }
             catch (_e) { return { status: 'bad', message: `❌ ${x.label} API response was not parseable JSON.` }; }
-            const hasExpected = body && typeof body === 'object'
+            const isObj = body && typeof body === 'object' && !Array.isArray(body);
+            const hasExpected = isObj
                 && EXPECTED_KEYS.some((k) => Object.prototype.hasOwnProperty.call(body, k));
-            if (!hasExpected) {
+            // The /availability endpoint returns a platform→count map (e.g.
+            // {"linkedin":2,...}) — a healthy response that contains none of
+            // EXPECTED_KEYS. Accept any non-empty all-numeric object as valid.
+            const isCountMap = isObj
+                && Object.keys(body).length > 0
+                && Object.values(body).every((v) => typeof v === 'number');
+            if (!hasExpected && !isCountMap) {
                 return { status: 'bad', message: `❌ ${x.label} API returned an unexpected schema (no ${EXPECTED_KEYS.join('/')}); check the URL points at the right service.` };
             }
         }

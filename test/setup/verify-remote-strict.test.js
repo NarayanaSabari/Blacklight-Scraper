@@ -65,6 +65,25 @@ test('verifyRemote: 200 + JSON missing expected keys → bad', async () => {
     assert.match(res.message, /unexpected/i);
 });
 
+test('verifyRemote: credentials availability {platform: count} map → ok (not "unexpected schema")', async () => {
+    // /api/scraper-credentials/queue/availability legitimately returns a
+    // platform→count map (e.g. {"linkedin":2,...}) — a healthy 200 response that
+    // contains NONE of the EXPECTED_KEYS words. It must be accepted, not flagged.
+    const fetchFn = async (url) => ({
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => String(url).includes('availability')
+            ? { dice: 999, glassdoor: 999, indeed: 999, linkedin: 2, monster: 999, techfetch: 999 }
+            : { has_active_session: false, session: null },
+    });
+    const res = await verifyRemote({
+        fetchFn,
+        blacklight: { apiUrl: 'https://b', apiKey: 'K' },
+        scraperCredentials: { apiUrl: 'https://c', apiKey: 'K' },
+    });
+    assert.equal(res.status, 'ok');
+});
+
 test('verifyRemote: network throw → warn (unchanged)', async () => {
     const fetchFn = async () => { throw new Error('ENOTFOUND'); };
     const res = await verifyRemote({
