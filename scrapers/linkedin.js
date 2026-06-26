@@ -130,6 +130,27 @@ export function postSourceUrl(postUrl) {
     return u;
 }
 
+// Import policy (LinkedIn ONLY): a post whose permalink we could not resolve is
+// NOT importable — we drop it rather than ship a link-less job. A row is
+// importable iff its `url` is a real absolute http(s) link. Rejects '' (the
+// unresolved case), the normalizeJobData 'N/A' placeholder, whitespace, and any
+// scheme-less fragment. Mirrors the "empty is better than wrong" producer above.
+export function hasImportableUrl(url) {
+    if (typeof url !== 'string') return false;
+    return /^https?:\/\/\S/.test(url.trim());
+}
+
+// Preserve BaseScraper's block-detection when the import filter empties a batch.
+// BaseScraper treats a 0-job return with emptyConfirmed=false as a SUSPECTED
+// BLOCK (warn + cooldown). If the filter drops every post but we DID extract
+// real posts (extractedCount > 0), that is a clean empty — not a block — so we
+// must report confirmed-empty. Genuine 0-extraction still relies on the page's
+// own no-results signal (pageConfirmedEmpty).
+export function confirmedEmptyAfterLinkFilter({ importableCount, extractedCount, pageConfirmedEmpty }) {
+    if (importableCount > 0) return false;
+    return extractedCount > 0 || !!pageConfirmedEmpty;
+}
+
 // Decode the post's activity id from the "Report post" link that LinkedIn
 // renders inside the "···" control menu — its href carries
 // `updateUrn=urn:li:activity:<id>` (URL-encoded). This is the post's OWN urn
@@ -1724,11 +1745,25 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
             return normalizeJobData(jobObj, 'LinkedIn');
         });
 
+        // Import policy (LinkedIn ONLY): drop any post we couldn't resolve a
+        // permalink for — a link-less job is not importable. The activity URN
+        // can't always be read from the "···" menu (see resolvePostUrlViaMenu),
+        // and we never fall back to the author /in/ profile, so those rows land
+        // here with an empty url. Filter them out instead of shipping them.
+        const importablePosts = normalizedPosts.filter((p) => hasImportableUrl(p?.url));
+        const droppedNoLink = normalizedPosts.length - importablePosts.length;
+        if (droppedNoLink > 0) {
+            logProgress('LinkedIn',
+                `   🔗 Dropped ${droppedNoLink} link-less post(s); ${importablePosts.length} importable.`);
+        }
+
         // L1: 0 posts is NOT automatically success. In STRICT mode, if
-        // nothing was extracted and the page didn't positively show a
-        // LinkedIn "no results" state, treat it as a suspected silent
-        // block / DOM change and fail loudly (classified metric +
-        // cooldown via the catch below) rather than reportSuccess([]).
+        // nothing was EXTRACTED (pre-filter) and the page didn't positively
+        // show a LinkedIn "no results" state, treat it as a suspected silent
+        // block / DOM change and fail loudly (classified metric + cooldown via
+        // the catch below) rather than reportSuccess([]). NB: this guards on
+        // extraction count, not the post-filter count — an all-link-less batch
+        // is a clean empty, not a block (handled in the return below).
         let emptyConfirmed = false;
         if (normalizedPosts.length === 0) {
             const html = await page.content().catch(() => '');
@@ -1745,12 +1780,21 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         // Per-role liveness against the held lease. Persistent session
         // stays warm; no per-role cookie write-back (no per-role browser
         // close means no close-time poison to work around).
-        await lease?.reportSuccess?.(`Scraped ${normalizedPosts.length} posts successfully`);
+        await lease?.reportSuccess?.(
+            `Scraped ${normalizedPosts.length} posts (${importablePosts.length} importable with links)`);
 
         // BaseScraper (Plan 1A) accepts Array OR { jobs, emptyConfirmed }.
-        // emptyConfirmed only when LinkedIn positively showed no-results;
-        // behavior-neutral for the jobs payload when OFF.
-        return { jobs: normalizedPosts, emptyConfirmed: emptyConfirmed && normalizedPosts.length === 0 };
+        // Only the importable (link-bearing) posts are returned. When the filter
+        // empties a batch that DID extract posts, confirmedEmptyAfterLinkFilter
+        // marks it confirmed-empty so BaseScraper doesn't misread it as a block.
+        return {
+            jobs: importablePosts,
+            emptyConfirmed: confirmedEmptyAfterLinkFilter({
+                importableCount: importablePosts.length,
+                extractedCount: normalizedPosts.length,
+                pageConfirmedEmpty: emptyConfirmed,
+            }),
+        };
 
         });
     } catch (error) {

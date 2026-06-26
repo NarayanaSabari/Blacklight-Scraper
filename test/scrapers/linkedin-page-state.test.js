@@ -63,7 +63,9 @@ test('the new 0-posts throw is STRICT-gated', () => {
     assert.match(SRC, /if\s*\(\s*STRICT\b[^)]*\)\s*\{[^}]*throw new DomChangedError/s);
 });
 test('scrapeLinkedIn returns the {jobs, emptyConfirmed} contract', () => {
-    assert.match(SRC, /return\s*\{\s*jobs:\s*normalizedPosts\s*,\s*emptyConfirmed/);
+    // jobs is the link-filtered set (importablePosts); emptyConfirmed is derived
+    // via confirmedEmptyAfterLinkFilter so an all-link-less batch isn't a block.
+    assert.match(SRC, /return\s*\{\s*jobs:\s*importablePosts\s*,\s*emptyConfirmed:\s*confirmedEmptyAfterLinkFilter/);
 });
 test('D4: sameSite never passes the raw value through', () => {
     assert.doesNotMatch(SRC, /:\s*c\.sameSite\s*\|\|\s*'Lax'/);
