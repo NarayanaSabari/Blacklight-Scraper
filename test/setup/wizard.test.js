@@ -12,30 +12,50 @@ const okFetch = async () => ({
     headers: { get: () => 'application/json' },
     json: async () => ({ ok: true }),
 });
-// The remote/prod flow asks (in order): blacklight apiUrl, blacklight apiKey,
-// scraperCredentials apiUrl, scraperCredentials apiKey, SCRAPER_MODE, headless,
-// strictEmpty, PORT. There is no "run mode" prompt — the scraper is always prod.
-const REMOTE = ['https://b', 'bkey', 'https://c', 'ckey', 'daemon', 'yes', 'no', '3001'];
+// The remote/prod flow no longer prompts for URLs — the API URL is a default
+// (injected here as deps.defaultApiUrl, overridable in prod via BLACKLIGHT_API_URL).
+// It asks, in order: API key, SCRAPER_MODE, headless, strictEmpty, PORT.
+const REMOTE = ['mykey', 'daemon', 'yes', 'no', '3001'];
 
-test('writes blacklight+scraperCredentials, NODE_ENV=production, returns 0', async () => {
+test('defaults the apiUrl, asks ONLY for the key, applies it to both sections', async () => {
     const cwd = tmp();
     const code = await runSetupWizard({
         cwd,
+        defaultApiUrl: 'https://default-api',
         ask: scriptedAsk([...REMOTE]),
         fetchFn: okFetch,
         isIgnored: () => true, out: () => {},
     });
     assert.equal(code, 0);
     const cred = JSON.parse(fs.readFileSync(path.join(cwd, 'config', 'credentials.json'), 'utf-8'));
-    assert.equal(cred.blacklight.apiUrl, 'https://b');
-    assert.equal(cred.scraperCredentials.apiKey, 'ckey');
+    assert.equal(cred.blacklight.apiUrl, 'https://default-api');
+    assert.equal(cred.scraperCredentials.apiUrl, 'https://default-api');
+    assert.equal(cred.blacklight.apiKey, 'mykey');
+    assert.equal(cred.scraperCredentials.apiKey, 'mykey', 'the one key is applied to both sections');
     assert.ok(cred.linkedin === undefined);
     assert.match(fs.readFileSync(path.join(cwd, '.env'), 'utf-8'), /^NODE_ENV=production$/m);
 });
 
+test('BLACKLIGHT_API_URL env overrides the default when not injected', async () => {
+    const cwd = tmp();
+    const prev = process.env.BLACKLIGHT_API_URL;
+    process.env.BLACKLIGHT_API_URL = 'https://env-api';
+    try {
+        const code = await runSetupWizard({
+            cwd, ask: scriptedAsk([...REMOTE]), fetchFn: okFetch, isIgnored: () => true, out: () => {},
+        });
+        assert.equal(code, 0);
+        const cred = JSON.parse(fs.readFileSync(path.join(cwd, 'config', 'credentials.json'), 'utf-8'));
+        assert.equal(cred.blacklight.apiUrl, 'https://env-api');
+    } finally {
+        if (prev === undefined) delete process.env.BLACKLIGHT_API_URL;
+        else process.env.BLACKLIGHT_API_URL = prev;
+    }
+});
+
 test('credentials.json is written 0600 (POSIX)', { skip: process.platform === 'win32' }, async () => {
     const cwd = tmp();
-    await runSetupWizard({ cwd, ask: scriptedAsk([...REMOTE]), fetchFn: okFetch, isIgnored: () => true, out: () => {} });
+    await runSetupWizard({ cwd, defaultApiUrl: 'https://d', ask: scriptedAsk([...REMOTE]), fetchFn: okFetch, isIgnored: () => true, out: () => {} });
     const mode = fs.statSync(path.join(cwd, 'config', 'credentials.json')).mode & 0o777;
     assert.equal(mode, 0o600);
 });
@@ -55,26 +75,14 @@ test('NEVER echoes the apiKey secret', async () => {
     const cwd = tmp(); const out = [];
     const code = await runSetupWizard({
         cwd,
-        ask: scriptedAsk(['https://b', 'SEKRIT-API-KEY-7Z', 'https://c', 'ckey', 'daemon', 'no', 'no', '3001']),
+        defaultApiUrl: 'https://d',
+        ask: scriptedAsk(['SEKRIT-API-KEY-7Z', 'daemon', 'no', 'no', '3001']),
         fetchFn: okFetch,
         isIgnored: () => true,
         out: (s) => out.push(String(s)),
     });
     assert.equal(code, 0);
     assert.ok(!out.join('\n').includes('SEKRIT-API-KEY-7Z'), 'apiKey value must never be echoed');
-});
-
-test('re-prompts on a non-http(s) apiUrl until valid', async () => {
-    const cwd = tmp();
-    const code = await runSetupWizard({
-        cwd,
-        ask: scriptedAsk(['ftp://nope', 'https://good', 'bkey', 'https://c', 'ckey', 'daemon', 'yes', 'no', '3001']),
-        fetchFn: okFetch,
-        isIgnored: () => true, out: () => {},
-    });
-    assert.equal(code, 0);
-    const cred = JSON.parse(fs.readFileSync(path.join(cwd, 'config', 'credentials.json'), 'utf-8'));
-    assert.equal(cred.blacklight.apiUrl, 'https://good');
 });
 
 test('overwrite replaces an existing config (no merge)', async () => {
@@ -84,6 +92,7 @@ test('overwrite replaces an existing config (no merge)', async () => {
     fs.writeFileSync(path.join(cwd, '.env'), 'OLD=1\n');
     const code = await runSetupWizard({
         cwd,
+        defaultApiUrl: 'https://b',
         ask: scriptedAsk(['overwrite', ...REMOTE]),
         fetchFn: okFetch,
         isIgnored: () => true, out: () => {},
@@ -102,6 +111,7 @@ test('merge preserves an unrelated existing credential section', async () => {
     fs.writeFileSync(path.join(cwd, 'config', 'credentials.json'), '{"glassdoor":{"credentials":[{"name":"gid"}]}}');
     const code = await runSetupWizard({
         cwd,
+        defaultApiUrl: 'https://b',
         ask: scriptedAsk(['merge', ...REMOTE]),
         fetchFn: okFetch, isIgnored: () => true, out: () => {},
     });
@@ -118,6 +128,7 @@ test('merge ABORTS (writes nothing) when the existing credentials file is unpars
     fs.writeFileSync(path.join(cwd, 'config', 'credentials.json'), broken);
     const code = await runSetupWizard({
         cwd,
+        defaultApiUrl: 'https://b',
         ask: scriptedAsk(['merge', ...REMOTE]),
         fetchFn: okFetch, isIgnored: () => true, out: () => {},
     });
@@ -130,6 +141,7 @@ test('git-ignore guard: refuses to write when the target is NOT ignored', async 
     const cwd = tmp();
     const code = await runSetupWizard({
         cwd,
+        defaultApiUrl: 'https://b',
         ask: scriptedAsk([...REMOTE]),
         fetchFn: okFetch,
         isIgnored: () => false, out: () => {},
@@ -144,6 +156,7 @@ test('git-ignore guard: unknown status (null) warns + requires confirm; declinin
     const out = [];
     const code = await runSetupWizard({
         cwd,
+        defaultApiUrl: 'https://b',
         ask: scriptedAsk([...REMOTE, 'n']),
         fetchFn: okFetch,
         isIgnored: () => null, out: (s) => out.push(String(s)),

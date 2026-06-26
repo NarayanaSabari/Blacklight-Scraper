@@ -18,12 +18,18 @@ function maskValue(v) {
     return s.length > 8 ? `••••${s.slice(-4)}` : '••••';
 }
 
+// The scraper always talks to the production backend, so setup only needs the
+// API key — the URL is a constant. Override with BLACKLIGHT_API_URL (e.g. to
+// point a host at the dev backend), or inject deps.defaultApiUrl in tests.
+const DEFAULT_API_URL = 'https://api.qpeakhire.com';
+
 export async function runSetupWizard(deps = {}) {
     const cwd = deps.cwd || process.cwd();
     const ask = deps.ask || defaultAsk();
     const out = deps.out || ((s) => process.stdout.write(s + '\n'));
     const fetchFn = deps.fetchFn || globalThis.fetch;
     const isIgnored = deps.isIgnored || realIsIgnored;
+    const defaultApiUrl = String(deps.defaultApiUrl ?? process.env.BLACKLIGHT_API_URL ?? DEFAULT_API_URL).replace(/\/$/, '');
 
     const credPath = path.join(cwd, 'config', 'credentials.json');
     const envPath = path.join(cwd, '.env');
@@ -40,13 +46,6 @@ export async function runSetupWizard(deps = {}) {
         const v = typeof ask.secret === 'function' ? await ask.secret(q) : await ask(q);
         if (v == null) { out('Cancelled (input closed) — nothing written.'); throw CANCEL; }
         return String(v);
-    };
-    const askUrl = async (label) => {
-        for (;;) {
-            const v = (await ask1(`${label} apiUrl:`)).replace(/\/$/, '');
-            if (/^https?:\/\/.+/i.test(v)) return v;
-            out('  ✗ must start with http:// or https:// — try again');
-        }
     };
     try {
         out('── Unified Job Scraper — setup ──');
@@ -68,10 +67,15 @@ export async function runSetupWizard(deps = {}) {
             if (mode !== 'merge' && mode !== 'overwrite') { out('Cancelled — nothing written.'); return 1; }
         }
 
-        // The scraper always runs as production against the remote queue.
+        // The scraper always runs as production against the remote queue. The
+        // backend URL is a default (no prompt) — both the queue (blacklight) and
+        // the credential pool (scraperCredentials) use the same URL + the same
+        // single API key.
         const answers = { mode: 'remote' };
-        answers.blacklight = { apiUrl: await askUrl('blacklight'), apiKey: await askSecret('blacklight apiKey:') };
-        answers.scraperCredentials = { apiUrl: await askUrl('scraperCredentials'), apiKey: await askSecret('scraperCredentials apiKey:') };
+        out(`API URL: ${defaultApiUrl}  (set BLACKLIGHT_API_URL to override)`);
+        const apiKey = await askSecret('Scraper API key:');
+        answers.blacklight = { apiUrl: defaultApiUrl, apiKey };
+        answers.scraperCredentials = { apiUrl: defaultApiUrl, apiKey };
         answers.scraperMode = (await ask1('SCRAPER_MODE [interactive/daemon] (default daemon):')) || 'daemon';
         answers.headless = (await ask1('Run the browser HEADLESS? [y/N]:')).toLowerCase().startsWith('y');
         answers.strictEmpty = (await ask1('Enable SCRAPER_STRICT_EMPTY now? [y/N]:')).toLowerCase().startsWith('y');

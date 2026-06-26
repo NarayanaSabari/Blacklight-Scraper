@@ -12,14 +12,15 @@ const okFetch = async () => ({
     headers: { get: () => 'application/json' },
     json: async () => ({ ok: true }),
 });
-// blacklight apiUrl, blacklight apiKey, scraperCredentials apiUrl, scraperCredentials apiKey,
-// SCRAPER_MODE, headless, strictEmpty, PORT — no "run mode" prompt (always prod).
-const REMOTE = ['https://blacklight.example.com', 'KEYB', 'https://creds.example.com', 'KEYC', 'daemon', 'no', 'no', '3001'];
+// URL is defaulted now; prompts in order: API key, SCRAPER_MODE, headless,
+// strictEmpty, PORT — no URL prompts, no "run mode" prompt (always prod).
+const REMOTE = ['KEYB', 'daemon', 'no', 'no', '3001'];
 
 test('success path prints the linkedin:login banner', async () => {
     const cwd = tmp(); const out = [];
     const code = await runSetupWizard({
         cwd,
+        defaultApiUrl: 'https://d',
         ask: scripted([...REMOTE]),
         fetchFn: okFetch,
         isIgnored: () => true,
