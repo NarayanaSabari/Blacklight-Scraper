@@ -138,11 +138,12 @@ export function postSourceUrl(postUrl) {
 // headless and headed. Installed via context.addInitScript at launch.
 export const CLIPBOARD_CAPTURE_INIT = `(() => {
   try { if (typeof window.__lastCopiedLink !== 'string') window.__lastCopiedLink = ''; } catch (e) {}
+  try { if (!window.__clipDiag) window.__clipDiag = { wt: 0, evt: 0, ec: 0, lastWt: '', lastEvt: '' }; } catch (e) {}
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       const orig = navigator.clipboard.writeText.bind(navigator.clipboard);
       navigator.clipboard.writeText = (text) => {
-        try { if (typeof text === 'string' && text) window.__lastCopiedLink = text; } catch (e) {}
+        try { window.__clipDiag.wt++; if (typeof text === 'string' && text) { window.__lastCopiedLink = text; window.__clipDiag.lastWt = String(text).slice(0, 120); } } catch (e) {}
         try { return orig(text); } catch (e) { return Promise.resolve(); }
       };
     }
@@ -150,11 +151,23 @@ export const CLIPBOARD_CAPTURE_INIT = `(() => {
   try {
     document.addEventListener('copy', (ev) => {
       try {
+        window.__clipDiag.evt++;
         const t = (ev.clipboardData && ev.clipboardData.getData('text/plain'))
           || (window.getSelection && String(window.getSelection()));
+        window.__clipDiag.lastEvt = String(t || '').slice(0, 120);
         if (t) window.__lastCopiedLink = t;
       } catch (e) {}
     }, true);
+  } catch (e) {}
+  // Also hook the legacy execCommand('copy') path some sites still use.
+  try {
+    const oc = document.execCommand ? document.execCommand.bind(document) : null;
+    if (oc) {
+      document.execCommand = (cmd, ...a) => {
+        try { if (String(cmd).toLowerCase() === 'copy') { window.__clipDiag.ec++; const s = window.getSelection && String(window.getSelection()); if (s) { window.__lastCopiedLink = s; } } } catch (e) {}
+        return oc(cmd, ...a);
+      };
+    }
   } catch (e) {}
 })()`;
 
@@ -462,15 +475,25 @@ export async function resolvePostUrlViaMenu(page, hash) {
             await randomDelay(110, 260);
             await copyItem.click({ timeout: 3000 });
             // Read the PER-PAGE captured link (window.__lastCopiedLink, set by the
-            // writeText/copy-event init hook). Per-page isolation makes this safe
-            // under PARALLEL LinkedIn scraping — multiple concurrent tabs in one
-            // process, or separate machines/accounts entirely, never cross-
-            // contaminate. We deliberately do NOT fall back to
-            // navigator.clipboard.readText(): it reads the shared OS clipboard
-            // (races across concurrent tabs) and fails headless anyway.
+            // writeText/copy-event/execCommand init hooks).
             for (let i = 0; i < 10 && !clip; i++) {
                 await randomDelay(120, 230);
                 clip = await page.evaluate(() => window.__lastCopiedLink || '').catch(() => '');
+            }
+            // DIAGNOSTIC + fallback: if the per-page hook captured nothing, dump
+            // which copy mechanism fired (Loki) and try the OS clipboard as a
+            // last resort. NOTE: readText reads the SHARED OS clipboard — under
+            // concurrent tabs it can return another tab's link, so this is a
+            // temporary diagnostic aid, not the final concurrency-safe path.
+            if (!clip) {
+                const dg = await page.evaluate(async () => {
+                    let rt = '';
+                    try { rt = await navigator.clipboard.readText(); } catch (e) { rt = 'ERR:' + (e && e.name); }
+                    return { rt: String(rt).slice(0, 120), d: window.__clipDiag || null };
+                }).catch(() => ({ rt: 'EVAL_ERR', d: null }));
+                logProgress('LinkedIn',
+                    `[COPY-DIAG] hook-empty readText="${dg.rt}" diag=${JSON.stringify(dg.d)}`);
+                if (dg.rt && !dg.rt.startsWith('ERR') && !dg.rt.startsWith('EVAL_ERR')) clip = dg.rt;
             }
         } catch { /* "Copy link to post" missing — LinkedIn changed again */ }
         await randomDelay(120, 320);
