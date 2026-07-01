@@ -408,21 +408,36 @@ export async function resolvePostUrlViaMenu(page, hash) {
             + 'button[aria-label*="control menu"]'
         );
         if (!btn) return '';
+        // Humanize the menu interaction (this runs per-post, so a robotic
+        // instant-click burst is a strong behavioral-detection signal): bring
+        // the card into view, drift the cursor onto the "···" button and pause
+        // as if reaching for it, then pause again "reading" the menu before
+        // picking an item, and hover the item before clicking. All delays are
+        // jittered (randomDelay), and every ~5th post takes a longer break.
         await btn.scrollIntoViewIfNeeded().catch(() => {});
+        await btn.hover().catch(() => {});
+        await randomDelay(140, 430);
         await btn.click();
+        await randomDelay(320, 780);
 
         let clip = '';
         try {
-            await page.getByText('Copy link to post', { exact: true })
-                .first().click({ timeout: 3000 });
+            const copyItem = page.getByText('Copy link to post', { exact: true }).first();
+            await copyItem.hover().catch(() => {});
+            await randomDelay(110, 260);
+            await copyItem.click({ timeout: 3000 });
             for (let i = 0; i < 8 && !clip; i++) {
-                await new Promise(r => setTimeout(r, 150));
+                await randomDelay(120, 230);
                 clip = await page.evaluate(async () => {
                     try { return await navigator.clipboard.readText(); } catch { return ''; }
                 }).catch(() => '');
             }
         } catch { /* "Copy link to post" missing — LinkedIn changed again */ }
+        await randomDelay(120, 320);
         await page.keyboard.press('Escape').catch(() => {});
+        // Occasional longer "reading" pause so the per-post cadence isn't a
+        // metronome (mirrors the scroll loop's reading-pause pacing).
+        if (Math.random() < 0.2) await randomDelay(900, 2200);
         return cleanPostPermalink(clip);
     } catch { return ''; }
 }
