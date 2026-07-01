@@ -151,6 +151,16 @@ export function confirmedEmptyAfterLinkFilter({ importableCount, extractedCount,
     return extractedCount > 0 || !!pageConfirmedEmpty;
 }
 
+// Loud-fail guard for the silent-drop failure mode: if we EXTRACTED a healthy
+// batch of posts but resolved a permalink for NONE of them, the permalink
+// resolver (resolvePostUrlViaMenu / inline urn) is almost certainly broken by a
+// LinkedIn DOM change — NOT a clean empty. Returns true so the caller can fail
+// loudly (classified + cooldown) instead of silently submitting 0 jobs. Guarded
+// by minExtracted so a genuinely tiny/odd batch doesn't false-positive.
+export function allLinklessLooksBroken({ extractedCount, importableCount, minExtracted = 3 } = {}) {
+    return importableCount === 0 && Number(extractedCount) >= minExtracted;
+}
+
 // Decode the post's activity id from the "Report post" link that LinkedIn
 // renders inside the "···" control menu — its href carries
 // `updateUrn=urn:li:activity:<id>` (URL-encoded). This is the post's OWN urn
@@ -367,18 +377,50 @@ export async function resolvePostUrlViaMenu(page, hash) {
     try {
         const el = await page.$(`main div[componentkey*="${hash}"]`);
         if (!el) return '';
-        const btn = await el.$('button[aria-label^="Open control menu for post by"]');
+
+        // Fallback A (no menu needed — fastest + most DOM-drift resistant): the
+        // activity urn is often present ON the card, in a data-urn attribute, an
+        // inline permalink anchor, or anywhere in the element markup. If we can
+        // read it here we skip the brittle menu interaction entirely.
+        const inlineId = await el.evaluate((node) => {
+            const pick = (s) => (String(s || '').match(/urn:li:activity:(\d+)/) || [])[1] || '';
+            const urnEl = node.querySelector('[data-urn*="urn:li:activity:"]');
+            return pick(node.getAttribute('data-urn'))
+                || (urnEl ? pick(urnEl.getAttribute('data-urn')) : '')
+                || pick(node.querySelector('a[href*="urn:li:activity:"]')?.getAttribute('href'))
+                || pick(node.outerHTML);
+        }).catch(() => '');
+        if (/^\d+$/.test(inlineId)) return inlineId;
+
+        // Fallback B (menu): open the "···" control menu and read the post's
+        // updateUrn from any menu link that carries it. Multiple button + link
+        // selectors so a LinkedIn menu rename degrades gracefully rather than
+        // silently returning '' for every post.
+        const btn = await el.$(
+            'button[aria-label^="Open control menu for post by"], '
+            + 'button[aria-label^="Open control menu"], '
+            + 'button[aria-label*="control menu"], '
+            + 'button[aria-label^="More actions"]'
+        );
         if (!btn) return '';
         await btn.scrollIntoViewIfNeeded().catch(() => {});
         await btn.click();
         let href = '';
         for (let i = 0; i < 12 && !href; i++) {
-            href = await page.evaluate(() =>
-                document.querySelector('a[href*="report-in-modal"][href*="updateUrn"]')?.getAttribute('href') || '');
+            href = await page.evaluate(() => {
+                const q = (sel) => document.querySelector(sel)?.getAttribute('href') || '';
+                return q('a[href*="report-in-modal"][href*="updateUrn"]')
+                    || q('a[href*="updateUrn=urn%3Ali%3Aactivity"]')
+                    || q('a[href*="updateUrn=urn:li:activity"]')
+                    || q('a[href*="/feed/update/urn:li:activity:"]')
+                    || '';
+            }).catch(() => '');
             if (!href) await new Promise(r => setTimeout(r, 150));
         }
         await page.keyboard.press('Escape').catch(() => {});
-        return activityIdFromMenuHref(href);
+        // activityIdFromMenuHref handles the updateUrn= form; extractActivityId
+        // catches a raw /feed/update/urn:li:activity:<id> permalink href.
+        return activityIdFromMenuHref(href) || extractActivityId(href);
     } catch { return ''; }
 }
 
@@ -1755,6 +1797,22 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         if (droppedNoLink > 0) {
             logProgress('LinkedIn',
                 `   🔗 Dropped ${droppedNoLink} link-less post(s); ${importablePosts.length} importable.`);
+        }
+
+        // LOUD GUARD: extracting a healthy batch but resolving 0 permalinks is
+        // the silent-drop signature (permalink resolver broken by a LinkedIn DOM
+        // change). Fail typed & classified (BaseScraper cools + alerts) instead
+        // of shipping an empty "confirmed empty" that hides the breakage — this
+        // is exactly the June-2026 failure that ran silently for days.
+        if (STRICT && allLinklessLooksBroken({
+            extractedCount: normalizedPosts.length,
+            importableCount: importablePosts.length,
+        })) {
+            throw new DomChangedError(
+                `LinkedIn extracted ${normalizedPosts.length} posts but resolved 0 permalinks `
+                + `— permalink resolver likely broken (DOM change); refusing to submit a silent empty`,
+                { platform: 'linkedin' },
+            );
         }
 
         // L1: 0 posts is NOT automatically success. In STRICT mode, if
