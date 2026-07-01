@@ -461,16 +461,16 @@ export async function resolvePostUrlViaMenu(page, hash) {
             await copyItem.hover().catch(() => {});
             await randomDelay(110, 260);
             await copyItem.click({ timeout: 3000 });
+            // Read the PER-PAGE captured link (window.__lastCopiedLink, set by the
+            // writeText/copy-event init hook). Per-page isolation makes this safe
+            // under PARALLEL LinkedIn scraping — multiple concurrent tabs in one
+            // process, or separate machines/accounts entirely, never cross-
+            // contaminate. We deliberately do NOT fall back to
+            // navigator.clipboard.readText(): it reads the shared OS clipboard
+            // (races across concurrent tabs) and fails headless anyway.
             for (let i = 0; i < 10 && !clip; i++) {
                 await randomDelay(120, 230);
-                // Primary: the hooked writeText value (works headless). Fallback:
-                // the real clipboard (headed sessions where the hook missed).
                 clip = await page.evaluate(() => window.__lastCopiedLink || '').catch(() => '');
-                if (!clip) {
-                    clip = await page.evaluate(async () => {
-                        try { return await navigator.clipboard.readText(); } catch { return ''; }
-                    }).catch(() => '');
-                }
             }
         } catch { /* "Copy link to post" missing — LinkedIn changed again */ }
         await randomDelay(120, 320);
