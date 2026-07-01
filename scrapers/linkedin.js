@@ -453,7 +453,7 @@ export async function resolvePostUrlViaMenu(page, hash) {
             + 'button[aria-label^="Open control menu"], '
             + 'button[aria-label*="control menu"]'
         );
-        if (!btn) { logProgress('LinkedIn', '[COPY-DIAG] menu button NOT FOUND'); return ''; }
+        if (!btn) return '';
         // Humanize the menu interaction (per-post, so a robotic instant-click
         // burst is a behavioral-detection signal): scroll in, hover the "···",
         // pause, open, pause "reading" the menu, hover the item, click. Jittered.
@@ -464,36 +464,21 @@ export async function resolvePostUrlViaMenu(page, hash) {
         await randomDelay(320, 780);
 
         let clip = '';
-        let copyCount = -1;
-        let clickErr = '';
+        // Reset the per-page capture slot so we never read a previous post's link.
         await page.evaluate(() => { try { window.__lastCopiedLink = ''; } catch (e) {} }).catch(() => {});
         try {
-            const copyItem = page.getByText('Copy link to post', { exact: true });
-            copyCount = await copyItem.count().catch(() => -1);
-            await copyItem.first().hover().catch(() => {});
+            const copyItem = page.getByText('Copy link to post', { exact: true }).first();
+            await copyItem.hover().catch(() => {});
             await randomDelay(110, 260);
-            await copyItem.first().click({ timeout: 3000 });
-            for (let i = 0; i < 10 && !clip; i++) {
+            await copyItem.click({ timeout: 4000 });
+            // Read the PER-PAGE captured link (window.__lastCopiedLink, set by the
+            // writeText/copy-event/execCommand init hooks). Per-page isolation is
+            // parallel-safe (concurrent tabs never cross-contaminate).
+            for (let i = 0; i < 12 && !clip; i++) {
                 await randomDelay(120, 230);
                 clip = await page.evaluate(() => window.__lastCopiedLink || '').catch(() => '');
             }
-        } catch (e) {
-            clickErr = String((e && e.message) || '').split('\n')[0].slice(0, 90);
-        }
-        // ALWAYS log the diagnostic (survives a click throw) + OS-clipboard
-        // fallback. Reveals in Loki: how many "Copy link to post" items matched
-        // (copyCount), whether the click threw (clickErr), the per-page hook
-        // value, the OS clipboard (readText), and which copy mechanism fired
-        // (diag.wt/evt/ec). readText is a temporary diagnostic fallback (shared
-        // clipboard races under concurrency).
-        const dg = await page.evaluate(async () => {
-            let rt = '';
-            try { rt = await navigator.clipboard.readText(); } catch (e) { rt = 'ERR:' + (e && e.name); }
-            return { rt: String(rt).slice(0, 120), d: window.__clipDiag || null };
-        }).catch(() => ({ rt: 'EVAL_ERR', d: null }));
-        logProgress('LinkedIn',
-            `[COPY-DIAG] copyCount=${copyCount} clickErr="${clickErr}" hook="${clip.slice(0, 50)}" readText="${dg.rt}" diag=${JSON.stringify(dg.d)}`);
-        if (!clip && dg.rt && !dg.rt.startsWith('ERR') && !dg.rt.startsWith('EVAL_ERR')) clip = dg.rt;
+        } catch { /* "Copy link to post" missing — LinkedIn changed again */ }
         await randomDelay(120, 320);
         await page.keyboard.press('Escape').catch(() => {});
         if (Math.random() < 0.2) await randomDelay(900, 2200);
@@ -1870,7 +1855,10 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         // can't always be read from the "···" menu (see resolvePostUrlViaMenu),
         // and we never fall back to the author /in/ profile, so those rows land
         // here with an empty url. Filter them out instead of shipping them.
-        const importablePosts = normalizedPosts.filter((p) => hasImportableUrl(p?.url));
+        // normalizeJobData nests the permalink at p.job.url (coreJob), NOT p.url
+        // — checking p.url dropped EVERY LinkedIn post since this filter shipped
+        // (2f313a3a, ~Jun 26). Check the correct nested field.
+        const importablePosts = normalizedPosts.filter((p) => hasImportableUrl(p?.job?.url));
         const droppedNoLink = normalizedPosts.length - importablePosts.length;
         if (droppedNoLink > 0) {
             logProgress('LinkedIn',
