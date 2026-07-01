@@ -130,6 +130,34 @@ export function postSourceUrl(postUrl) {
     return u;
 }
 
+// Init script that captures "Copy link to post" permalinks WITHOUT relying on
+// clipboard reads. The menu action calls navigator.clipboard.writeText(url) (or
+// execCommand('copy')); headless Chromium has no focused clipboard so
+// clipboard.readText() fails there. We hook the WRITE side and stash the value
+// on window.__lastCopiedLink, which resolvePostUrlViaMenu reads back — works
+// headless and headed. Installed via context.addInitScript at launch.
+export const CLIPBOARD_CAPTURE_INIT = `(() => {
+  try { if (typeof window.__lastCopiedLink !== 'string') window.__lastCopiedLink = ''; } catch (e) {}
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      const orig = navigator.clipboard.writeText.bind(navigator.clipboard);
+      navigator.clipboard.writeText = (text) => {
+        try { if (typeof text === 'string' && text) window.__lastCopiedLink = text; } catch (e) {}
+        try { return orig(text); } catch (e) { return Promise.resolve(); }
+      };
+    }
+  } catch (e) {}
+  try {
+    document.addEventListener('copy', (ev) => {
+      try {
+        const t = (ev.clipboardData && ev.clipboardData.getData('text/plain'))
+          || (window.getSelection && String(window.getSelection()));
+        if (t) window.__lastCopiedLink = t;
+      } catch (e) {}
+    }, true);
+  } catch (e) {}
+})()`;
+
 // Clean a permalink copied from the "Copy link to post" menu action: accept
 // ONLY genuine LinkedIn post URLs (/posts/… or /feed/update/…), strip tracking
 // query params + fragments, and reject anything else (a stray profile/search
@@ -253,11 +281,13 @@ export async function launchWithCookies(credential) {
         locale: 'en-US',
         timezoneId: 'America/New_York',
     });
-    // Grant clipboard access for the "Copy link to post" permalink read.
+    // Grant clipboard access + hook clipboard writes for the "Copy link to
+    // post" permalink (headless-safe). Best-effort.
     try {
         await context.grantPermissions?.(
             ['clipboard-read', 'clipboard-write'], { origin: 'https://www.linkedin.com' });
     } catch { /* non-fatal */ }
+    try { await context.addInitScript?.(CLIPBOARD_CAPTURE_INIT); } catch { /* non-fatal */ }
 
     const cookies = loadCookies(credential);
     let added = 0;
@@ -385,6 +415,9 @@ export async function launchPersistentProfile({ profileKey = null, proxy = null 
         await context.grantPermissions?.(
             ['clipboard-read', 'clipboard-write'], { origin: 'https://www.linkedin.com' });
     } catch { /* non-fatal */ }
+    // Capture copied permalinks even when headless (clipboard.readText fails
+    // without a focused clipboard). Best-effort.
+    try { await context.addInitScript?.(CLIPBOARD_CAPTURE_INIT); } catch { /* non-fatal */ }
     logProgress('LinkedIn', '✅ CloakBrowser persistent profile ready');
     return context;
 }
@@ -422,15 +455,22 @@ export async function resolvePostUrlViaMenu(page, hash) {
 
         let clip = '';
         try {
+            // Reset the capture slot so we never read a previous post's link.
+            await page.evaluate(() => { try { window.__lastCopiedLink = ''; } catch (e) {} }).catch(() => {});
             const copyItem = page.getByText('Copy link to post', { exact: true }).first();
             await copyItem.hover().catch(() => {});
             await randomDelay(110, 260);
             await copyItem.click({ timeout: 3000 });
-            for (let i = 0; i < 8 && !clip; i++) {
+            for (let i = 0; i < 10 && !clip; i++) {
                 await randomDelay(120, 230);
-                clip = await page.evaluate(async () => {
-                    try { return await navigator.clipboard.readText(); } catch { return ''; }
-                }).catch(() => '');
+                // Primary: the hooked writeText value (works headless). Fallback:
+                // the real clipboard (headed sessions where the hook missed).
+                clip = await page.evaluate(() => window.__lastCopiedLink || '').catch(() => '');
+                if (!clip) {
+                    clip = await page.evaluate(async () => {
+                        try { return await navigator.clipboard.readText(); } catch { return ''; }
+                    }).catch(() => '');
+                }
             }
         } catch { /* "Copy link to post" missing — LinkedIn changed again */ }
         await randomDelay(120, 320);
