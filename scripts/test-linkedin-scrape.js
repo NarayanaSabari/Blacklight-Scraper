@@ -56,8 +56,12 @@ async function main() {
 
     const onNewPost = async (post) => {
         if (post.postUrl) return;
-        const act = await resolvePostUrlViaMenu(page, post.id);
-        if (act) { post.activityUrn = `urn:li:activity:${act}`; post.postUrl = activityPermalink(act); }
+        const url = await resolvePostUrlViaMenu(page, post.id);
+        if (url) {
+            post.postUrl = url;
+            const act = extractActivityId(url);
+            if (act) post.activityUrn = `urn:li:activity:${act}`;
+        }
     };
     const posts = await extractPosts(page, MAX, { onNewPost });
     console.log(`\n=== Scraped ${posts.length} post(s) (cap ${MAX}) ===\n`);

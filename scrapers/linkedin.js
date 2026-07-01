@@ -130,6 +130,16 @@ export function postSourceUrl(postUrl) {
     return u;
 }
 
+// Clean a permalink copied from the "Copy link to post" menu action: accept
+// ONLY genuine LinkedIn post URLs (/posts/… or /feed/update/…), strip tracking
+// query params + fragments, and reject anything else (a stray profile/search
+// URL) so we never ship a wrong link. '' when it isn't a post permalink.
+export function cleanPostPermalink(url) {
+    const u = String(url ?? '').trim();
+    if (!/^https?:\/\/(www\.)?linkedin\.com\/(posts|feed\/update)\//i.test(u)) return '';
+    return u.split('?')[0].split('#')[0];
+}
+
 // Import policy (LinkedIn ONLY): a post whose permalink we could not resolve is
 // NOT importable — we drop it rather than ship a link-less job. A row is
 // importable iff its `url` is a real absolute http(s) link. Rejects '' (the
@@ -243,6 +253,11 @@ export async function launchWithCookies(credential) {
         locale: 'en-US',
         timezoneId: 'America/New_York',
     });
+    // Grant clipboard access for the "Copy link to post" permalink read.
+    try {
+        await context.grantPermissions?.(
+            ['clipboard-read', 'clipboard-write'], { origin: 'https://www.linkedin.com' });
+    } catch { /* non-fatal */ }
 
     const cookies = loadCookies(credential);
     let added = 0;
@@ -363,64 +378,52 @@ export async function launchPersistentProfile({ profileKey = null, proxy = null 
         }
     }
     const context = await launcher(opts);
+    // "Copy link to post" (the only post-permalink source in LinkedIn's Jul-2026
+    // DOM) writes to the clipboard — grant read/write so resolvePostUrlViaMenu
+    // can read it back. Best-effort (unit-test launcher fakes have no grant).
+    try {
+        await context.grantPermissions?.(
+            ['clipboard-read', 'clipboard-write'], { origin: 'https://www.linkedin.com' });
+    } catch { /* non-fatal */ }
     logProgress('LinkedIn', '✅ CloakBrowser persistent profile ready');
     return context;
 }
 
-// Resolve a post's permalink by opening its "···" control menu and reading the
-// activity id from the Report-post link (`updateUrn=urn:li:activity:<id>`). The
-// activity URN isn't in the rendered DOM, so this per-post interaction is the
-// reliable source. Best-effort: returns '' (→ empty url, never wrong) if the
-// element/menu/link isn't found. Always closes the menu (Escape).
+// Resolve a post's permalink via its "···" control menu. LinkedIn (Jul 2026)
+// dropped the activity URN from the rendered DOM AND from the Report-post href
+// entirely — the ONLY remaining source is the "Copy link to post" menu action,
+// which writes the canonical /posts/… permalink to the clipboard. So we open the
+// menu, click "Copy link to post", and read the clipboard (the browser context
+// grants clipboard-read at launch). Best-effort: returns '' (never a wrong or
+// guessed url) if the menu, the item, or the clipboard read fails. Closes the
+// menu (Escape) on the way out.
 export async function resolvePostUrlViaMenu(page, hash) {
     if (!hash) return '';
     try {
         const el = await page.$(`main div[componentkey*="${hash}"]`);
         if (!el) return '';
-
-        // Fallback A (no menu needed — fastest + most DOM-drift resistant): the
-        // activity urn is often present ON the card, in a data-urn attribute, an
-        // inline permalink anchor, or anywhere in the element markup. If we can
-        // read it here we skip the brittle menu interaction entirely.
-        const inlineId = await el.evaluate((node) => {
-            const pick = (s) => (String(s || '').match(/urn:li:activity:(\d+)/) || [])[1] || '';
-            const urnEl = node.querySelector('[data-urn*="urn:li:activity:"]');
-            return pick(node.getAttribute('data-urn'))
-                || (urnEl ? pick(urnEl.getAttribute('data-urn')) : '')
-                || pick(node.querySelector('a[href*="urn:li:activity:"]')?.getAttribute('href'))
-                || pick(node.outerHTML);
-        }).catch(() => '');
-        if (/^\d+$/.test(inlineId)) return inlineId;
-
-        // Fallback B (menu): open the "···" control menu and read the post's
-        // updateUrn from any menu link that carries it. Multiple button + link
-        // selectors so a LinkedIn menu rename degrades gracefully rather than
-        // silently returning '' for every post.
         const btn = await el.$(
             'button[aria-label^="Open control menu for post by"], '
             + 'button[aria-label^="Open control menu"], '
-            + 'button[aria-label*="control menu"], '
-            + 'button[aria-label^="More actions"]'
+            + 'button[aria-label*="control menu"]'
         );
         if (!btn) return '';
         await btn.scrollIntoViewIfNeeded().catch(() => {});
         await btn.click();
-        let href = '';
-        for (let i = 0; i < 12 && !href; i++) {
-            href = await page.evaluate(() => {
-                const q = (sel) => document.querySelector(sel)?.getAttribute('href') || '';
-                return q('a[href*="report-in-modal"][href*="updateUrn"]')
-                    || q('a[href*="updateUrn=urn%3Ali%3Aactivity"]')
-                    || q('a[href*="updateUrn=urn:li:activity"]')
-                    || q('a[href*="/feed/update/urn:li:activity:"]')
-                    || '';
-            }).catch(() => '');
-            if (!href) await new Promise(r => setTimeout(r, 150));
-        }
+
+        let clip = '';
+        try {
+            await page.getByText('Copy link to post', { exact: true })
+                .first().click({ timeout: 3000 });
+            for (let i = 0; i < 8 && !clip; i++) {
+                await new Promise(r => setTimeout(r, 150));
+                clip = await page.evaluate(async () => {
+                    try { return await navigator.clipboard.readText(); } catch { return ''; }
+                }).catch(() => '');
+            }
+        } catch { /* "Copy link to post" missing — LinkedIn changed again */ }
         await page.keyboard.press('Escape').catch(() => {});
-        // activityIdFromMenuHref handles the updateUrn= form; extractActivityId
-        // catches a raw /feed/update/urn:li:activity:<id> permalink href.
-        return activityIdFromMenuHref(href) || extractActivityId(href);
+        return cleanPostPermalink(clip);
     } catch { return ''; }
 }
 
@@ -1612,10 +1615,11 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
         // while the element is fresh. Best-effort — empty url, never wrong.
         const onNewPost = async (post) => {
             if (post.postUrl) return;
-            const act = await resolvePostUrlViaMenu(page, post.id);
-            if (act) {
-                post.activityUrn = `urn:li:activity:${act}`;
-                post.postUrl = activityPermalink(act);
+            const url = await resolvePostUrlViaMenu(page, post.id);
+            if (url) {
+                post.postUrl = url;
+                const act = extractActivityId(url);
+                if (act) post.activityUrn = `urn:li:activity:${act}`;
             }
         };
 
