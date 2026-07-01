@@ -453,13 +453,10 @@ export async function resolvePostUrlViaMenu(page, hash) {
             + 'button[aria-label^="Open control menu"], '
             + 'button[aria-label*="control menu"]'
         );
-        if (!btn) return '';
-        // Humanize the menu interaction (this runs per-post, so a robotic
-        // instant-click burst is a strong behavioral-detection signal): bring
-        // the card into view, drift the cursor onto the "···" button and pause
-        // as if reaching for it, then pause again "reading" the menu before
-        // picking an item, and hover the item before clicking. All delays are
-        // jittered (randomDelay), and every ~5th post takes a longer break.
+        if (!btn) { logProgress('LinkedIn', '[COPY-DIAG] menu button NOT FOUND'); return ''; }
+        // Humanize the menu interaction (per-post, so a robotic instant-click
+        // burst is a behavioral-detection signal): scroll in, hover the "···",
+        // pause, open, pause "reading" the menu, hover the item, click. Jittered.
         await btn.scrollIntoViewIfNeeded().catch(() => {});
         await btn.hover().catch(() => {});
         await randomDelay(140, 430);
@@ -467,39 +464,38 @@ export async function resolvePostUrlViaMenu(page, hash) {
         await randomDelay(320, 780);
 
         let clip = '';
+        let copyCount = -1;
+        let clickErr = '';
+        await page.evaluate(() => { try { window.__lastCopiedLink = ''; } catch (e) {} }).catch(() => {});
         try {
-            // Reset the capture slot so we never read a previous post's link.
-            await page.evaluate(() => { try { window.__lastCopiedLink = ''; } catch (e) {} }).catch(() => {});
-            const copyItem = page.getByText('Copy link to post', { exact: true }).first();
-            await copyItem.hover().catch(() => {});
+            const copyItem = page.getByText('Copy link to post', { exact: true });
+            copyCount = await copyItem.count().catch(() => -1);
+            await copyItem.first().hover().catch(() => {});
             await randomDelay(110, 260);
-            await copyItem.click({ timeout: 3000 });
-            // Read the PER-PAGE captured link (window.__lastCopiedLink, set by the
-            // writeText/copy-event/execCommand init hooks).
+            await copyItem.first().click({ timeout: 3000 });
             for (let i = 0; i < 10 && !clip; i++) {
                 await randomDelay(120, 230);
                 clip = await page.evaluate(() => window.__lastCopiedLink || '').catch(() => '');
             }
-            // DIAGNOSTIC + fallback: if the per-page hook captured nothing, dump
-            // which copy mechanism fired (Loki) and try the OS clipboard as a
-            // last resort. NOTE: readText reads the SHARED OS clipboard — under
-            // concurrent tabs it can return another tab's link, so this is a
-            // temporary diagnostic aid, not the final concurrency-safe path.
-            if (!clip) {
-                const dg = await page.evaluate(async () => {
-                    let rt = '';
-                    try { rt = await navigator.clipboard.readText(); } catch (e) { rt = 'ERR:' + (e && e.name); }
-                    return { rt: String(rt).slice(0, 120), d: window.__clipDiag || null };
-                }).catch(() => ({ rt: 'EVAL_ERR', d: null }));
-                logProgress('LinkedIn',
-                    `[COPY-DIAG] hook-empty readText="${dg.rt}" diag=${JSON.stringify(dg.d)}`);
-                if (dg.rt && !dg.rt.startsWith('ERR') && !dg.rt.startsWith('EVAL_ERR')) clip = dg.rt;
-            }
-        } catch { /* "Copy link to post" missing — LinkedIn changed again */ }
+        } catch (e) {
+            clickErr = String((e && e.message) || '').split('\n')[0].slice(0, 90);
+        }
+        // ALWAYS log the diagnostic (survives a click throw) + OS-clipboard
+        // fallback. Reveals in Loki: how many "Copy link to post" items matched
+        // (copyCount), whether the click threw (clickErr), the per-page hook
+        // value, the OS clipboard (readText), and which copy mechanism fired
+        // (diag.wt/evt/ec). readText is a temporary diagnostic fallback (shared
+        // clipboard races under concurrency).
+        const dg = await page.evaluate(async () => {
+            let rt = '';
+            try { rt = await navigator.clipboard.readText(); } catch (e) { rt = 'ERR:' + (e && e.name); }
+            return { rt: String(rt).slice(0, 120), d: window.__clipDiag || null };
+        }).catch(() => ({ rt: 'EVAL_ERR', d: null }));
+        logProgress('LinkedIn',
+            `[COPY-DIAG] copyCount=${copyCount} clickErr="${clickErr}" hook="${clip.slice(0, 50)}" readText="${dg.rt}" diag=${JSON.stringify(dg.d)}`);
+        if (!clip && dg.rt && !dg.rt.startsWith('ERR') && !dg.rt.startsWith('EVAL_ERR')) clip = dg.rt;
         await randomDelay(120, 320);
         await page.keyboard.press('Escape').catch(() => {});
-        // Occasional longer "reading" pause so the per-post cadence isn't a
-        // metronome (mirrors the scroll loop's reading-pause pacing).
         if (Math.random() < 0.2) await randomDelay(900, 2200);
         return cleanPostPermalink(clip);
     } catch { return ''; }
