@@ -39,6 +39,16 @@ function proxyStr(proxy) {
     const hp = String(proxy.server).replace(/^https?:\/\//, '');
     return proxy.username ? `http://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${hp}` : `http://${hp}`;
 }
+// Listing age in days from the Glassdoor header (null when unknown).
+export function listingAgeDays(l) {
+    const age = l?.jobview?.header?.ageInDays;
+    return typeof age === 'number' ? age : null;
+}
+// Within the recency cutoff? Unknown age → keep (don't over-drop on missing data).
+export function isFreshListing(l, maxAgeDays) {
+    const age = listingAgeDays(l);
+    return age === null || age <= maxAgeDays;
+}
 function mapListing(l) {
     const h = l?.jobview?.header;
     if (!h?.jobTitleText) return null;
@@ -60,6 +70,10 @@ function mapListing(l) {
 // it and the caller can fall back to the browser path.
 export async function scrapeGlassdoorViaApi(jobTitle, location, sessionId, options = {}, deps = {}) {
     const maxJobs = options.maxJobs || 30;
+    // Client-side recency cutoff (days). Mirrors the importer's 7-day too_old
+    // filter so stale Glassdoor listings are dropped before submission, not
+    // after. Tunable via GLASSDOOR_MAX_AGE_DAYS.
+    const MAX_AGE_DAYS = Number.parseInt(process.env.GLASSDOOR_MAX_AGE_DAYS, 10) || 7;
     const locationId = Number.parseInt(process.env.GLASSDOOR_LOCATION_ID, 10) || 11047; // US (JobSpy default)
     await ensureTLS();
     const proxy = (deps.getProxyPool || getProxyPool)().acquire('glassdoor');
@@ -91,7 +105,22 @@ export async function scrapeGlassdoorViaApi(jobTitle, location, sessionId, optio
             const listings = data?.jobListings;
             if (!Array.isArray(listings)) throw new NetworkError(`Glassdoor API returned no jobListings (HTTP ${r.status})`, { platform: 'glassdoor' });
             if (listings.length === 0) { if (jobs.length === 0) return { jobs: [], emptyConfirmed: true }; break; }
-            for (const l of listings) { const job = mapListing(l); if (job) jobs.push(job); if (jobs.length >= maxJobs) break; }
+            // Recency filter at the SOURCE: Glassdoor is queried with fromage:null
+            // (no server-side date filter) and for most roles ~79% of what it
+            // returns is older than the 7-day import cutoff — those jobs were
+            // being shipped only to be dropped as "too_old" downstream (~445K/12h
+            // of pure waste). Drop stale listings here (h.ageInDays) so they
+            // never enter the pipeline. Since sort:'date' is newest-first, a
+            // FULLY-stale page means every later page is stale too → stop.
+            let freshOnPage = 0;
+            for (const l of listings) {
+                if (!isFreshListing(l, MAX_AGE_DAYS)) continue; // drop stale at source
+                freshOnPage++;
+                const job = mapListing(l);
+                if (job) jobs.push(job);
+                if (jobs.length >= maxJobs) break;
+            }
+            if (freshOnPage === 0) break; // entire page stale → later pages older still
             const next = (data.paginationCursors || []).find((c) => c.pageNumber === pageNumber + 1);
             if (!next?.cursor) break;
             cursor = next.cursor; pageNumber += 1;
