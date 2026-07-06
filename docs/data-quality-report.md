@@ -6,7 +6,7 @@
 Monster's appsapi can't geocode a country-level `where`. Verified live on a warmed
 profile: `where=United States` → appsapi 403 / "no jobs"; **`where=` empty → appsapi
 200 + 36 jobs**. Fixed in `searchUrl` (country-level → nationwide). Working recipe:
-`node scripts/warm-monster.mjs` (headed, operator loads page once to mint the datadome cookie)
+warm the profile headed once (operator loads monster.com to mint the datadome cookie; the `warm-monster` helper has been removed)
 → scrape with `MONSTER_PROFILE_DIR` + `MONSTER_HEADLESS=false` + the where-fix.
 Monster's data (when it returns) is the **richest**: full descriptions + structured
 salary min/max + city/state. Caveat: still IP-sensitive — the appsapi re-burns within

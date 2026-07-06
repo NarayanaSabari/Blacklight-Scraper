@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "setup": "node server.js --setup",
-    "linkedin:login": "node scripts/linkedin-login.js"
+    "linkedin:login": "node scripts/linkedin-login.js",
+    "creds:clean": "node scripts/clean-credentials.js"
   },
   "keywords": [
     "job-scraper",

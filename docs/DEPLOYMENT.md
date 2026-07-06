@@ -14,7 +14,7 @@ most-missed prerequisite.
 | **Dice** | Anonymous | None | CloakBrowser | ✅ 20 runs, 997 jobs, 0 bad | Ready |
 | **Monster** | Anonymous | DataDome + 60-min cooldown | CloakBrowser | ✅ cooldown fired live | Ready (§8) |
 | **Glassdoor** | Anonymous | Geo-pin + classifier | CloakBrowser | ✅ 14 runs, 98.8% US | Ready (§8) |
-| **Indeed** | Profile (optional, `indeed:login`) | Cloudflare + 60-min cooldown | CloakBrowser | ✅ anon page-1 + persistent-path wiring; ⚠️ full pagination needs a real login | Ready anon; full needs `indeed:login` + smoke |
+| **Indeed** | Profile (optional, `INDEED_PROFILE_DIR`) | Cloudflare + 60-min cooldown | CloakBrowser | ✅ anon page-1 + persistent-path wiring; ⚠️ full pagination needs a pre-existing profile | Ready anon; full needs a supplied profile + smoke |
 | **TechFetch** | Anonymous-first | None | CloakBrowser | ✅ 40 jobs/run; ⚠️ login fallback unverified | Ready anon; fallback needs smoke |
 | **LinkedIn** | Cookie (required) | Cloudflare/auth-wall | CloakBrowser | ⚠️ not run (no cookies present) | Code-ready; needs cookies + smoke |
 
@@ -87,7 +87,7 @@ Git-ignored. Copy `config/credentials.example.json` and fill in:
 | Platform | Needs | Without it |
 |---|---|---|
 | Dice / Monster / Glassdoor / TechFetch | nothing | Full function (TechFetch credential only used if search bounces to login) |
-| Indeed | `node scripts/indeed-login.js` once (persistent profile, headed) | Page-1 only (~16 jobs) until you log in; then full ~200. No login + no `INDEED_ALLOW_ANONYMOUS=1` → `AuthError`. |
+| Indeed | Pre-existing profile at `INDEED_PROFILE_DIR` (login helper removed) | Page-1 only (~16 jobs) without a profile; full ~200 with one. No profile + no `INDEED_ALLOW_ANONYMOUS=1` → `AuthError`. |
 | LinkedIn | `npm run linkedin:login` once (persistent profile, headed) | Cannot scrape — throws `AuthError`. Session persists in-profile + rotates; re-login when it expires. |
 
 ---
@@ -101,7 +101,7 @@ Git-ignored. Copy `config/credentials.example.json` and fill in:
 ~/.blacklight-glassdoor-cooldown    Glassdoor Cloudflare cooldown marker
 ~/.blacklight-techfetch-cooldown    TechFetch stub-page/block cooldown marker
 ~/.blacklight-linkedin-profile/     persistent LinkedIn browser profile (npm run linkedin:login)
-~/.blacklight-indeed-profile/       persistent Indeed browser profile   (node scripts/indeed-login.js)
+~/.blacklight-indeed-profile/       persistent Indeed browser profile   (bring-your-own; login helper removed)
 ~/.blacklight-scraper-backups/      LinkedIn cookie backups (0600)
 ```
 
@@ -124,11 +124,11 @@ Ephemeral container → volume-mount these. Otherwise: re-download the 350 MB br
 [ ] 4. config/credentials.json → blacklight API filled in
 [ ] 5. persist the 5 paths in §6 (or volume-mount)
 [ ] 6. node server.js  →  curl localhost:3001/healthz  →  200 + gitSha matches deployed commit
-[ ] 7. log in to the two profile platforms (headed, once each — needs a display;
-       on a headless host run on a workstation + copy the profile dir, or use VNC):
+[ ] 7. log in to LinkedIn (headed — needs a display; on a headless host run on a
+       workstation + copy the profile dir, or use VNC):
          npm run linkedin:login
-         node scripts/indeed-login.js
-       (Indeed also runs anonymously at page-1 with INDEED_ALLOW_ANONYMOUS=1 if you skip login)
+       (Indeed has no login helper — it runs anonymously at page-1 with
+        INDEED_ALLOW_ANONYMOUS=1, or supply a pre-existing profile at INDEED_PROFILE_DIR)
 [ ] 8. verify end-to-end via the live queue (the per-platform smoke harness has
        been removed — verification is now the real queue flow):
          node server.js  → watch the log for a claim, then confirm in

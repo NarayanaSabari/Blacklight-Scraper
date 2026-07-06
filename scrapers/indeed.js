@@ -1,8 +1,8 @@
 // Indeed Job Scraper Module
 //
 // Uses CloakBrowser — stealth Chromium with source-level C++ fingerprint
-// patches — combined with a persistent logged-in profile (`npm run
-// indeed:login`) for full pagination. Anonymous (page-1) is the fallback.
+// patches — combined with a pre-existing persistent logged-in profile (at
+// INDEED_PROFILE_DIR) for full pagination. Anonymous (page-1) is the fallback.
 //
 // Why auth: anonymous Indeed caps at page 1 (~16 cards per role). Any
 // pagination attempt — direct &start=10 or clicking "Next page" —
@@ -45,11 +45,10 @@ import {
     defaultReadFile, defaultWriteFile, defaultRename,
 } from '../src/core/indeed-cooldown.js';
 
-// Persistent logged-in profile (manual-login model, mirrors LinkedIn). The
-// operator runs `node scripts/indeed-login.js` once → a headed CloakBrowser writes the
-// session into this dir → scrapeIndeed reuses it (full pagination + a warmed
-// cf_clearance that passes Cloudflare). Default ~/.blacklight-indeed-profile;
-// override with INDEED_PROFILE_DIR (must match what indeed:login uses).
+// Persistent logged-in profile (manual-login model, mirrors LinkedIn). Supply
+// a pre-existing logged-in profile in this dir → scrapeIndeed reuses it (full
+// pagination + a warmed cf_clearance that passes Cloudflare). Default
+// ~/.blacklight-indeed-profile; override with INDEED_PROFILE_DIR.
 export function indeedProfileDir() {
     return process.env.INDEED_PROFILE_DIR
         || path.join(os.homedir(), '.blacklight-indeed-profile');
@@ -709,11 +708,11 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null, options
 
     const domain = getIndeedDomain(location);
 
-    // Session: prefer the operator's persistent logged-in profile
-    // (`node scripts/indeed-login.js`). It gives full pagination AND a warmed
+    // Session: prefer a pre-existing persistent logged-in profile at
+    // INDEED_PROFILE_DIR. It gives full pagination AND a warmed
     // cf_clearance that passes Cloudflare reliably on later runs. With no
     // profile, fall back to an anonymous context (page-1 only) when
-    // INDEED_ALLOW_ANONYMOUS=1, otherwise throw — the remedy is indeed:login.
+    // INDEED_ALLOW_ANONYMOUS=1, otherwise throw.
     const usingProfile = indeedProfileExists();
     const proxy = getProxyPool().acquire('indeed');
     let browser = null;   // set only in anonymous mode (plain launch → Browser handle)
@@ -725,15 +724,15 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null, options
             headless: process.env.INDEED_HEADLESS !== 'false',
             humanize: true,
             ...(proxy ? { proxy } : {}),
-            // Match indeed-login.js's viewport so the scrape fingerprint stays
-            // coherent with the profile the operator logged in under.
+            // Fixed viewport so the scrape fingerprint stays coherent with the
+            // profile the operator logged in under.
             viewport: { width: 1366, height: 900 },
             locale: 'en-US',
             timezoneId: 'America/New_York',
         });
     } else if (process.env.INDEED_ALLOW_ANONYMOUS === '1') {
         const fingerprint = getRandomFingerprint();
-        logProgress('Indeed', 'WARN: no Indeed profile — running anonymous (page 1 only). Run `node scripts/indeed-login.js` for full pagination.');
+        logProgress('Indeed', 'WARN: no Indeed profile — running anonymous (page 1 only). Provide a profile at INDEED_PROFILE_DIR for full pagination.');
         browser = await launch({ headless: true, humanize: true, ...(proxy ? { proxy } : {}) });
         context = await browser.newContext({
             userAgent: fingerprint.userAgent,
@@ -743,7 +742,7 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null, options
         });
     } else {
         throw new AuthError(
-            'No Indeed profile — run `node scripts/indeed-login.js` (or set INDEED_ALLOW_ANONYMOUS=1 for page-1 only)',
+            'No Indeed profile — provide one at INDEED_PROFILE_DIR (or set INDEED_ALLOW_ANONYMOUS=1 for page-1 only)',
             { platform: 'indeed' },
         );
     }

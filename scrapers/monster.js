@@ -337,7 +337,7 @@ export async function scrapeMonster(jobTitle, location, sessionId = null, option
 // Open a Monster browser context. Default: a fresh stealth browser on a rotating
 // pool IP. If MONSTER_PROFILE_DIR is set, reuse that PERSISTENT profile on a
 // STICKY pool IP — so a manually-warmed datadome cookie (operator solved the
-// captcha once via `node scripts/warm-monster.mjs`) carries into the scrape. Returns
+// DataDome captcha once in that profile dir) carries into the scrape. Returns
 // { context, cleanup }.
 async function openMonsterContext() {
     const profileDir = process.env.MONSTER_PROFILE_DIR;
