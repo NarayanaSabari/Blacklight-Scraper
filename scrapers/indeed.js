@@ -46,7 +46,7 @@ import {
 } from '../src/core/indeed-cooldown.js';
 
 // Persistent logged-in profile (manual-login model, mirrors LinkedIn). The
-// operator runs `npm run indeed:login` once → a headed CloakBrowser writes the
+// operator runs `node scripts/indeed-login.js` once → a headed CloakBrowser writes the
 // session into this dir → scrapeIndeed reuses it (full pagination + a warmed
 // cf_clearance that passes Cloudflare). Default ~/.blacklight-indeed-profile;
 // override with INDEED_PROFILE_DIR (must match what indeed:login uses).
@@ -710,7 +710,7 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null, options
     const domain = getIndeedDomain(location);
 
     // Session: prefer the operator's persistent logged-in profile
-    // (`npm run indeed:login`). It gives full pagination AND a warmed
+    // (`node scripts/indeed-login.js`). It gives full pagination AND a warmed
     // cf_clearance that passes Cloudflare reliably on later runs. With no
     // profile, fall back to an anonymous context (page-1 only) when
     // INDEED_ALLOW_ANONYMOUS=1, otherwise throw — the remedy is indeed:login.
@@ -733,7 +733,7 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null, options
         });
     } else if (process.env.INDEED_ALLOW_ANONYMOUS === '1') {
         const fingerprint = getRandomFingerprint();
-        logProgress('Indeed', 'WARN: no Indeed profile — running anonymous (page 1 only). Run `npm run indeed:login` for full pagination.');
+        logProgress('Indeed', 'WARN: no Indeed profile — running anonymous (page 1 only). Run `node scripts/indeed-login.js` for full pagination.');
         browser = await launch({ headless: true, humanize: true, ...(proxy ? { proxy } : {}) });
         context = await browser.newContext({
             userAgent: fingerprint.userAgent,
@@ -743,7 +743,7 @@ export async function scrapeIndeed(jobTitle, location, sessionId = null, options
         });
     } else {
         throw new AuthError(
-            'No Indeed profile — run `npm run indeed:login` (or set INDEED_ALLOW_ANONYMOUS=1 for page-1 only)',
+            'No Indeed profile — run `node scripts/indeed-login.js` (or set INDEED_ALLOW_ANONYMOUS=1 for page-1 only)',
             { platform: 'indeed' },
         );
     }

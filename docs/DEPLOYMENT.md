@@ -87,7 +87,7 @@ Git-ignored. Copy `config/credentials.example.json` and fill in:
 | Platform | Needs | Without it |
 |---|---|---|
 | Dice / Monster / Glassdoor / TechFetch | nothing | Full function (TechFetch credential only used if search bounces to login) |
-| Indeed | `npm run indeed:login` once (persistent profile, headed) | Page-1 only (~16 jobs) until you log in; then full ~200. No login + no `INDEED_ALLOW_ANONYMOUS=1` → `AuthError`. |
+| Indeed | `node scripts/indeed-login.js` once (persistent profile, headed) | Page-1 only (~16 jobs) until you log in; then full ~200. No login + no `INDEED_ALLOW_ANONYMOUS=1` → `AuthError`. |
 | LinkedIn | `npm run linkedin:login` once (persistent profile, headed) | Cannot scrape — throws `AuthError`. Session persists in-profile + rotates; re-login when it expires. |
 
 ---
@@ -101,7 +101,7 @@ Git-ignored. Copy `config/credentials.example.json` and fill in:
 ~/.blacklight-glassdoor-cooldown    Glassdoor Cloudflare cooldown marker
 ~/.blacklight-techfetch-cooldown    TechFetch stub-page/block cooldown marker
 ~/.blacklight-linkedin-profile/     persistent LinkedIn browser profile (npm run linkedin:login)
-~/.blacklight-indeed-profile/       persistent Indeed browser profile   (npm run indeed:login)
+~/.blacklight-indeed-profile/       persistent Indeed browser profile   (node scripts/indeed-login.js)
 ~/.blacklight-scraper-backups/      LinkedIn cookie backups (0600)
 ```
 
@@ -124,20 +124,17 @@ Ephemeral container → volume-mount these. Otherwise: re-download the 350 MB br
 [ ] 4. config/credentials.json → blacklight API filled in
 [ ] 5. persist the 5 paths in §6 (or volume-mount)
 [ ] 6. node server.js  →  curl localhost:3001/healthz  →  200 + gitSha matches deployed commit
-[ ] 7. smoke the 4 anonymous platforms (no creds):
-         npm run dice:test-scrape -- "software engineer"
-         npm run monster:test-scrape -- "software engineer"
-         npm run glassdoor:test-scrape -- "software engineer"
-         npm run techfetch:test-scrape -- "java developer"
-       → each: exit 0, jobs > 0, 0 bad rows
-[ ] 8. log in to the two profile platforms (headed, once each — needs a display;
+[ ] 7. log in to the two profile platforms (headed, once each — needs a display;
        on a headless host run on a workstation + copy the profile dir, or use VNC):
-         npm run linkedin:login    then  npm run linkedin:test-scrape
-         npm run indeed:login      then  npm run indeed:test-scrape -- "software engineer"
+         npm run linkedin:login
+         node scripts/indeed-login.js
        (Indeed also runs anonymously at page-1 with INDEED_ALLOW_ANONYMOUS=1 if you skip login)
+[ ] 8. verify end-to-end via the live queue (the per-platform smoke harness has
+       been removed — verification is now the real queue flow):
+         node server.js  → watch the log for a claim, then confirm in
+         central.qpeakhire.com → Scraper → Active Sessions: a `running` row for
+         this host with jobs submitted (count > 0, 0 bad rows)
 ```
-
-Harness exit codes: `0` ok · `2` threw · `3` bad-row rate too high · `4` blocked/cooldown/auth-needed.
 
 ---
 

@@ -4,8 +4,8 @@
 // IP + profile. The Monster scraper reuses the SAME profile + sticky IP
 // (MONSTER_PROFILE_DIR) so it rides that trusted session past DataDome.
 //
-//   npm run monster:warm           # opens the window; solve the captcha
-//   MONSTER_PROFILE_DIR=<dir> npm run monster:warm   # custom profile path
+//   node scripts/warm-monster.mjs           # opens the window; solve the captcha
+//   MONSTER_PROFILE_DIR=<dir> node scripts/warm-monster.mjs   # custom profile path
 //
 // Then scrape with:  MONSTER_PROFILE_DIR=<same dir> node ...getScraper('monster')
 import os from 'node:os';

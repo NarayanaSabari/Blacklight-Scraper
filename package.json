@@ -6,19 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "start:prod": "node --max-old-space-size=4096 server.js",
-    "creds:clean": "node scripts/clean-credentials.js",
-    "linkedin:login": "node scripts/linkedin-login.js",
-    "linkedin:test-scrape": "node scripts/test-linkedin-scrape.js",
-    "monster:test-scrape": "node scripts/test-monster-scrape.js",
-    "dice:test-scrape": "node scripts/test-dice-scrape.js",
-    "indeed:login": "node scripts/indeed-login.js",
-    "monster:warm": "node scripts/warm-monster.mjs",
-    "indeed:test-scrape": "node scripts/test-indeed-scrape.js",
-    "glassdoor:test-scrape": "node scripts/test-glassdoor-scrape.js",
-    "techfetch:test-scrape": "node scripts/test-techfetch-scrape.js",
-    "test": "node --test 'test/**/*.test.js'",
-    "setup": "node server.js --setup"
+    "setup": "node server.js --setup",
+    "linkedin:login": "node scripts/linkedin-login.js"
   },
   "keywords": [
     "job-scraper",

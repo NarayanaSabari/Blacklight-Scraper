@@ -5,7 +5,7 @@
 // (cookies incl. cf_clearance, localStorage) persists across scraper runs and
 // rotates organically — no per-run cookie injection from the credentials API.
 //
-//   npm run indeed:login
+//   node scripts/indeed-login.js
 //
 // The profile dir defaults to ~/.blacklight-indeed-profile; override with
 // INDEED_PROFILE_DIR (must match what the scraper uses). Once logged in,

@@ -9,10 +9,10 @@
  * before anything changes.
  *
  * Usage:
- *   npm run creds:clean                          # interactive — pick what to remove
- *   npm run creds:clean -- --remove linkedin,indeed
- *   npm run creds:clean -- --keep glassdoor      # remove every platform EXCEPT these
- *   npm run creds:clean -- --all                 # remove ALL platform sections
+ *   node scripts/clean-credentials.js                          # interactive — pick what to remove
+ *   node scripts/clean-credentials.js -- --remove linkedin,indeed
+ *   node scripts/clean-credentials.js -- --keep glassdoor      # remove every platform EXCEPT these
+ *   node scripts/clean-credentials.js -- --all                 # remove ALL platform sections
  */
 import fs from 'node:fs';
 import path from 'node:path';
