@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readPacingConfig } from '../../scrapers/linkedin.js';
+import { readPacingConfig, readMenuPacing } from '../../scrapers/linkedin.js';
 
 test('readPacingConfig: all-absent → documented defaults', () => {
     assert.deepEqual(readPacingConfig({}), {
@@ -31,4 +31,35 @@ test('readPacingConfig: garbage/empty → default, never throws', () => {
 
 test('readPacingConfig: defaults to process.env when no arg (smoke, no throw)', () => {
     assert.doesNotThrow(() => readPacingConfig());
+});
+
+test('readMenuPacing: all-absent → faster documented defaults', () => {
+    assert.deepEqual(readMenuPacing({}), {
+        hoverMin: 80, hoverMax: 200,
+        openMin: 160, openMax: 380,
+        itemMin: 60, itemMax: 150,
+        pollTries: 7, pollMin: 60, pollMax: 140,
+        closeMin: 70, closeMax: 180,
+    });
+});
+
+test('readMenuPacing: overrides parsed to ints (dial back for a canary)', () => {
+    const c = readMenuPacing({
+        LINKEDIN_MENU_HOVER_MIN_MS: '140', LINKEDIN_MENU_HOVER_MAX_MS: '430',
+        LINKEDIN_MENU_POLL_TRIES: '12', LINKEDIN_MENU_POLL_MIN_MS: '120', LINKEDIN_MENU_POLL_MAX_MS: '230',
+    });
+    assert.equal(c.hoverMin, 140);
+    assert.equal(c.hoverMax, 430);
+    assert.equal(c.pollTries, 12);
+    assert.equal(c.pollMin, 120);
+});
+
+test('readMenuPacing: garbage → default; pollTries floored at 1', () => {
+    const c = readMenuPacing({ LINKEDIN_MENU_HOVER_MIN_MS: 'abc', LINKEDIN_MENU_POLL_TRIES: '0' });
+    assert.equal(c.hoverMin, 80);
+    assert.equal(c.pollTries, 1, 'pollTries must be >= 1 so the clipboard is read at least once');
+});
+
+test('readMenuPacing: defaults to process.env when no arg (smoke, no throw)', () => {
+    assert.doesNotThrow(() => readMenuPacing());
 });

@@ -78,6 +78,31 @@ export function readPacingConfig(env = process.env) {
     };
 }
 
+// Per-post "Copy link" menu-interaction pacing (env-tunable, read once).
+// resolvePostUrlViaMenu runs ONCE PER POST and used to spend ~1.5-3s here in
+// deliberate jitter — the dominant per-scroll cost. These faster defaults keep
+// the human-like SHAPE of the interaction (hover → pause → open → pause → click)
+// but cut the padding ~half. Dial back per-account via env if a canary shows
+// challenges. Same int() discipline: absent/garbage → default; never throws.
+export function readMenuPacing(env = process.env) {
+    const int = (v, d) => { const n = Number.parseInt(v, 10); return Number.isFinite(n) ? n : d; };
+    return {
+        hoverMin: int(env.LINKEDIN_MENU_HOVER_MIN_MS, 80),
+        hoverMax: int(env.LINKEDIN_MENU_HOVER_MAX_MS, 200),
+        openMin: int(env.LINKEDIN_MENU_OPEN_MIN_MS, 160),
+        openMax: int(env.LINKEDIN_MENU_OPEN_MAX_MS, 380),
+        itemMin: int(env.LINKEDIN_MENU_ITEM_MIN_MS, 60),
+        itemMax: int(env.LINKEDIN_MENU_ITEM_MAX_MS, 150),
+        pollTries: Math.max(1, int(env.LINKEDIN_MENU_POLL_TRIES, 7)),
+        pollMin: int(env.LINKEDIN_MENU_POLL_MIN_MS, 60),
+        pollMax: int(env.LINKEDIN_MENU_POLL_MAX_MS, 140),
+        closeMin: int(env.LINKEDIN_MENU_CLOSE_MIN_MS, 70),
+        closeMax: int(env.LINKEDIN_MENU_CLOSE_MAX_MS, 180),
+    };
+}
+
+const MENU_PACING = readMenuPacing();
+
 // Anti-bot: choose exactly ONE query variant per browser session.
 // Uniformly random so repeated orchestrator cycles cover all variants
 // and the query pattern is less predictable. Pure (rng injectable).
@@ -457,11 +482,14 @@ export async function resolvePostUrlViaMenu(page, hash) {
         // Humanize the menu interaction (per-post, so a robotic instant-click
         // burst is a behavioral-detection signal): scroll in, hover the "···",
         // pause, open, pause "reading" the menu, hover the item, click. Jittered.
+        // Pacing is env-tunable via MENU_PACING — faster defaults keep the shape
+        // but drop the padding (this runs once per post, so it dominates).
+        const mp = MENU_PACING;
         await btn.scrollIntoViewIfNeeded().catch(() => {});
         await btn.hover().catch(() => {});
-        await randomDelay(140, 430);
+        await randomDelay(mp.hoverMin, mp.hoverMax);
         await btn.click();
-        await randomDelay(320, 780);
+        await randomDelay(mp.openMin, mp.openMax);
 
         let clip = '';
         // Reset the per-page capture slot so we never read a previous post's link.
@@ -469,19 +497,19 @@ export async function resolvePostUrlViaMenu(page, hash) {
         try {
             const copyItem = page.getByText('Copy link to post', { exact: true }).first();
             await copyItem.hover().catch(() => {});
-            await randomDelay(110, 260);
+            await randomDelay(mp.itemMin, mp.itemMax);
             await copyItem.click({ timeout: 4000 });
             // Read the PER-PAGE captured link (window.__lastCopiedLink, set by the
-            // writeText/copy-event/execCommand init hooks). Per-page isolation is
-            // parallel-safe (concurrent tabs never cross-contaminate).
-            for (let i = 0; i < 12 && !clip; i++) {
-                await randomDelay(120, 230);
+            // writeText/copy-event/execCommand init hooks). The write hook fires
+            // synchronously on click, so the link is usually present within the
+            // first poll or two — polling fewer times is the main time saving.
+            for (let i = 0; i < mp.pollTries && !clip; i++) {
+                await randomDelay(mp.pollMin, mp.pollMax);
                 clip = await page.evaluate(() => window.__lastCopiedLink || '').catch(() => '');
             }
         } catch { /* "Copy link to post" missing — LinkedIn changed again */ }
-        await randomDelay(120, 320);
+        await randomDelay(mp.closeMin, mp.closeMax);
         await page.keyboard.press('Escape').catch(() => {});
-        if (Math.random() < 0.2) await randomDelay(900, 2200);
         return cleanPostPermalink(clip);
     } catch { return ''; }
 }
