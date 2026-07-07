@@ -57,26 +57,55 @@ async function main() {
     console.log(`Opening profile "${profileKey}" (headed)…`);
     const context = await launchPersistentProfile({ profileKey, proxy: null });
 
-    // Capture Voyager XHR responses BEFORE navigating so we see the search fetch.
-    const voyagerHits = [];
-    context.on('response', async (resp) => {
-        const url = resp.url();
-        if (!url.includes('/voyager/api')) return;
-        try {
-            const ct = (resp.headers()['content-type'] || '').toLowerCase();
-            if (!ct.includes('json')) return;
-            const text = await resp.text();
-            const urns = text.match(/urn:li:activity:(\d+)/g) || [];
-            if (urns.length) {
-                voyagerHits.push({
-                    url: url.split('?')[0].replace('https://www.linkedin.com', '') + (url.includes('graphql') ? '?graphql' : ''),
-                    queryId: (url.match(/queryId=([^&]+)/) || [])[1] || null,
-                    urnCount: urns.length,
-                    uniqueUrns: new Set(urns).size,
-                    bytes: text.length,
-                });
-            }
-        } catch { /* body already consumed / non-text — ignore */ }
+    // Hook fetch + XHR IN-PAGE (reliable where Playwright's reactive
+    // response.text() can't read LinkedIn's GraphQL/normalized-JSON bodies).
+    // Records every voyager/graphql/api call the page's OWN code makes, and
+    // whether it carries post URNs — so we learn if the search results are
+    // interceptable (the safe "A-bridge" = Option C for free).
+    await context.addInitScript(() => {
+        window.__apiCaptures = [];
+        const rec = (url, body) => {
+            try {
+                const u = String(url || '');
+                if (!/voyager|graphql|\/api\//i.test(u)) return;
+                const b = String(body || '');
+                const act = b.match(/urn:li:activity:(\d+)/g) || [];
+                const ugc = b.match(/urn:li:ugcPost:(\d+)/g) || [];
+                const share = b.match(/urn:li:share:(\d+)/g) || [];
+                const fsd = b.match(/urn:li:fsd_update|urn:li:fs_updateV2/g) || [];
+                if (!act.length && !ugc.length && !share.length && !fsd.length && !/search|feed|content/i.test(u)) return;
+                const cap = {
+                    url: u.split('?')[0].replace(/^https?:\/\/[^/]+/, '').slice(0, 90),
+                    graphql: /graphql/i.test(u),
+                    queryId: (u.match(/queryId=([^&]+)/) || [])[1] || null,
+                    bytes: b.length,
+                    activity: act.length, uActivity: new Set(act).size,
+                    ugcPost: ugc.length, share: share.length, fsdUpdate: fsd.length,
+                };
+                // First capture that actually has an activity URN: keep a structure snippet.
+                if (act.length && !window.__urnSnippet) {
+                    const i = b.indexOf(act[0]);
+                    window.__urnSnippet = b.slice(Math.max(0, i - 160), i + 220);
+                }
+                window.__apiCaptures.push(cap);
+            } catch (e) { /* ignore */ }
+        };
+        const of = window.fetch;
+        window.fetch = function (...a) {
+            const p = of.apply(this, a);
+            try {
+                const url = (a[0] && a[0].url) || a[0];
+                p.then((r) => { try { r.clone().text().then((t) => rec(url, t)).catch(() => {}); } catch (e) {} });
+            } catch (e) {}
+            return p;
+        };
+        const oo = XMLHttpRequest.prototype.open;
+        const os2 = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, url) { this.__u = url; return oo.apply(this, arguments); };
+        XMLHttpRequest.prototype.send = function () {
+            this.addEventListener('load', () => { try { rec(this.__u, this.responseText || ''); } catch (e) {} });
+            return os2.apply(this, arguments);
+        };
     });
 
     const page = context.pages()[0] || await context.newPage();
@@ -92,6 +121,11 @@ async function main() {
         }).catch(() => {});
         await page.waitForTimeout(3500);
     }
+
+    const api = await page.evaluate(() => ({
+        captures: window.__apiCaptures || [],
+        snippet: window.__urnSnippet || null,
+    })).catch(() => ({ captures: [], snippet: null }));
 
     console.log('Analyzing embedded JSON + post DOM…');
     const probe = await page.evaluate(() => {
@@ -144,14 +178,16 @@ async function main() {
     // ── Report ──────────────────────────────────────────────────────────────
     console.log('\n════════════════ URN PROBE RESULT ════════════════');
     console.log('search query:', SEARCH_QUERY);
-    console.log('\n[1] Voyager XHR responses carrying activity URNs (passive-intercept feasibility):');
-    if (voyagerHits.length === 0) {
-        console.log('   NONE — the page did not expose search results via a JSON voyager/api response.');
+    console.log('\n[1] In-page fetch/XHR captures (voyager/graphql/api the page itself made):');
+    if (!api.captures.length) {
+        console.log('   NONE captured — search data did not flow through a hooked fetch/XHR.');
     } else {
-        for (const h of voyagerHits.slice(0, 12)) {
-            console.log(`   ${h.url}  queryId=${h.queryId || '-'}  urns=${h.urnCount} (uniq ${h.uniqueUrns})  ${h.bytes}b`);
+        for (const h of api.captures.slice(0, 16)) {
+            console.log(`   ${h.url}${h.graphql ? ' [graphql]' : ''}  qId=${h.queryId || '-'}  act=${h.activity}(u${h.uActivity}) ugc=${h.ugcPost} share=${h.share} fsd=${h.fsdUpdate}  ${h.bytes}b`);
         }
+        if (api.captures.length > 16) console.log(`   … +${api.captures.length - 16} more`);
     }
+    if (api.snippet) console.log(`   structure around first activity URN:\n     …${api.snippet.replace(/\n/g, ' ')}…`);
     console.log('\n[2] Embedded page JSON (script/code hydration blocks):');
     console.log(`   jsonScripts=${probe.jsonScriptCount} codeBlocks=${probe.codeBlockCount} chars=${probe.embeddedJsonChars}`);
     console.log(`   activity URNs in embedded JSON: ${probe.urnsInEmbeddedJson} (unique ${probe.uniqueUrnsInEmbeddedJson})`);
@@ -164,9 +200,10 @@ async function main() {
         if (p.dataAttrs?.length) console.log(`     data-*: ${p.dataAttrs.join('  ')}`);
     }
     console.log('\nVERDICT HINTS:');
-    console.log('   • [1] non-empty  → A-bridge: intercept the voyager response, read URNs passively (best).');
-    console.log('   • [2] URNs>0 AND a post hash appears in JSON → A1: map card→URN via embedded JSON.');
-    console.log('   • both empty, [3] elUrn/cardPermalink all none → URN only via the menu; do A2 (trim menu delays).');
+    console.log('   • [1] a search/graphql capture with act>0 (or ugc/share) → A-bridge: hook fetch/XHR');
+    console.log('     in the scraper and read post URNs from the response the page already fetches (best).');
+    console.log('   • [1] captures exist but 0 URNs → the search payload lacks post URNs; menu stays needed.');
+    console.log('   • [1] empty & [2]/[3] empty → URN only via the menu; do A2 (trim menu delays).');
     console.log('═══════════════════════════════════════════════════');
     return 0;
 }
