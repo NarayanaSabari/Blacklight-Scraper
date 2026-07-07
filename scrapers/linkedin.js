@@ -186,9 +186,9 @@ export const URN_PROBE_INIT = `(() => {
       try {
         var u = String(url || '');
         if (window.__urnAll.length < 200) window.__urnAll.push(u.slice(0, 140));
-        if (window.__urnCaps.length < 20) {
+        if (window.__urnCaps.length < 24 && /flagship|rsc|feed|voyager|graphql|\\/api\\/|search|update/i.test(u)) {
           var b = String(body || '');
-          if (b.length > 0) window.__urnCaps.push({ url: u.slice(0, 180), body: b.slice(0, 24000) });
+          if (b.length > 0) window.__urnCaps.push({ url: u.slice(0, 180), body: b.slice(0, 900000) });
         }
       } catch (e) {}
     };
@@ -1767,32 +1767,47 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
                 try {
                     const probe = await page.evaluate(() => {
                         const strip = (u) => String(u).replace(/^https?:\/\/[^/]+/, '').split('?')[0].slice(0, 80);
-                        const all = window.__urnAll || [];
+                        const uniq = (arr) => [...new Set(arr)];
                         const caps = (window.__urnCaps || []).map((c) => {
                             const a = c.body.match(/urn:li:activity:(\d+)/g) || [];
-                            const u = c.body.match(/urn:li:ugcPost:(\d+)/g) || [];
-                            const s = c.body.match(/urn:li:share:(\d+)/g) || [];
-                            return { url: strip(c.url), graphql: /graphql/i.test(c.url), qId: (c.url.match(/queryId=([^&]+)/) || [])[1] || null, bytes: c.body.length, act: a.length, uAct: new Set(a).size, ugc: u.length, share: s.length };
+                            const ug = c.body.match(/urn:li:ugcPost:(\d+)/g) || [];
+                            const sh = c.body.match(/urn:li:share:(\d+)/g) || [];
+                            const uA = uniq(a.map((x) => x.split(':').pop()));
+                            return { url: strip(c.url), bytes: c.body.length, act: a.length, uAct: uA.length, ugc: ug.length, uUgc: uniq(ug).length, share: sh.length, _body: c.body, _uA: uA };
                         });
-                        let snip = null;
-                        for (const c of (window.__urnCaps || [])) {
-                            const m = c.body.match(/urn:li:activity:\d+/);
-                            if (m) { const i = c.body.indexOf(m[0]); snip = c.body.slice(Math.max(0, i - 140), i + 200); break; }
+                        // The response with the most UNIQUE activity URNs ≈ the post list.
+                        let best = null;
+                        for (const c of caps) if (!best || c.uAct > best.uAct) best = c;
+                        let sampleUrns = [];
+                        let primarySnip = null;
+                        if (best && best.uAct > 0) {
+                            sampleUrns = best._uA.slice(0, 12);
+                            // Find a URN occurrence that is NOT reaction/social metadata — the
+                            // primary post entry — and dump its surroundings to judge whether
+                            // author/text/order sit near it (i.e. how mappable the payload is).
+                            const body = best._body;
+                            for (const id of best._uA.slice(0, 40)) {
+                                const re = new RegExp('.{0,44}urn:li:activity:' + id, 'g');
+                                let m;
+                                while ((m = re.exec(body))) {
+                                    if (!/reactionState|confirmed|socialDetail|comment|reshare/i.test(m[0])) {
+                                        primarySnip = body.slice(Math.max(0, m.index - 30), m.index + 230);
+                                        break;
+                                    }
+                                }
+                                if (primarySnip) break;
+                            }
                         }
                         const html = document.documentElement.outerHTML;
                         return {
-                            calls: all.length,
-                            sampleCalls: [...new Set(all.map(strip))].slice(0, 25),
-                            urnCaps: caps.filter((c) => c.act || c.ugc || c.share || c.graphql || /search|feed|content/i.test(c.url)).slice(0, 12),
-                            snip,
-                            domChars: html.length,
-                            scripts: document.querySelectorAll('script').length,
-                            jsonScripts: document.querySelectorAll('script[type="application/json"]').length,
-                            gActivity: (html.match(/urn:li:activity:(\d+)/g) || []).length,
-                            gUgc: (html.match(/urn:li:ugcPost:(\d+)/g) || []).length,
-                            gShare: (html.match(/urn:li:share:(\d+)/g) || []).length,
-                            sampleUrns: [...new Set(html.match(/urn:li:(?:activity|ugcPost|share):\d+/g) || [])].slice(0, 5),
-                            posts: document.querySelectorAll('main div[componentkey^="expanded"]').length,
+                            calls: (window.__urnAll || []).length,
+                            capInventory: caps.map(({ _body, _uA, ...c }) => c).sort((a, b) => b.uAct - a.uAct).slice(0, 12),
+                            bestUrl: best && best.uAct ? best.url : null,
+                            bestUniqueActivityUrns: best ? best.uAct : 0,
+                            sampleUrns,
+                            primarySnip,
+                            domActivityUrns: (html.match(/urn:li:activity:(\d+)/g) || []).length,
+                            renderedPosts: document.querySelectorAll('main div[componentkey^="expanded"]').length,
                         };
                     });
                     log.info('URN_PROBE result', { scraper_alert: 'urn_probe', ...probe });
