@@ -173,6 +173,12 @@ After this, the session persists in `~/.blacklight-linkedin-profile`, so the scr
 reuses your logged-in session without further logins until LinkedIn
 invalidates it. Re-run `npm run linkedin:login` whenever the session dies.
 
+To start a profile over from scratch (wrong/old account keeps opening, or you're
+switching the account behind a profile key), run `npm run linkedin:reset` — it
+lists the on-disk LinkedIn profiles, deletes the one(s) you pick, and refuses to
+run while the scraper is up (a profile Chromium still has open can't be deleted).
+Then `npm run linkedin:login` gives a fresh login page.
+
 ## 6. Start the scraper
 
 ```bash
