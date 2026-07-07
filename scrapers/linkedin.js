@@ -171,6 +171,39 @@ export const CLIPBOARD_CAPTURE_INIT = `(() => {
   } catch (e) {}
 })()`;
 
+// DIAGNOSTIC (Option-A feasibility, gated by LINKEDIN_URN_PROBE=1): hook the
+// page's own fetch + XHR so a real scrape records the URLs it requests and the
+// response bodies — so we can see whether a post's urn:li:activity is
+// recoverable from the search API response the browser already fetches (the
+// safe way to drop the ~2s/post copy-link menu). The hook only STORES bodies;
+// the URN analysis runs later in a normal page.evaluate (no regex escaping in
+// this serialized string). Bounded: ≤200 URLs, ≤20 bodies × 24KB. Off by
+// default (zero overhead unless the flag is set at launch).
+export const URN_PROBE_INIT = `(() => {
+  try {
+    window.__urnAll = []; window.__urnCaps = [];
+    var rec = function (url, body) {
+      try {
+        var u = String(url || '');
+        if (window.__urnAll.length < 200) window.__urnAll.push(u.slice(0, 140));
+        if (window.__urnCaps.length < 20) {
+          var b = String(body || '');
+          if (b.length > 0) window.__urnCaps.push({ url: u.slice(0, 180), body: b.slice(0, 24000) });
+        }
+      } catch (e) {}
+    };
+    var of = window.fetch;
+    window.fetch = function () {
+      var a = arguments; var p = of.apply(this, a);
+      try { var url = (a[0] && a[0].url) || a[0]; p.then(function (r) { try { r.clone().text().then(function (t) { rec(url, t); }).catch(function () {}); } catch (e) {} }); } catch (e) {}
+      return p;
+    };
+    var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, url) { this.__u = url; return oo.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function () { var s = this; this.addEventListener('load', function () { try { rec(s.__u, s.responseText || ''); } catch (e) {} }); return os.apply(this, arguments); };
+  } catch (e) {}
+})()`;
+
 // Clean a permalink copied from the "Copy link to post" menu action: accept
 // ONLY genuine LinkedIn post URLs (/posts/… or /feed/update/…), strip tracking
 // query params + fragments, and reject anything else (a stray profile/search
@@ -431,6 +464,12 @@ export async function launchPersistentProfile({ profileKey = null, proxy = null 
     // Capture copied permalinks even when headless (clipboard.readText fails
     // without a focused clipboard). Best-effort.
     try { await context.addInitScript?.(CLIPBOARD_CAPTURE_INIT); } catch { /* non-fatal */ }
+    // Diagnostic URN probe — installed at launch (before any navigation, same as
+    // the clipboard hook) so it reliably wraps the page's fetch/XHR. Off unless
+    // LINKEDIN_URN_PROBE=1. See URN_PROBE_INIT + the read-back in scrapeLinkedIn.
+    if (process.env.LINKEDIN_URN_PROBE === '1') {
+        try { await context.addInitScript?.(URN_PROBE_INIT); } catch { /* non-fatal */ }
+    }
     logProgress('LinkedIn', '✅ CloakBrowser persistent profile ready');
     return context;
 }
@@ -1718,6 +1757,49 @@ export async function scrapeLinkedIn(jobTitle, location, sessionId = null, optio
 
             const remainingBudget = CONFIG.maxPosts - posts.length;
             const queryPosts = await extractPosts(page, remainingBudget, { onAuthenticatedBatch, onNewPost });
+
+            // Diagnostic URN probe read-back (gated). Runs once, after the first
+            // query's scrape, on the live page: analyzes the fetch/XHR bodies the
+            // URN_PROBE_INIT hook captured + scans the whole DOM for post URNs, and
+            // logs a structured line to Loki (scraper_alert=urn_probe). Read-only,
+            // best-effort — never affects the scrape.
+            if (qi === 0 && process.env.LINKEDIN_URN_PROBE === '1') {
+                try {
+                    const probe = await page.evaluate(() => {
+                        const strip = (u) => String(u).replace(/^https?:\/\/[^/]+/, '').split('?')[0].slice(0, 80);
+                        const all = window.__urnAll || [];
+                        const caps = (window.__urnCaps || []).map((c) => {
+                            const a = c.body.match(/urn:li:activity:(\d+)/g) || [];
+                            const u = c.body.match(/urn:li:ugcPost:(\d+)/g) || [];
+                            const s = c.body.match(/urn:li:share:(\d+)/g) || [];
+                            return { url: strip(c.url), graphql: /graphql/i.test(c.url), qId: (c.url.match(/queryId=([^&]+)/) || [])[1] || null, bytes: c.body.length, act: a.length, uAct: new Set(a).size, ugc: u.length, share: s.length };
+                        });
+                        let snip = null;
+                        for (const c of (window.__urnCaps || [])) {
+                            const m = c.body.match(/urn:li:activity:\d+/);
+                            if (m) { const i = c.body.indexOf(m[0]); snip = c.body.slice(Math.max(0, i - 140), i + 200); break; }
+                        }
+                        const html = document.documentElement.outerHTML;
+                        return {
+                            calls: all.length,
+                            sampleCalls: [...new Set(all.map(strip))].slice(0, 25),
+                            urnCaps: caps.filter((c) => c.act || c.ugc || c.share || c.graphql || /search|feed|content/i.test(c.url)).slice(0, 12),
+                            snip,
+                            domChars: html.length,
+                            scripts: document.querySelectorAll('script').length,
+                            jsonScripts: document.querySelectorAll('script[type="application/json"]').length,
+                            gActivity: (html.match(/urn:li:activity:(\d+)/g) || []).length,
+                            gUgc: (html.match(/urn:li:ugcPost:(\d+)/g) || []).length,
+                            gShare: (html.match(/urn:li:share:(\d+)/g) || []).length,
+                            sampleUrns: [...new Set(html.match(/urn:li:(?:activity|ugcPost|share):\d+/g) || [])].slice(0, 5),
+                            posts: document.querySelectorAll('main div[componentkey^="expanded"]').length,
+                        };
+                    });
+                    log.info('URN_PROBE result', { scraper_alert: 'urn_probe', ...probe });
+                } catch (probeErr) {
+                    log.warn('URN_PROBE failed', { err: probeErr.message });
+                }
+            }
 
             // Dedup by id — same post can match multiple queries.
             // Tag with the query that found it for downstream tracing.
