@@ -192,7 +192,9 @@ class MetricsRegistry {
         this.queueChecksTotal = new Counter({
             name: 'scraper_queue_checks_total',
             help: 'Outcomes of Blacklight queue poll attempts.',
-            labelNames: ['result'], // job_found|empty|active_session|skipped_busy|error
+            // job_found|empty|active_session|skipped_busy|error|no_creds|
+            // all_cooldown|preflight_failed|recovered_orphan
+            labelNames: ['result'],
             registers: reg,
         });
 

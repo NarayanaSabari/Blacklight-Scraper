@@ -19,11 +19,15 @@ import { Mutex } from './mutex.js';
 import { getMetrics } from '../metrics/registry.js';
 import { platformsOnCooldown } from '../core/platform-cooldowns.js';
 import { TimeoutError } from '../core/errors.js';
+import { PLATFORM_NAMES } from '../scrapers/registry.js';
 
 const log = createLogger('orchestrator');
 
 export class QueueOrchestrator {
-    constructor({ blacklightConfig, queueConfig, defaultLocation, client = null, metrics = null, scraperResolver = null }) {
+    constructor({
+        blacklightConfig, queueConfig, defaultLocation,
+        client = null, metrics = null, scraperResolver = null, cooldownCheck = null,
+    }) {
         if (!client && !blacklightConfig) {
             throw new Error('QueueOrchestrator requires blacklightConfig');
         }
@@ -43,6 +47,7 @@ export class QueueOrchestrator {
         // without live HTTP / the real scraper registry.
         this._metrics = metrics;
         this._resolveScraper = scraperResolver ?? getScraper;
+        this._cooldownCheck = cooldownCheck ?? platformsOnCooldown;
     }
 
     // Resolve the metrics sink: injected fake in tests, global registry in prod.
@@ -155,28 +160,40 @@ export class QueueOrchestrator {
         } catch (error) {
             // Don't block the claim if the availability check fails —
             // fall back to old behaviour (let the backend filter only
-            // by static allowlist). Log so it's visible.
+            // by static allowlist). Log so it's visible, and count it: a
+            // failed pre-flight is exactly the condition (backend blip,
+            // open circuit breaker — SCR-15) most likely to coincide with a
+            // platform being on local cooldown, so this degraded path must
+            // be countable, not just a log line (SCR-25).
             log.warn('Credential availability pre-flight failed; falling back to static allowlist', {
                 err: error.message,
+                scraper_alert: 'preflight_failed',
             });
-            usablePlatforms = null;
+            metrics.recordQueueCheck('preflight_failed');
+            // SCR-10: resolve null → the full known platform list so the
+            // cooldown filter below always has an explicit array to subtract
+            // from. Without this, a failed pre-flight fell through the
+            // Array.isArray guard below and cooldowns were never consulted —
+            // exactly the condition that caused ~185 zero-result sessions/min
+            // in prod on 2026-06-14 (Glassdoor + Monster both cooled down).
+            usablePlatforms = [...PLATFORM_NAMES];
         }
 
-        // Also exclude platforms on a LOCAL cooldown (Cloudflare/DataDome
+        // Exclude platforms on a LOCAL cooldown (Cloudflare/DataDome
         // back-off markers). Without this the orchestrator keeps claiming work
         // for a cooled-down platform that then instant-fails at scrape time,
         // churning 0-result sessions — prod 2026-06-14 burned ~185/min this way
-        // once Glassdoor + Monster were both cooled down.
-        if (Array.isArray(usablePlatforms)) {
-            const cooled = platformsOnCooldown().filter((p) => usablePlatforms.includes(p));
-            if (cooled.length > 0) {
-                log.info('Platforms on local cooldown — excluded from claim', { cooled });
-                usablePlatforms = usablePlatforms.filter((p) => !cooled.includes(p));
-                if (usablePlatforms.length === 0) {
-                    log.info('All usable platforms are on local cooldown — skipping claim');
-                    metrics.recordQueueCheck('all_cooldown');
-                    return { assignments: [] };
-                }
+        // once Glassdoor + Monster were both cooled down. This must run
+        // unconditionally (not just when the pre-flight succeeded) — that
+        // guard is exactly what let the incident happen.
+        const cooled = this._cooldownCheck().filter((p) => usablePlatforms.includes(p));
+        if (cooled.length > 0) {
+            log.info('Platforms on local cooldown — excluded from claim', { cooled });
+            usablePlatforms = usablePlatforms.filter((p) => !cooled.includes(p));
+            if (usablePlatforms.length === 0) {
+                log.info('All usable platforms are on local cooldown — skipping claim');
+                metrics.recordQueueCheck('all_cooldown');
+                return { assignments: [] };
             }
         }
 

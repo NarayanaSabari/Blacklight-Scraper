@@ -98,18 +98,14 @@ export class BlacklightApiClient {
         // /api/scraper-credentials/queue/availability docstring for
         // why this exists (spam-prevention on credential-starved
         // platforms).
-        const url = `${this.apiUrl}/api/scraper-credentials/queue/availability`;
-        const response = await requestWithRetry(url, {
-            method: 'GET',
-            headers: this.headers,
-        });
-        if (!response.ok) {
-            throw new NetworkError(
-                `Credential availability check → ${response.status} ${response.statusText}`,
-                { statusCode: response.status },
-            );
-        }
-        return response.json();
+        //
+        // Routed through #request (not a hand-rolled fetch) so its
+        // latency/status/failure count reach scraper_blacklight_api_requests_total
+        // — this is the single call most worth measuring, since its
+        // failure silently disables the local-cooldown filter (SCR-10).
+        // #request already throws a NetworkError with statusCode for a
+        // non-ok response, so the error contract here is unchanged.
+        return this.#request('GET', '/api/scraper-credentials/queue/availability');
     }
 
     async submitJobs(sessionId, platform, jobs, status = 'success', errorMessage = null) {

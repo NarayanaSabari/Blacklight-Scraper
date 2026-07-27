@@ -190,3 +190,78 @@ test('O9: a platform returning 0 jobs still submits success but is recorded dist
         ['indeed', 'success', 0],
     );
 });
+
+// SCR-10: prod 2026-06-14 burned ~185 zero-result sessions/min because the
+// local-cooldown filter sat inside `if (Array.isArray(usablePlatforms))` —
+// when the availability pre-flight threw, usablePlatforms became null, the
+// guard was false, and cooled-down platforms were claimed anyway. These
+// tests pin the fix: the cooldown filter must run even in the degraded
+// (pre-flight-failed) path.
+
+test('SCR-10: pre-flight throws + one platform on cooldown → that platform is excluded from the claim', async () => {
+    const m = fakeMetrics();
+    let requestedPlatforms;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => { throw new Error('backend 503'); },
+        getNextRole: async ({ platforms }) => {
+            requestedPlatforms = platforms;
+            return { assignments: [] };
+        },
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: m,
+        cooldownCheck: () => ['glassdoor'],
+    });
+    await o.runOnce();
+
+    assert.ok(Array.isArray(requestedPlatforms), 'a degraded pre-flight must still resolve to an explicit platform list');
+    assert.ok(!requestedPlatforms.includes('glassdoor'), 'the cooled-down platform must be excluded even when the pre-flight failed');
+    assert.ok(requestedPlatforms.length > 0, 'other platforms should still be claimable');
+    assert.ok(m.calls.queueCheck.includes('preflight_failed'), 'the degraded pre-flight must be countable on a metric');
+});
+
+test('SCR-10: pre-flight throws + ALL platforms cooled → no claim at all', async () => {
+    const m = fakeMetrics();
+    let getNextRoleCalled = false;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => { throw new Error('backend 503'); },
+        getNextRole: async () => { getNextRoleCalled = true; return { assignments: [] }; },
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: m,
+        // Every platform the registry knows about is cooled down.
+        cooldownCheck: () => ['dice', 'techfetch', 'linkedin', 'glassdoor', 'indeed', 'monster'],
+    });
+    const result = await o.runOnce();
+
+    assert.equal(getNextRoleCalled, false, 'must not claim once every platform is on cooldown');
+    assert.deepEqual(result, { message: 'Queue is empty for idle platforms' });
+    assert.ok(m.calls.queueCheck.includes('preflight_failed'));
+    assert.ok(m.calls.queueCheck.includes('all_cooldown'));
+});
+
+test('SCR-10: cooldown filter still applies on the happy path (pre-flight succeeds)', async () => {
+    const m = fakeMetrics();
+    let requestedPlatforms;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => ({ indeed: 1, glassdoor: 1 }),
+        getNextRole: async ({ platforms }) => {
+            requestedPlatforms = platforms;
+            return { assignments: [] };
+        },
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: m,
+        cooldownCheck: () => ['glassdoor'],
+    });
+    await o.runOnce();
+
+    assert.deepEqual(requestedPlatforms, ['indeed']);
+    assert.ok(!m.calls.queueCheck.includes('preflight_failed'), 'happy path should not record a preflight_failed check');
+});
