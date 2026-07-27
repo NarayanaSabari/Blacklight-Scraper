@@ -154,40 +154,57 @@ export class LinkedInSession {
     async #establish(sessionId) {
         const lease = await this.#acquireLease(sessionId);
         if (!lease) throw new Error('No LinkedIn credential available from API');
-        this._lease = lease;
-        // Stamp the lease birth time and (re)compute its jittered rotation cap.
-        // Done per (re)establish so every lease gets its own stable deadline.
-        this._establishedAt = this._now();
-        this._maxLeaseMs = this.#computeMaxLeaseMs();
+        try {
+            this._lease = lease;
+            // Stamp the lease birth time and (re)compute its jittered rotation cap.
+            // Done per (re)establish so every lease gets its own stable deadline.
+            this._establishedAt = this._now();
+            this._maxLeaseMs = this.#computeMaxLeaseMs();
 
-        const cred = lease.credential || {};
-        const profileKey = cred.profile_key;
-        // Per-account warm-profile model: gate on profile_key ALONE. The on-disk
-        // profile (logged in once via the per-account login command) is the only
-        // session source — we NEVER inject leased cookies (that mismatches the
-        // device fingerprint and triggers LinkedIn's security-code challenge).
-        const perAccount = !!profileKey;
+            const cred = lease.credential || {};
+            const profileKey = cred.profile_key;
+            // Per-account warm-profile model: gate on profile_key ALONE. The on-disk
+            // profile (logged in once via the per-account login command) is the only
+            // session source — we NEVER inject leased cookies (that mismatches the
+            // device fingerprint and triggers LinkedIn's security-code challenge).
+            const perAccount = !!profileKey;
 
-        if (perAccount) {
-            this._context = await this._launch({ profileKey, proxy: cred.proxy ?? null });
-            let authed = false;
-            try { authed = this._isAuthed(await this._readCookies(this._context)); }
-            catch { authed = false; }
-            if (authed) {
-                log.info('Reusing warm LinkedIn profile', { credentialId: cred.id, profileKey });
+            if (perAccount) {
+                this._context = await this._launch({ profileKey, proxy: cred.proxy ?? null });
+                let authed = false;
+                try { authed = this._isAuthed(await this._readCookies(this._context)); }
+                catch { authed = false; }
+                if (authed) {
+                    log.info('Reusing warm LinkedIn profile', { credentialId: cred.id, profileKey });
+                } else {
+                    await this.#teardown(); // don't leave a dead context alive
+                    throw new AuthError(
+                        'LinkedIn account not logged in — needs re-login',
+                        { platform: 'linkedin', code: 'NEEDS_RELOGIN' });
+                }
             } else {
-                await this.#teardown(); // don't leave a dead context alive
-                throw new AuthError(
-                    'LinkedIn account not logged in — needs re-login',
-                    { platform: 'linkedin', code: 'NEEDS_RELOGIN' });
+                // launchPersistentProfile returns a BrowserContext directly (no
+                // separate Browser handle); the operator's logged-in session lives
+                // in the on-disk profile, so we do NOT inject the lease's cookies.
+                this._context = await this._launch();
             }
-        } else {
-            // launchPersistentProfile returns a BrowserContext directly (no
-            // separate Browser handle); the operator's logged-in session lives
-            // in the on-disk profile, so we do NOT inject the lease's cookies.
-            this._context = await this._launch();
+            log.info('Persistent LinkedIn session established', { credentialId: cred.id });
+        } catch (err) {
+            // NEEDS_RELOGIN is a deliberate terminal transition: withPage's outer
+            // catch still needs to read this._lease to call
+            // reportFailure(authDead:true) on the SAME lease (that's what tells
+            // the backend the account is genuinely dead, not just "released").
+            // So leave it set here — withPage nulls it once the report lands.
+            // Every OTHER establish failure (launch crash, locked profile, dead
+            // proxy, disk full, readCookies throwing for an unrelated reason...)
+            // has no such follow-up, so hand the credential straight back to the
+            // pool or it starves with nothing using it.
+            if (err?.code !== 'NEEDS_RELOGIN') {
+                try { await lease.release(); } catch { /* best-effort */ }
+                this._lease = null;
+            }
+            throw err;
         }
-        log.info('Persistent LinkedIn session established', { credentialId: cred.id });
     }
 
     // Jittered max-lease window in ms, or null when rotation is disabled. Base
@@ -280,6 +297,12 @@ export class LinkedInSession {
                 // just storm onto other un-logged-in accounts.
                 try { await this._lease?.reportFailure?.(err.message, 0, { authDead: true }); }
                 catch { /* reporting is best-effort */ }
+                // #establish deliberately left this._lease set (see its catch)
+                // so the reportFailure call above had a lease to report on.
+                // Clear it now — the account is terminal, _context is already
+                // torn down, and nothing should hold this lease reference any
+                // longer.
+                this._lease = null;
             }
             throw err;
         } finally {
