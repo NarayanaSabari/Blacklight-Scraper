@@ -22,11 +22,25 @@ const DEFAULTS = Object.freeze({
     // so each instance falls back to this. Override with SCRAPER_DEFAULT_LOCATION
     // if you want to scope a scraper to a tighter region.
     SCRAPER_DEFAULT_LOCATION: 'United States',
+    // Manual POST /scrape used to always write one JSON file per platform to
+    // results/, with no retention (SCR-28). The scraper runs as a long-lived
+    // process on an operator-managed host, so that grows unbounded — and a
+    // full disk breaks the persistent Chrome profile flush in
+    // LinkedInSession#teardown(), which is how the logged-in LinkedIn session
+    // survives restarts. The HTTP response already returns the full result,
+    // so the file is a debugging affordance now, off by default. Set
+    // SCRAPE_SAVE_RESULTS=true to restore the old always-write behavior.
+    SCRAPE_SAVE_RESULTS: false,
 });
 
 function toInt(value, fallback) {
     const n = Number.parseInt(value, 10);
     return Number.isFinite(n) ? n : fallback;
+}
+
+function toBool(value, fallback) {
+    if (value === undefined || value === null || value === '') return fallback;
+    return value === 'true';
 }
 
 // ── .env support (zero-dependency) ──────────────────────────────────────
@@ -96,6 +110,12 @@ function buildConfig() {
             checkIntervalMs: toInt(process.env.QUEUE_CHECK_INTERVAL_MS, DEFAULTS.QUEUE_CHECK_INTERVAL_MS),
             startupDelayMs: toInt(process.env.QUEUE_CHECK_STARTUP_DELAY_MS, DEFAULTS.QUEUE_CHECK_STARTUP_DELAY_MS),
             defaultLocation: process.env.SCRAPER_DEFAULT_LOCATION || DEFAULTS.SCRAPER_DEFAULT_LOCATION,
+        }),
+
+        // SCR-28: manual /scrape results/ file write, gated off by default.
+        // See the SCRAPE_SAVE_RESULTS comment on DEFAULTS above.
+        scrape: Object.freeze({
+            saveResultsToDisk: toBool(process.env.SCRAPE_SAVE_RESULTS, DEFAULTS.SCRAPE_SAVE_RESULTS),
         }),
 
         linkedin: Object.freeze({

@@ -13,6 +13,7 @@ import { parseScrapeRequest } from '../validation/schemas.js';
 import { getScraper, PLATFORM_NAMES } from '../scrapers/registry.js';
 import { createLogger } from '../logger/index.js';
 import { sanitizeFilename, generateTimestamp } from '../core/html.js';
+import { getConfig } from '../config/env.js';
 
 const log = createLogger('route:scrape');
 
@@ -21,9 +22,14 @@ function resolvePlatforms(requested) {
     return requested.filter((p) => p !== 'all');
 }
 
-function savePlatformResults(platformName, payload, jobTitle, location, timestamp) {
-    const resultsDir = path.join(process.cwd(), 'results');
-    try { fs.mkdirSync(resultsDir, { recursive: true }); } catch { /* ignore */ }
+// Writes a per-platform JSON file to results/ — a debugging affordance, not
+// part of the response contract (the response already carries the full
+// payload). Gated behind SCRAPE_SAVE_RESULTS (see src/config/env.js), off by
+// default: this route runs unattended on a long-lived operator host, and an
+// unbounded results/ directory can fill the disk (SCR-28), which breaks the
+// persistent Chrome profile flush in LinkedInSession#teardown().
+function savePlatformResults(fsImpl, resultsDir, platformName, payload, jobTitle, location, timestamp) {
+    try { fsImpl.mkdirSync(resultsDir, { recursive: true }); } catch { /* ignore */ }
 
     const filename = `${platformName}_${sanitizeFilename(jobTitle)}_${sanitizeFilename(location)}_${timestamp}.json`;
     const filepath = path.join(resultsDir, filename);
@@ -34,12 +40,17 @@ function savePlatformResults(platformName, payload, jobTitle, location, timestam
         location,
         ...payload,
     };
-    fs.writeFileSync(filepath, JSON.stringify(body, null, 2));
+    fsImpl.writeFileSync(filepath, JSON.stringify(body, null, 2));
     log.info('Platform results saved', { filename });
     return filename;
 }
 
-export function registerScrapeRoute(app) {
+export function registerScrapeRoute(app, deps = {}) {
+    const resolveScraper = deps.getScraper ?? getScraper;
+    const saveResultsToDisk = deps.saveResultsToDisk ?? (() => getConfig().scrape.saveResultsToDisk);
+    const fsImpl = deps.fs ?? fs;
+    const resultsDir = deps.resultsDir ?? path.join(process.cwd(), 'results');
+
     app.post('/scrape', async (req, res) => {
         let params;
         try {
@@ -79,7 +90,7 @@ export function registerScrapeRoute(app) {
         };
 
         const tasks = platforms.map(async (platformName) => {
-            const scraper = getScraper(platformName);
+            const scraper = resolveScraper(platformName);
             if (!scraper) {
                 log.warn('Unknown platform requested', { platformName });
                 return {
@@ -104,10 +115,14 @@ export function registerScrapeRoute(app) {
             }
 
             let savedFile = null;
-            try {
-                savedFile = savePlatformResults(platformName, payload, jobTitle, location, timestamp);
-            } catch (error) {
-                log.error('Failed to persist platform results', { platformName, err: error.message });
+            if (saveResultsToDisk()) {
+                try {
+                    savedFile = savePlatformResults(
+                        fsImpl, resultsDir, platformName, payload, jobTitle, location, timestamp,
+                    );
+                } catch (error) {
+                    log.error('Failed to persist platform results', { platformName, err: error.message });
+                }
             }
 
             return { platformName, payload, savedFile };

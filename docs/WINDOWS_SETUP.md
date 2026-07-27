@@ -321,6 +321,20 @@ dashboard).
   npm start
   ```
 
+**Disk fills up from `results/`**
+- Manual `POST /scrape` calls used to always write a per-platform JSON
+  file (the full job list) to `results/` in the scraper's working
+  directory, with no cleanup. On this long-lived host that grows
+  unbounded, and a full disk breaks the persistent Chrome profile
+  flush on shutdown — the thing that keeps the LinkedIn login across
+  restarts — which can cost you a re-run of `npm run linkedin:login`.
+- This write is now **off by default**. The HTTP response already
+  contains the full result, so the file is only useful when you're
+  debugging a manual scrape locally. To turn it back on for a
+  session, set `SCRAPE_SAVE_RESULTS=true` (in `.env` or the shell
+  environment) before starting the scraper, and remember to delete
+  `results/` yourself when you're done — nothing prunes it.
+
 ## Architecture recap
 
 | Host | Allowlist | Why |

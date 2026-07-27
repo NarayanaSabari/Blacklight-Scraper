@@ -9,7 +9,8 @@
     "setup": "node server.js --setup",
     "linkedin:login": "node scripts/linkedin-login.js",
     "linkedin:reset": "node scripts/linkedin-reset.js",
-    "creds:clean": "node scripts/clean-credentials.js"
+    "creds:clean": "node scripts/clean-credentials.js",
+    "test": "node --test"
   },
   "keywords": [
     "job-scraper",
