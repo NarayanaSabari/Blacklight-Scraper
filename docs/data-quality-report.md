@@ -1,5 +1,30 @@
 # Scraper Data-Quality Report
 
+## Current status - 2026-07-29
+
+The current scraper paths now restore all platforms with clean, platform-appropriate
+network routes.
+
+- **Monster** requires `cloakbrowser` 0.5.2 or newer in the 0.5.x line.
+  It uses an ISP/residential proxy pool, retries DataDome blocks across IPs, and
+  treats a suppressed appsapi request as a retryable `datadome-suppressed` block.
+- **Glassdoor** warms a real job page before `/graph`, verifies `gdsid`/`gdId`
+  cookies, and rotates IPs before retrying a challenged warm-up.
+  Its API listings have empty descriptions, so one shared CloakBrowser fetches
+  server-rendered JSON-LD from job pages concurrently.
+  Rate limiting is expected: the blocked batch is abandoned early, the
+  `glassdoor-jd` IP is cooled, and remaining descriptions fall back to `N/A`.
+  The measured enrichment path returned 11–12 descriptions averaging about
+  4,200 characters in 10–18 seconds.
+- **Dice** defaults detail-page render waiting to `0 ms` because its JSON-LD is
+  present at `domcontentloaded`.
+- **TechFetch** no longer pays the dead 500 ms first-attempt and post-navigation
+  waits; its detail path remains JSDOM-based because browser navigation, not HTML
+  parsing, is the throughput limit.
+
+The dated sections below are historical snapshots and retain the measurements and
+recommendations that were true when those runs were performed.
+
 ## Monster breakthrough — 2026-06-18 (`where` bug)
 
 **`where=United States` was itself causing the DataDome 403**, not just the IP.

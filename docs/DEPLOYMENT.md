@@ -1,7 +1,7 @@
 # Blacklight Scraper — Production Deployment Runbook
 
 Pre-flight guide for pulling `main` into production and running it. All 6
-platforms are hardened (398 unit tests). Read §2 (browsers) and §6
+platforms are hardened (637 unit tests). Read §2 (browsers) and §6
 (persistent state) carefully — the CloakBrowser binary download is the
 most-missed prerequisite.
 
@@ -12,8 +12,8 @@ most-missed prerequisite.
 | Platform | Auth model | Anti-bot | Browser engine | Live-verified | Verdict |
 |---|---|---|---|---|---|
 | **Dice** | Anonymous | None | CloakBrowser | ✅ 20 runs, 997 jobs, 0 bad | Ready |
-| **Monster** | Anonymous | DataDome + 60-min cooldown | CloakBrowser | ✅ cooldown fired live | Ready (§8) |
-| **Glassdoor** | Anonymous | Geo-pin + classifier | CloakBrowser | ✅ 14 runs, 98.8% US | Ready (§8) |
+| **Monster** | Anonymous | DataDome + rotating ISP/residential IPs | CloakBrowser 0.5.2 | ✅ clean-IP path + retry wiring | Ready with a clean proxy pool |
+| **Glassdoor** | Anonymous `/graph` API | Cloudflare warm-up + per-IP detail-page rate limit | node-tls-client + CloakBrowser 0.5.2 | ✅ warmed API + description enrichment | Ready with direct discovery and pooled detail IPs |
 | **Indeed** | Profile (optional, `INDEED_PROFILE_DIR`) | Cloudflare + 60-min cooldown | CloakBrowser | ✅ anon page-1 + persistent-path wiring; ⚠️ full pagination needs a pre-existing profile | Ready anon; full needs a supplied profile + smoke |
 | **TechFetch** | Anonymous-first | None | CloakBrowser | ✅ 40 jobs/run; ⚠️ login fallback unverified | Ready anon; fallback needs smoke |
 | **LinkedIn** | Cookie (required) | Cloudflare/auth-wall | CloakBrowser | ⚠️ not run (no cookies present) | Code-ready; needs cookies + smoke |
@@ -24,11 +24,11 @@ LinkedIn is the only platform without `strictEmpty` — intentional (tuned in th
 
 ## 2. Browser engine — CloakBrowser (ALL 6 scrapers)
 
-All six scrapers run on **CloakBrowser** (stealth Chromium) — one engine, fleet-wide. TechFetch was migrated off playwright-extra so there's no longer a second stack. Playwright's own chromium is not used by any active scraper (the only remaining importer, `src/core/browser.js`, is dead code).
+All browser paths run on **CloakBrowser 0.5.2** (stealth Chromium) - one engine, fleet-wide. Glassdoor's API discovery additionally uses `node-tls-client`; its description enrichment uses CloakBrowser. TechFetch was migrated off playwright-extra so there's no longer a second active browser stack. Playwright's own Chromium is not used by any active scraper (the only remaining importer, `src/core/browser.js`, is dead code).
 
 | Engine | Scrapers | How the binary is provisioned |
 |---|---|---|
-| **CloakBrowser** (stealth Chromium) | LinkedIn, Monster, Dice, Indeed, Glassdoor, TechFetch | **Auto-downloaded (~350 MB) from GitHub on first `launch()`** → cached at `~/.cloakbrowser/`. NOT installed by `npm ci`, NOT by `playwright install`. |
+| **CloakBrowser 0.5.2** (stealth Chromium) | LinkedIn, Monster, Dice, Indeed, Glassdoor detail enrichment, TechFetch | **Auto-downloaded (~350 MB) from GitHub on first `launch()`** → cached at `~/.cloakbrowser/`. NOT installed by `npm ci`, NOT by `playwright install`. |
 
 > **CRITICAL:** On a fresh/firewalled host, `npm ci` succeeding is NOT enough. The
 > first scrape of ANY platform triggers a ~350 MB download from
@@ -111,7 +111,7 @@ Ephemeral container → volume-mount these. Otherwise: re-download the 350 MB br
 
 ## 7. Environment variables (optional; safe defaults)
 
-`PORT` (3001) · `NODE_ENV` (production) · `SCRAPER_MODE` (`daemon` = offline alerts) · `LOG_LEVEL` · `INSTANCE_ID` · `QUEUE_CHECK_INTERVAL_MS` (30000) · `MONSTER_BLOCK_COOLDOWN_MIN` / `INDEED_BLOCK_COOLDOWN_MIN` / `GLASSDOOR_BLOCK_COOLDOWN_MIN` / `TECHFETCH_BLOCK_COOLDOWN_MIN` (60) · `INDEED_ALLOW_ANONYMOUS` (`1` = Indeed page-1 without a credential) · `LINKEDIN_MAX_CONCURRENCY` (2 — concurrent LinkedIn tabs on the one account; 1 = serialize, 3 = push harder/ban-risk; read at process start) · `LINKEDIN_SINGLEFLIGHT_RELOGIN` (off by default; `1`/`true` = on. When a LinkedIn cookie dies mid-scrape, run ONE coordinated re-login that rotates to a fresh pool account while concurrent tabs wait + retry, instead of wedging the session into a "lease unavailable" storm until a process restart. REMOTE pool mode only — needs ≥1 spare healthy account to rotate to) · `SCRAPER_DEFAULT_LOCATION` · CloakBrowser vars (§2).
+`PORT` (3001) · `NODE_ENV` (production) · `SCRAPER_MODE` (`daemon` = offline alerts) · `LOG_LEVEL` · `INSTANCE_ID` · `QUEUE_CHECK_INTERVAL_MS` (30000) · `PROXY_LIST` / `PROXY_LIST_FILE` · `PROXY_EXCLUDE_PLATFORMS` · `PROXY_BLOCK_COOLDOWN_MS` (600000) · `DICE_DETAIL_RENDER_WAIT_MS` (0) · `DICE_DETAIL_CONCURRENCY` (10) · `TECHFETCH_RETRY_BACKOFF_MS` (500) · `TECHFETCH_DETAIL_CONCURRENCY` (8) · `GLASSDOOR_FETCH_DESCRIPTIONS` (on) · `GLASSDOOR_DESC_CONCURRENCY` (6) · `INDEED_ALLOW_ANONYMOUS` (`1` = Indeed page-1 without a credential) · `LINKEDIN_MAX_CONCURRENCY` (2 — concurrent LinkedIn tabs on the one account; 1 = serialize, 3 = push harder/ban-risk; read at process start) · `LINKEDIN_SINGLEFLIGHT_RELOGIN` (off by default; `1`/`true` = on. When a LinkedIn cookie dies mid-scrape, run ONE coordinated re-login that rotates to a fresh pool account while concurrent tabs wait + retry, instead of wedging the session into a "lease unavailable" storm until a process restart. REMOTE pool mode only — needs ≥1 spare healthy account to rotate to) · `SCRAPER_DEFAULT_LOCATION` · CloakBrowser vars (§2).
 
 ---
 
@@ -140,8 +140,8 @@ Ephemeral container → volume-mount these. Otherwise: re-download the 350 MB br
 
 ## 9. Known limitations & operational notes
 
-- **Monster (DataDome):** single IP blocks after ~10 cumulative requests → quiet for 60 min. Cooldown prevents the wasted-cascade, not the block. Fine for modest bursts; heavy volume wants residential proxy rotation (deferred). Self-clears.
-- **Glassdoor (anonymous depth):** title/company/location/URL 100%; salary + rating sparse, descriptions partial on sponsored listings — Glassdoor gates rich data behind login by design. Breadth, not depth. (Confirmed not a bug.)
+- **Monster (DataDome):** the appsapi can be suppressed after a page loads. The scraper records this as `datadome-suppressed`, cools the current IP, and retries on another pool IP. Keep the 3–5 second warm-up and inter-page pacing.
+- **Glassdoor:** `/graph` discovery requires a warmed direct session. Job descriptions come from concurrent server-rendered detail pages through the separate `glassdoor-jd` lease; a per-IP denial stops enrichment early and leaves some descriptions as `N/A`.
 - **IP geography:** validated from a non-US IP. Glassdoor handles it (geo-pin); Indeed/Monster returned US jobs. Different prod region → re-run §8 smokes.
 - **LinkedIn cookies expire** — recurring task; `/health/linkedin?probe=1` does a real in-session check.
 - **Two unverified code paths** (no creds to test here): Indeed full pagination, TechFetch login fallback. Reviewed + reasoned; step 9 is their first real exercise.

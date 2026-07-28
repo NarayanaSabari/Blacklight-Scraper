@@ -14,8 +14,8 @@ The six platforms split across two hosts based on what they tolerate:
 
 | Host | Platforms | Why |
 |---|---|---|
-| **Hetzner VM** (Linux, datacenter IP) | `monster, dice, techfetch` | HTTP-API or cookie-only flows; headless Chromium fine; tolerates datacenter IP |
-| **Windows machine** (residential IP) | `linkedin, glassdoor, indeed` | Need a headed Chrome (LinkedIn CDP, Glassdoor visible window) **and** a clean residential IP — Indeed and Monster are both behind Cloudflare/DataDome anti-bot which 403s the VM IP at the edge |
+| **Hetzner VM** (Linux, with an ISP/residential proxy pool) | `monster, dice, techfetch` | Monster needs the pool for DataDome; Dice and TechFetch can run headless |
+| **Windows machine** (residential IP) | `linkedin, glassdoor, indeed` | LinkedIn needs a headed Chrome; Glassdoor discovery stays direct while its detail enrichment can use the proxy pool; Indeed needs a clean residential IP |
 
 Both hosts run the **same code**. Each gets its own scraper API key with
 a `platform_allowlist` set in the central dashboard (Dashboard → API
@@ -31,10 +31,11 @@ on the key's allowlist. Adding a new host = registering a new key.
 - **Queue-driven** — polls the Blacklight backend every 30s, claims a
   role, scrapes all platforms in its allowlist **in parallel** within a
   single session, submits jobs back, completes the session
-- **Multi-platform** — Monster (HTTP API behind DataDome), Dice (Crawlee
-  + Cheerio), TechFetch (Playwright + login), LinkedIn (CDP to a real
-  Chrome with persistent profile), Glassdoor (cookie auth + stealth
-  Playwright), Indeed (cookie auth + stealth Playwright)
+- **Multi-platform** - Monster (CloakBrowser + appsapi JSON behind
+  DataDome), Dice (Crawlee + Cheerio), TechFetch (CloakBrowser + login),
+  LinkedIn (CDP to a real Chrome with persistent profile), Glassdoor
+  (`/graph` API plus CloakBrowser detail enrichment, with an opt-in browser
+  fallback), Indeed (mobile API with an opt-in browser fallback)
 - **Express API** for manual scraping (`POST /scrape`)
 - **Credential management** via the backend — credentials live in the
   central dashboard, scraper fetches them on demand
@@ -46,7 +47,7 @@ on the key's allowlist. Adding a new host = registering a new key.
 - **Node.js** ≥ 20 LTS
 - **npm** ≥ 10
 - **Google Chrome** (only on hosts that scrape LinkedIn)
-- **Playwright Chromium** — installed below
+- **CloakBrowser** - downloads its stealth Chromium on first launch
 
 ## 🔧 Installation (Linux dev / VM)
 
@@ -80,13 +81,14 @@ This will install all required packages including:
 - Cheerio (HTML parsing)
 - JSDOM (DOM manipulation)
 
-### 3. Install Playwright Browsers
+### 3. Pre-warm CloakBrowser (recommended)
 
 ```bash
-npx playwright install
+node -e "import('cloakbrowser').then(async m => { const b = await m.launch({headless:true}); await b.close(); })"
 ```
 
-This downloads Chromium, Firefox, and WebKit browsers used for scraping.
+CloakBrowser downloads and caches the browser required by the active scrapers.
+No `playwright install` is needed for the active scraping paths.
 
 ### 4. Configure Credentials
 
@@ -116,8 +118,8 @@ Then create `config/credentials.json`:
 
 `config/credentials.json` is **gitignored** — never commit it.
 
-Per-platform credentials (LinkedIn email/password, Glassdoor cookies,
-Indeed cookies, TechFetch login) live in the central dashboard
+Per-platform credentials (LinkedIn email/password, Indeed cookies,
+TechFetch login) live in the central dashboard
 (Dashboard → Credentials), not in this file. The scraper pulls them on
 demand via the `scraperCredentials` API config above.
 
@@ -291,6 +293,8 @@ Job-Scraper/
 │   │   ├── delays.js         # humanDelay, randomDelay, backoff+jitter
 │   │   ├── html.js           # stripHtmlTags, sanitizeFilename, hashString
 │   │   ├── normalize.js      # Unified master schema normalization
+│   │   ├── glassdoor-jd.js   # Shared Glassdoor detail-page parser
+│   │   ├── proxy-pool.js     # Per-platform proxy leasing and cooldowns
 │   │   └── format.js         # Format for Blacklight API submission
 │   ├── scrapers/
 │   │   └── registry.js       # Platform → scraper mapping
@@ -305,12 +309,13 @@ Job-Scraper/
 │       ├── scrape-queue.js   # POST /scrape-queue
 │       └── metrics.js        # GET /metrics (Prometheus text format)
 │
-├── scrapers/                 # Platform-specific scraping logic (unchanged selectors/flows)
+├── scrapers/                 # Platform-specific scraping logic
 │   ├── monster.js            # Monster Jobs (HTTP API)
 │   ├── dice.js               # Dice Jobs (Playwright + Crawlee)
 │   ├── techfetch.js          # TechFetch (requires login)
 │   ├── linkedin.js           # LinkedIn (CDP to existing Chrome)
-│   ├── glassdoor.js          # Glassdoor (cookie auth + stealth)
+│   ├── glassdoor.js          # Glassdoor browser fallback + detail extraction
+│   ├── glassdoor-api.js      # Glassdoor /graph discovery + detail enrichment
 │   └── indeed.js             # Indeed (cookie auth + stealth)
 │
 ├── schemas/
@@ -338,7 +343,16 @@ CDP_PORT=9222
 
 # Proxies (host:port:user:pass per entry — creds NEVER committed)
 PROXY_LIST=                     # comma/newline separated; or use the git-ignored config/proxies.txt
-PROXY_EXCLUDE_PLATFORMS=glassdoor   # platforms that must run DIRECT, never through the pool
+PROXY_EXCLUDE_PLATFORMS=glassdoor   # Glassdoor discovery direct; glassdoor-jd enrichment remains pooled
+
+# Platform performance overrides (see docs/scraper-runbook.md)
+DICE_SEARCH_RENDER_WAIT_MS=2000
+DICE_DETAIL_RENDER_WAIT_MS=0
+DICE_DETAIL_CONCURRENCY=10
+TECHFETCH_RETRY_BACKOFF_MS=500
+TECHFETCH_DETAIL_CONCURRENCY=8
+GLASSDOOR_FETCH_DESCRIPTIONS=true
+GLASSDOOR_DESC_CONCURRENCY=6
 
 # Observability (optional — auto-enabled when blacklight.apiUrl is configured)
 INSTANCE_ID=                    # Unique host identifier; defaults to os.hostname()
@@ -347,60 +361,8 @@ TELEMETRY_URL=                  # Override telemetry base URL (default: blacklig
 TELEMETRY_KEY=                  # Override telemetry key (default: blacklight.apiKey)
 ```
 
-### Which platforms want which IP
-
-Verified live 2026-07-28 — the platforms actively disagree, so a host serving all
-of them needs both paths:
-
-| Platform | Wants | Behaviour on the wrong path |
-|---|---|---|
-| Monster | **Proxy** (ISP/residential pool) | DataDome suppresses the appsapi on a plain residential line |
-| Glassdoor `/graph` | **Direct** (residential) | Cloudflare challenges ISP-proxy IPs → no session cookies → 403 |
-| Dice, TechFetch, Indeed | either | works both ways |
-
-Hence `PROXY_EXCLUDE_PLATFORMS=glassdoor` alongside a populated `PROXY_LIST`:
-Monster gets the pool, Glassdoor discovery stays direct, the rest don't care.
-
-The warmed Monster profile is an exception: `sticky()` deliberately keeps its
-pinned proxy even when Monster appears in `PROXY_EXCLUDE_PLATFORMS`, because a
-DataDome cookie solved inside `MONSTER_PROFILE_DIR` is bound to that exit IP.
-
-### Glassdoor descriptions cost one IP per batch
-
-Glassdoor's search API returns listings with an **empty** description field, and
-the backend importer drops any job under 50 characters of description — so
-without the enrichment step below, every Glassdoor job is scraped and then
-discarded (that was prod's 0.26% import rate: 444k found, 1.1k imported).
-
-The API path therefore fetches each listing's own page (server-rendered JSON-LD)
-through one shared CloakBrowser, concurrently and with no per-job sleeps:
-~12 descriptions averaging ~4,200 chars in 10-18s.
-
-The catch, verified 2026-07-28: **Glassdoor rate-limits job-page fetches per IP
-and allows roughly one batch before answering 429 "Access denied."** A fresh IP
-returns 200 with a ~500KB page; a burned one returns a ~7.5KB denial page. The
-scraper detects this, stops the batch immediately rather than grinding through
-it, cools that IP in the pool, and falls back to `'N/A'` descriptions for the
-rest — it never crashes, it just yields less.
-
-Practical consequence: **sustained Glassdoor throughput needs roughly one clean
-IP per role-batch per cooldown window** (`PROXY_BLOCK_COOLDOWN_MS`, default 10
-min). Three IPs ≈ three roles per 10 minutes. Enrichment leases under its own
-pool key `glassdoor-jd`, separate from discovery, so you can tune them
-independently:
-
-```bash
-PROXY_EXCLUDE_PLATFORMS=glassdoor              # discovery direct, enrichment pooled (default intent)
-PROXY_EXCLUDE_PLATFORMS=glassdoor,glassdoor-jd # force BOTH direct (small/no pool)
-GLASSDOOR_FETCH_DESCRIPTIONS=false             # skip enrichment entirely (jobs will be dropped by the importer)
-GLASSDOOR_DESC_CONCURRENCY=6                   # parallel job-page fetches
-```
-
-**CloakBrowser must stay current.** Monster was fully DataDome-blocked (403 on
-the very first homepage warm-up) on cloakbrowser 0.3.x and started returning 36
-jobs/query on 0.5.2 with no other change. Anti-bot evasion is a moving target —
-treat a stale `cloakbrowser` pin as a likely cause of any sudden platform-wide
-block, and check `npm view cloakbrowser version` before debugging further.
+Platform routing, Glassdoor's per-IP detail-page limit, and all platform-specific
+performance knobs are maintained in the [scraper runbook](docs/scraper-runbook.md).
 
 ### LinkedIn — log in once to the persistent stealth profile
 
@@ -536,16 +498,16 @@ success/failure back so the backend can rotate / cool down bad creds.
 | Dice | None — public scrape | n/a |
 | TechFetch | Email + password | Dashboard → Credentials → TechFetch |
 | LinkedIn | Email + password (one-time interactive login per host, then persistent profile) | Dashboard → Credentials → LinkedIn |
-| Glassdoor | JSON cookie array (export from a cleared browser) | Dashboard → Credentials → Glassdoor |
+| Glassdoor | None for the primary `/graph` API; browser fallback is opt-in | n/a unless the fallback flow is enabled |
 | Indeed | JSON cookie array (export from a cleared browser) | Dashboard → Credentials → Indeed |
 
 ### IP-binding caveats
 
-Cleared browser sessions (Glassdoor, Indeed cookies; DataDome on Monster)
-are **bound to the IP that solved the captcha**. Cookies exported from a
-laptop won't authenticate when sent from a VM in a different region.
-This is why LinkedIn/Glassdoor/Indeed run on a residential Windows host
-rather than the VM — see the deployment-topology table at the top.
+Cleared browser sessions (Indeed cookies; DataDome on Monster) are **bound to
+the IP that solved the captcha**. Cookies exported from a laptop won't
+authenticate when sent from a VM in a different region. Glassdoor's primary
+API path warms its own session and uses direct discovery plus separate pooled
+detail enrichment; see the deployment-topology table at the top.
 
 ## 🐛 Troubleshooting
 
@@ -560,18 +522,16 @@ rather than the VM — see the deployment-topology table at the top.
 - Check session status in Blacklight admin panel
 
 ### "No credentials available"
-- No LinkedIn/Glassdoor credentials in the backend pool
+- No LinkedIn credentials in the backend pool
 - Add credentials via Blacklight admin panel
 - Scraper will automatically fetch them from the API
 
-### Playwright Installation Issues
+### Browser Installation Issues
 
 ```bash
-# Force reinstall browsers
-npx playwright install --force
-
-# Install system dependencies (Linux)
-npx playwright install-deps
+# CloakBrowser provisions its browser on first launch.
+# On Linux, install the host libraries required by Chromium if needed.
+npm start
 ```
 
 ### Module Import Errors
