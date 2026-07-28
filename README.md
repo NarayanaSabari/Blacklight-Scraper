@@ -336,12 +336,67 @@ QUEUE_CHECK_STARTUP_DELAY_MS=5000
 CHROME_PATH=/usr/bin/google-chrome
 CDP_PORT=9222
 
+# Proxies (host:port:user:pass per entry — creds NEVER committed)
+PROXY_LIST=                     # comma/newline separated; or use the git-ignored config/proxies.txt
+PROXY_EXCLUDE_PLATFORMS=glassdoor   # platforms that must run DIRECT, never through the pool
+
 # Observability (optional — auto-enabled when blacklight.apiUrl is configured)
 INSTANCE_ID=                    # Unique host identifier; defaults to os.hostname()
 SCRAPER_MODE=interactive        # daemon | interactive (daemon fires offline alerts)
 TELEMETRY_URL=                  # Override telemetry base URL (default: blacklight.apiUrl)
 TELEMETRY_KEY=                  # Override telemetry key (default: blacklight.apiKey)
 ```
+
+### Which platforms want which IP
+
+Verified live 2026-07-28 — the platforms actively disagree, so a host serving all
+of them needs both paths:
+
+| Platform | Wants | Behaviour on the wrong path |
+|---|---|---|
+| Monster | **Proxy** (ISP/residential pool) | DataDome suppresses the appsapi on a plain residential line |
+| Glassdoor `/graph` | **Direct** (residential) | Cloudflare challenges ISP-proxy IPs → no session cookies → 403 |
+| Dice, TechFetch, Indeed | either | works both ways |
+
+Hence `PROXY_EXCLUDE_PLATFORMS=glassdoor` alongside a populated `PROXY_LIST`:
+Monster gets the pool, Glassdoor discovery stays direct, the rest don't care.
+
+### Glassdoor descriptions cost one IP per batch
+
+Glassdoor's search API returns listings with an **empty** description field, and
+the backend importer drops any job under 50 characters of description — so
+without the enrichment step below, every Glassdoor job is scraped and then
+discarded (that was prod's 0.26% import rate: 444k found, 1.1k imported).
+
+The API path therefore fetches each listing's own page (server-rendered JSON-LD)
+through one shared CloakBrowser, concurrently and with no per-job sleeps:
+~12 descriptions averaging ~4,200 chars in 10-18s.
+
+The catch, verified 2026-07-28: **Glassdoor rate-limits job-page fetches per IP
+and allows roughly one batch before answering 429 "Access denied."** A fresh IP
+returns 200 with a ~500KB page; a burned one returns a ~7.5KB denial page. The
+scraper detects this, stops the batch immediately rather than grinding through
+it, cools that IP in the pool, and falls back to `'N/A'` descriptions for the
+rest — it never crashes, it just yields less.
+
+Practical consequence: **sustained Glassdoor throughput needs roughly one clean
+IP per role-batch per cooldown window** (`PROXY_BLOCK_COOLDOWN_MS`, default 10
+min). Three IPs ≈ three roles per 10 minutes. Enrichment leases under its own
+pool key `glassdoor-jd`, separate from discovery, so you can tune them
+independently:
+
+```bash
+PROXY_EXCLUDE_PLATFORMS=glassdoor              # discovery direct, enrichment pooled (default intent)
+PROXY_EXCLUDE_PLATFORMS=glassdoor,glassdoor-jd # force BOTH direct (small/no pool)
+GLASSDOOR_FETCH_DESCRIPTIONS=false             # skip enrichment entirely (jobs will be dropped by the importer)
+GLASSDOOR_DESC_CONCURRENCY=6                   # parallel job-page fetches
+```
+
+**CloakBrowser must stay current.** Monster was fully DataDome-blocked (403 on
+the very first homepage warm-up) on cloakbrowser 0.3.x and started returning 36
+jobs/query on 0.5.2 with no other change. Anti-bot evasion is a moving target —
+treat a stale `cloakbrowser` pin as a likely cause of any sudden platform-wide
+block, and check `npm view cloakbrowser version` before debugging further.
 
 ### LinkedIn — log in once to the persistent stealth profile
 

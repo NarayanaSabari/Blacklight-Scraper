@@ -378,9 +378,10 @@ class TechFetchScraper {
     async extractJobDetails(jobLink, retryCount = 0, page = null) {
         const maxRetries = 3;
         const baseTimeout = 15000;
-        // Polite-but-not-glacial delay. Original 2000ms was overkill — TechFetch
-        // never rate-limited at this rate across 463+ historical sessions.
-        const baseDelay = 500;
+        // Retry backoff only. This was previously also spent on the FIRST attempt,
+        // costing 500ms per job for nothing — TechFetch has never rate-limited
+        // across 463+ historical sessions. Tunable via TECHFETCH_RETRY_BACKOFF_MS.
+        const baseDelay = Number.parseInt(process.env.TECHFETCH_RETRY_BACKOFF_MS, 10) || 500;
         // Allow a per-call page so we can parallelize detail fetches across
         // multiple Playwright pages within the same browser context (cookies
         // are shared, login persists).
@@ -389,15 +390,17 @@ class TechFetchScraper {
         try {
             logProgress('TechFetch', `   Fetching details for: ${jobLink.split('/').pop().substring(0, 30)}...${retryCount > 0 ? ` (retry ${retryCount}/${maxRetries})` : ''}`);
 
-            const delay = baseDelay * Math.pow(1.5, retryCount);
-            await targetPage.waitForTimeout(delay);
+            if (retryCount > 0) {
+                await targetPage.waitForTimeout(baseDelay * Math.pow(1.5, retryCount));
+            }
 
             const response = await targetPage.goto(jobLink, {
                 waitUntil: 'domcontentloaded',
                 timeout: baseTimeout
             });
 
-            await targetPage.waitForTimeout(500);
+            // No render wait: we parse the raw HTTP body below, not the live DOM,
+            // so the bytes are already complete the moment goto() resolves.
             const html = await response.text();
             
             const dom = new JSDOM(html);
@@ -763,8 +766,12 @@ class TechFetchScraper {
                 // shared via the browser context, so login session persists). 4 is
                 // enough to ~4× detail throughput without spamming TechFetch.
                 if (includeDetails) {
-                    logProgress('TechFetch', `   📋 Fetching details for ${jobs.length} jobs (concurrency=4)...`);
-                    const concurrency = Math.min(4, jobs.length);
+                    // Detail fetching dominates wall time and TechFetch has no rate
+                    // limiting, but scaling is sublinear (measured ~2x at 6-way, the
+                    // browser is the limit) — tune with TECHFETCH_DETAIL_CONCURRENCY.
+                    const wanted = Number.parseInt(process.env.TECHFETCH_DETAIL_CONCURRENCY, 10) || 8;
+                    const concurrency = Math.min(wanted, jobs.length);
+                    logProgress('TechFetch', `   📋 Fetching details for ${jobs.length} jobs (concurrency=${concurrency})...`);
                     const queue = jobs.map((job, idx) => ({ job, idx }));
 
                     const mergeDetails = (job, details) => ({

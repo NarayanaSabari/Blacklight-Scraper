@@ -65,10 +65,26 @@ export function loadProxies(env = process.env, deps = {}) {
     return out;
 }
 
+// Platforms that must NOT be proxied, from PROXY_EXCLUDE_PLATFORMS (comma
+// separated). Platforms disagree about what a "good" IP is: verified 2026-07-28,
+// Monster returns jobs through Decodo ISP IPs but is DataDome-blocked on a plain
+// residential line, while Glassdoor is the exact inverse — Cloudflare challenges
+// those same ISP IPs and only lets the residential one through. So the pool has
+// to be per-platform rather than all-or-nothing for a host.
+export function excludedPlatforms(env = process.env) {
+    return new Set(
+        String(env.PROXY_EXCLUDE_PLATFORMS ?? '')
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean),
+    );
+}
+
 export class ProxyPool {
-    constructor(proxies = [], { cooldownMs, now = () => Date.now() } = {}) {
+    constructor(proxies = [], { cooldownMs, now = () => Date.now(), excluded } = {}) {
         this._proxies = proxies;
         this._cooldownMs = cooldownMs ?? defaultCooldownMs();
+        this._excluded = excluded ?? excludedPlatforms();
         this._now = now;
         this._rr = 0;
         this._cooledUntil = new Map();      // id -> timestamp
@@ -97,6 +113,8 @@ export class ProxyPool {
     // cooled, returns the one recovering soonest so we keep trying rather than
     // falling back to the (blocked) datacenter IP.
     acquire(platform = null) {
+        // Opted out for this platform → run direct, as if no pool were configured.
+        if (platform && this._excluded.has(String(platform).toLowerCase())) return null;
         const n = this._proxies.length;
         if (n === 0) return null;
         let chosen = null;

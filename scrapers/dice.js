@@ -177,14 +177,24 @@ export function extractWorkplaceType($job) {
     return badge.text().trim() || null;
 }
 
+function intEnv(name, fallback) {
+    const n = Number.parseInt(process.env[name], 10);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 const CONFIG = {
     MAX_PAGES: 5,
     MAX_JOBS: 40,   // detail-page count drives proxy bandwidth; 40 keeps cost sane
     SEARCH_NAV_TIMEOUT_MS: 30000,
-    SEARCH_RENDER_WAIT_MS: 2000,
+    SEARCH_RENDER_WAIT_MS: intEnv('DICE_SEARCH_RENDER_WAIT_MS', 2000),
     DETAIL_NAV_TIMEOUT_MS: 30000,
-    DETAIL_RENDER_WAIT_MS: 2000,
-    DETAIL_CONCURRENCY: 10,
+    // The detail page's payload is the server-rendered jobDetailStructuredData
+    // JSON-LD, which is in the HTML at domcontentloaded — waiting for React to
+    // hydrate bought nothing but cost 2s on every job. Kept tunable in case a
+    // future Dice layout does need hydration; a rise in "Detail dropped
+    // (dom_changed)" is the signal that it does.
+    DETAIL_RENDER_WAIT_MS: intEnv('DICE_DETAIL_RENDER_WAIT_MS', 0),
+    DETAIL_CONCURRENCY: intEnv('DICE_DETAIL_CONCURRENCY', 10),
     DETAIL_CONTEXTS: 5,
     DETAIL_DOM_CHANGED_THRESHOLD: 0.30,  // > 30% bad rows = batch DOM changed
 };
@@ -326,7 +336,7 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
                 let pageHtml = '';
                 try {
                     await jobPage.goto(request.url, { waitUntil: 'domcontentloaded', timeout: CONFIG.DETAIL_NAV_TIMEOUT_MS });
-                    await jobPage.waitForTimeout(CONFIG.DETAIL_RENDER_WAIT_MS);
+                    if (CONFIG.DETAIL_RENDER_WAIT_MS > 0) await jobPage.waitForTimeout(CONFIG.DETAIL_RENDER_WAIT_MS);
                     pageHtml = await jobPage.content();
                 } catch (e) {
                     logProgress('Dice', `Detail nav failed: ${request.url} — ${e.message}`);
