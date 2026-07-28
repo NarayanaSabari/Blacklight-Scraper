@@ -103,6 +103,8 @@ export class ProxyPool {
     // A FIXED proxy (no rotation), defaulting to the first configured IP.
     // For warmed-profile flows where a manually-solved datadome cookie is bound
     // to one specific IP — the warm-up and the scrape MUST use the same exit IP.
+    // This deliberately ignores PROXY_EXCLUDE_PLATFORMS because the caller has
+    // explicitly opted into a pinned IP.
     sticky(index = 0) {
         if (this._proxies.length === 0) return null;
         return this._playwright(this._proxies[index % this._proxies.length]);

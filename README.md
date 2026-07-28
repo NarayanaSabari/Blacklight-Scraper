@@ -361,6 +361,10 @@ of them needs both paths:
 Hence `PROXY_EXCLUDE_PLATFORMS=glassdoor` alongside a populated `PROXY_LIST`:
 Monster gets the pool, Glassdoor discovery stays direct, the rest don't care.
 
+The warmed Monster profile is an exception: `sticky()` deliberately keeps its
+pinned proxy even when Monster appears in `PROXY_EXCLUDE_PLATFORMS`, because a
+DataDome cookie solved inside `MONSTER_PROFILE_DIR` is bound to that exit IP.
+
 ### Glassdoor descriptions cost one IP per batch
 
 Glassdoor's search API returns listings with an **empty** description field, and

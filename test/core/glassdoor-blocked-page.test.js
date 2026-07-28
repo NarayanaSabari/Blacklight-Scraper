@@ -16,6 +16,7 @@ test('isBlockedPage: rate-limit and forbidden statuses are blocks', () => {
 
 test('isBlockedPage: recognises the interstitial bodies even on a 200', () => {
     assert.equal(isBlockedPage(200, '<title>Access denied | www.glassdoor.com used Cloudflare</title>'), true);
+    assert.equal(isBlockedPage(200, '<title>Security</title>'), true);
     assert.equal(isBlockedPage(200, '<title>Just a moment...</title>'), true);
     assert.equal(isBlockedPage(200, '<title>Attention Required! | Cloudflare</title>'), true);
 });

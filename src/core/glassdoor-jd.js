@@ -16,7 +16,7 @@ import * as cheerio from 'cheerio';
 export function isBlockedPage(status, html) {
     if (status === 429 || status === 403) return true;
     const head = String(html ?? '').slice(0, 2000);
-    return /Access denied|Just a moment|Attention Required/i.test(head);
+    return /Access denied|Security|Just a moment|Attention Required/i.test(head);
 }
 
 export function extractJobDetailsFromHTML(html) {
