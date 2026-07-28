@@ -27,6 +27,11 @@ test('isBlockedPage: a real job page is not a block', () => {
     assert.equal(isBlockedPage(undefined, real), false);
 });
 
+test('isBlockedPage: a security-related job title is not a block', () => {
+    const real = '<html><head><title>Acme hiring Senior Security Engineer</title></head><body>Job details</body></html>';
+    assert.equal(isBlockedPage(200, real), false);
+});
+
 test('isBlockedPage: missing/empty input is not treated as a block', () => {
     assert.equal(isBlockedPage(200, ''), false);
     assert.equal(isBlockedPage(200, null), false);

@@ -4,6 +4,10 @@
 // so neither creates a circular import.
 import * as cheerio from 'cheerio';
 
+function isSecurityInterstitialTitle(title) {
+    return /^Security$/i.test(title.trim());
+}
+
 // Extract job details from a Glassdoor job detail page's HTML. Returns null
 // on a Cloudflare interstitial (title says "Security" / "Just a moment"),
 // otherwise an object with `fullDescription` set when one was found.
@@ -15,15 +19,18 @@ import * as cheerio from 'cheerio';
 // batch on an address Glassdoor has already shut out.
 export function isBlockedPage(status, html) {
     if (status === 429 || status === 403) return true;
-    const head = String(html ?? '').slice(0, 2000);
-    return /Access denied|Security|Just a moment|Attention Required/i.test(head);
+    const page = String(html ?? '');
+    const head = page.slice(0, 2000);
+    if (/Access denied|Just a moment|Attention Required/i.test(head)) return true;
+    const $ = cheerio.load(page);
+    return isSecurityInterstitialTitle($('title').text());
 }
 
 export function extractJobDetailsFromHTML(html) {
     const $ = cheerio.load(html);
     const title = $('title').text().trim();
 
-    if (title.includes('Security') || title.includes('Just a moment')) {
+    if (isSecurityInterstitialTitle(title) || title.includes('Just a moment')) {
         return null;
     }
 
