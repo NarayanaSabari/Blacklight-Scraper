@@ -390,7 +390,13 @@ test('a failed launch does not hold a seat hostage', async () => {
 test('the seat is released even when close() throws', async () => {
     __resetLicensePoolForTest();
     process.env.CLOAKBROWSER_LICENSE_KEYS = 'solo';
-    __setLauncherForTest({ launch: async () => fakeBrowser(async () => { throw new Error('close boom'); }) });
+    let closeAttempts = 0;
+    __setLauncherForTest({
+        launch: async () => fakeBrowser(async () => {
+            closeAttempts += 1;
+            if (closeAttempts === 1) throw new Error('close boom');
+        }),
+    });
     try {
         const b = await launch({});
         await assert.rejects(() => b.close(), /close boom/);
