@@ -354,6 +354,10 @@ TECHFETCH_DETAIL_CONCURRENCY=8
 GLASSDOOR_FETCH_DESCRIPTIONS=true
 GLASSDOOR_DESC_CONCURRENCY=6
 
+# CloakBrowser session seats — ONE key per concurrent browser platform.
+# Comma/newline separated, or one per line in git-ignored config/cloakbrowser-keys.txt
+CLOAKBROWSER_LICENSE_KEYS=
+
 # Observability (optional — auto-enabled when blacklight.apiUrl is configured)
 INSTANCE_ID=                    # Unique host identifier; defaults to os.hostname()
 SCRAPER_MODE=interactive        # daemon | interactive (daemon fires offline alerts)

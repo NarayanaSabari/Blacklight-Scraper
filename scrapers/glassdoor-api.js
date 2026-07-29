@@ -10,7 +10,7 @@
 // Verified 2026-06-17: HTTP 200, 30 real jobs/page through the residential
 // proxy. Method derived from JobSpy (speedyapply/JobSpy) glassdoor module.
 import fs from 'node:fs';
-import { launch } from 'cloakbrowser';
+import { launch } from '../src/core/browser-pool.js';
 import { initTLS, Session } from 'node-tls-client';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { getProxyPool } from '../src/core/proxy-pool.js';

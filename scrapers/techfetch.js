@@ -3,7 +3,7 @@
 // puppeteer-extra-plugin-stealth; CloakBrowser supplies a coherent stealth
 // fingerprint out of the box, so the manual launch args + StealthPlugin + the
 // hardcoded Chrome/120 UA are no longer needed.
-import { launch } from 'cloakbrowser';
+import { launch } from '../src/core/browser-pool.js';
 import { JSDOM } from 'jsdom';
 import { createLogger } from '../src/logger/index.js';
 import { applyResourceBlocking } from '../src/core/resource-blocking.js';

@@ -12,7 +12,7 @@
 // from the API is roughly the same as the DOM ceiling, just paginated
 // via &page=N.
 
-import { launch, launchPersistentContext } from 'cloakbrowser';
+import { launch, launchPersistentContext } from '../src/core/browser-pool.js';
 import { createLogger } from '../src/logger/index.js';
 import { applyResourceBlocking } from '../src/core/resource-blocking.js';
 import { getProxyPool } from '../src/core/proxy-pool.js';

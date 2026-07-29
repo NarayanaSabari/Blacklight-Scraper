@@ -31,7 +31,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import * as cheerio from 'cheerio';
-import { launch, launchPersistentContext } from 'cloakbrowser';
+import { launch, launchPersistentContext } from '../src/core/browser-pool.js';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';

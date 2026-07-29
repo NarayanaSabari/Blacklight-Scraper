@@ -7,7 +7,7 @@
 // fingerprint surface). humanize:false because there's nothing to fool
 // and the behavioral overhead would slow the 5-page-then-100-detail
 // scrape pattern down meaningfully.
-import { launch } from 'cloakbrowser';
+import { launch } from '../src/core/browser-pool.js';
 import { CheerioCrawler, RequestQueue } from 'crawlee';
 import * as cheerio from 'cheerio';
 import { createLogger } from '../src/logger/index.js';

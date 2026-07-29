@@ -8,7 +8,7 @@
 // CloakBrowser eliminates all of that — anonymous fresh launches load
 // search-result pages cleanly.
 import * as cheerio from 'cheerio';
-import { launch } from 'cloakbrowser';
+import { launch } from '../src/core/browser-pool.js';
 import { createLogger } from '../src/logger/index.js';
 import { applyResourceBlocking } from '../src/core/resource-blocking.js';
 import { getProxyPool } from '../src/core/proxy-pool.js';

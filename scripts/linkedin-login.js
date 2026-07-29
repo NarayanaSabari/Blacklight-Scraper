@@ -19,7 +19,7 @@
 //
 // The profile dir defaults to ~/.blacklight-linkedin-profile; override with
 // LINKEDIN_PROFILE_DIR (must match what the scraper uses).
-import { launchPersistentContext } from 'cloakbrowser';
+import { launchPersistentContext } from '../src/core/browser-pool.js';
 import { linkedInProfileDir, launchPersistentProfile } from '../scrapers/linkedin.js';
 import { saveLinkedinCredential } from '../src/setup/linkedin-credential.js';
 import { defaultAsk } from '../src/setup/io.js';

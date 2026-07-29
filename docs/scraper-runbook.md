@@ -94,6 +94,42 @@ Monster is DataDome-gated. The scraper warms up monster.com (so DataDome's JS mi
 
 ---
 
+## CloakBrowser session seats (one licence key per concurrent browser)
+
+CloakBrowser enforces its concurrent-session limit **per licence key, globally** —
+not per process. Verified 2026-07-28: two browsers on one key leaves one alive and
+kills the other with `Target page, context or browser has been closed`; three
+leaves one; two separate OS processes collide identically, so process isolation is
+no escape. cloakbrowser's own error 76 says it outright: "session limit reached
+for your plan."
+
+This bit us because the orchestrator scrapes **all of a role's platforms in
+parallel**. The old prod VM key allowed `["dice","glassdoor","indeed","techfetch"]`
+— four browsers on one licence, three of them killed on every assignment. It shows
+up as `failed` session_platform_status rows and near-instant platform failures,
+not as an obvious licensing error.
+
+`src/core/browser-pool.js` wraps `launch` / `launchPersistentContext` so every
+scraper leases a seat from `src/core/license-pool.js` for the browser's lifetime.
+Configure keys with `CLOAKBROWSER_LICENSE_KEYS` (comma/newline separated) or one
+per line in the git-ignored `config/cloakbrowser-keys.txt`. **Never commit keys.**
+
+**Sizing rule: one key per browser platform you want running concurrently.**
+Measured on this fleet with three browser platforms in parallel:
+
+| Keys | Behaviour | Result |
+|---|---|---|
+| 1 (before the pool) | dice survives, techfetch killed after 2s | ~40 jobs, two scrapes lost |
+| 2 | the third platform queues for a seat | 116 jobs (40+40+36) in 66s |
+
+Fewer keys than platforms is safe — the extras wait rather than fail. With **no**
+keys configured the pool still exposes a single seat, so launches serialise
+instead of killing each other while cloakbrowser falls back to its own
+`CLOAKBROWSER_LICENSE_KEY` / `~/.cloakbrowser/license.key` resolution.
+
+Note the plan matters: a key on the free plan is `{valid: true, plan: 'free'}`
+with a one-session limit, so extra concurrency means extra keys (or a paid plan).
+
 ## Global knobs
 - `SCRAPER_HEADLESS` — default headless; `false`/`0`/`no`/`off` → **headful** (a stronger stealth posture for DataDome/Cloudflare; on Linux use `xvfb-run -a`).
 - `SCRAPER_BLOCK_RESOURCES` — block images/media/fonts to cut proxy bandwidth (`SCRAPER_BLOCK_RESOURCE_TYPES` to customize). Measured ~20% bandwidth savings.
