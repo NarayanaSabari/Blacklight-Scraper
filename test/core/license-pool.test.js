@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import nodeFs from 'node:fs';
 import path from 'node:path';
-import { LicensePool, loadLicenseKeys, parseKeyLine } from '../../src/core/license-pool.js';
+import { LicensePool, loadLicenseKeys, lockDirectory, parseKeyLine } from '../../src/core/license-pool.js';
 import { __setLauncherForTest, launch, launchPersistentContext } from '../../src/core/browser-pool.js';
 import { __resetLicensePoolForTest } from '../../src/core/license-pool.js';
 
@@ -11,6 +11,11 @@ nodeFs.rmSync(browserLockDir, { recursive: true, force: true });
 process.env.CLOAKBROWSER_LICENSE_LOCK_DIR = browserLockDir;
 test.after(() => {
     delete process.env.CLOAKBROWSER_LICENSE_LOCK_DIR;
+    nodeFs.rmSync(browserLockDir, { recursive: true, force: true });
+});
+test.afterEach(() => {
+    __resetLicensePoolForTest();
+    __setLauncherForTest(null);
     nodeFs.rmSync(browserLockDir, { recursive: true, force: true });
 });
 
@@ -107,9 +112,11 @@ function fakeFs(initialFiles = new Map()) {
     const files = new Map(initialFiles);
     const descriptors = new Map();
     let nextDescriptor = 1;
-    const calls = { mkdir: 0, open: 0, write: 0, close: 0, read: 0, unlink: 0 };
+    const calls = { mkdir: 0, open: 0, write: 0, fsync: 0, close: 0, read: 0, unlink: 0 };
+    const mtimes = new Map();
     return {
         files,
+        mtimes,
         calls,
         mkdirSync() { calls.mkdir += 1; },
         openSync(file, flags) {
@@ -119,12 +126,15 @@ function fakeFs(initialFiles = new Map()) {
             const fd = nextDescriptor++;
             descriptors.set(fd, file);
             files.set(file, '');
+            mtimes.set(file, Date.now());
             return fd;
         },
         writeSync(fd, data) {
             calls.write += 1;
             files.set(descriptors.get(fd), data);
+            mtimes.set(descriptors.get(fd), Date.now());
         },
+        fsyncSync() { calls.fsync += 1; },
         closeSync(fd) {
             calls.close += 1;
             descriptors.delete(fd);
@@ -134,9 +144,14 @@ function fakeFs(initialFiles = new Map()) {
             if (!files.has(file)) throw fsError('ENOENT');
             return files.get(file);
         },
+        statSync(file) {
+            if (!files.has(file)) throw fsError('ENOENT');
+            return { mtimeMs: mtimes.get(file) ?? Date.now() };
+        },
         unlinkSync(file) {
             calls.unlink += 1;
             if (!files.delete(file)) throw fsError('ENOENT');
+            mtimes.delete(file);
         },
     };
 }
@@ -163,9 +178,77 @@ test('lock is acquired with O_EXCL and removed on release', async () => {
     const lease = await pool.acquire();
     assert.equal(deps.files.size, 1);
     assert.equal([...deps.files.values()][0], '101\n');
+    assert.equal(deps.calls.write, 1);
     lease.release();
     assert.equal(deps.files.size, 0);
     assert.equal(deps.calls.unlink, 1);
+});
+
+test('incomplete lock contents remain held during the publication grace period', async () => {
+    const deps = fakeFs();
+    const pool = new LicensePool(['shared-key'], {
+        fs: deps,
+        lockDir: '/locks',
+        pid: 202,
+        process: fakeProcess(202),
+        env: { CLOAKBROWSER_LICENSE_LOCK_RETRY_MS: '1', CLOAKBROWSER_LICENSE_LOCK_INCOMPLETE_GRACE_SEC: '5' },
+    });
+    const pathToLock = pool._seats[0].lockPath;
+    deps.files.set(pathToLock, '');
+    deps.mtimes.set(pathToLock, Date.now());
+    const pending = pool.acquire();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(pool.stats().waiting, 1);
+    deps.files.set(pathToLock, '202\n');
+    const lease = await pending;
+    lease.release();
+});
+
+test('incomplete lock contents are reclaimed after the grace period', async () => {
+    const deps = fakeFs();
+    const pool = new LicensePool(['shared-key'], {
+        fs: deps,
+        lockDir: '/locks',
+        pid: 202,
+        process: fakeProcess(202),
+        env: { CLOAKBROWSER_LICENSE_LOCK_RETRY_MS: '1', CLOAKBROWSER_LICENSE_LOCK_INCOMPLETE_GRACE_MS: '1' },
+    });
+    const pathToLock = pool._seats[0].lockPath;
+    deps.files.set(pathToLock, '');
+    deps.mtimes.set(pathToLock, Date.now() - 100);
+    const lease = await pool.acquire();
+    assert.equal(deps.files.get(pathToLock), '202\n');
+    lease.release();
+});
+
+test('failed lock cleanup keeps the seat unavailable until retry succeeds', async () => {
+    const deps = fakeFs();
+    const pool = new LicensePool(['shared-key'], {
+        fs: deps,
+        lockDir: '/locks',
+        pid: 202,
+        process: fakeProcess(202, new Set([202])),
+        env: { CLOAKBROWSER_LICENSE_LOCK_RETRY_MS: '1' },
+    });
+    const originalUnlink = deps.unlinkSync;
+    let failures = 1;
+    deps.unlinkSync = (file) => {
+        if (failures > 0) {
+            failures -= 1;
+            throw fsError('EACCES');
+        }
+        originalUnlink(file);
+    };
+    const lease = await pool.acquire();
+    lease.release();
+    assert.equal(pool.stats().inUse, 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(pool.stats().inUse, 0);
+    assert.equal(deps.files.size, 0);
+});
+
+test('lockDirectory honors the injected environment setting', () => {
+    assert.equal(lockDirectory({ CLOAKBROWSER_LICENSE_LOCK_DIR: '/locks' }), '/locks');
 });
 
 test('a second pool waits for a key locked by another live process', async () => {

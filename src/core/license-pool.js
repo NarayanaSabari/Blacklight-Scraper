@@ -33,9 +33,14 @@ const log = createLogger('license-pool');
 const DEFAULT_FILE = 'config/cloakbrowser-keys.txt';
 const DEFAULT_LOCK_RETRY_MS = 250;
 const DEFAULT_LOCK_DIR = '.blacklight-cloakbrowser-seats';
+const DEFAULT_INCOMPLETE_LOCK_GRACE_MS = 5_000;
+const MAX_CLEANUP_RETRY_MS = 5_000;
 
-export function lockDirectory() {
-    return path.join(os.homedir(), DEFAULT_LOCK_DIR);
+export function lockDirectory(env = process.env) {
+    const configured = env?.CLOAKBROWSER_LICENSE_LOCK_DIR;
+    return configured && String(configured).trim()
+        ? String(configured)
+        : path.join(os.homedir(), DEFAULT_LOCK_DIR);
 }
 
 function lockName(key) {
@@ -49,6 +54,29 @@ function retryMs(env) {
     const value = Number.parseInt(String(raw), 10);
     return Number.isFinite(value) && value > 0 ? value : DEFAULT_LOCK_RETRY_MS;
 }
+
+function incompleteLockGraceMs(env) {
+    const rawMs = env?.CLOAKBROWSER_LICENSE_LOCK_INCOMPLETE_GRACE_MS;
+    if (rawMs !== undefined && rawMs !== null && rawMs !== '') {
+        const value = Number.parseInt(String(rawMs), 10);
+        if (Number.isFinite(value) && value > 0) return value;
+    }
+    const rawSeconds = env?.CLOAKBROWSER_LICENSE_LOCK_INCOMPLETE_GRACE_SEC;
+    if (rawSeconds !== undefined && rawSeconds !== null && rawSeconds !== '') {
+        const value = Number.parseInt(String(rawSeconds), 10);
+        if (Number.isFinite(value) && value > 0) return value * 1000;
+    }
+    return DEFAULT_INCOMPLETE_LOCK_GRACE_MS;
+}
+
+function parsePid(raw) {
+    const value = String(raw ?? '');
+    if (!/^[1-9]\d*\n$/.test(value)) return null;
+    const pid = Number(value.slice(0, -1));
+    return Number.isSafeInteger(pid) ? pid : null;
+}
+
+const pools = new Set();
 
 // One key per line; blanks and `#` comments ignored.
 export function parseKeyLine(line) {
@@ -82,25 +110,31 @@ export class LicensePool {
         // No keys configured still means ONE seat: cloakbrowser resolves the key
         // itself from env or ~/.cloakbrowser/license.key, and serialising on a
         // single seat is what stops concurrent launches killing each other.
-        this._seats = (keys.length ? keys : [null]).map((key) => ({
-            key,
-            busy: false,
-            lockPath: path.join(options.lockDir ?? lockDirectory(), `${lockName(key)}.lock`),
-            lockHeld: false,
-        }));
-        this._waiters = [];
         this._fs = options.fs ?? fs;
         this._process = options.process ?? process;
         this._pid = options.pid ?? this._process.pid ?? process.pid;
         this._env = options.env ?? process.env;
+        const lockDir = options.lockDir ?? lockDirectory(this._env);
+        this._seats = (keys.length ? keys : [null]).map((key) => ({
+            key,
+            busy: false,
+            lockPath: path.join(lockDir, `${lockName(key)}.lock`),
+            lockHeld: false,
+            cleanupTimer: null,
+            cleanupAttempt: 0,
+            cleanupWarned: false,
+        }));
+        this._waiters = [];
         this._locking = options.locking ?? true;
-        this._lockDir = options.lockDir ?? lockDirectory();
+        this._lockDir = lockDir;
         this._lockDirReady = false;
         this._lockRetryMs = retryMs(this._env);
+        this._incompleteLockGraceMs = incompleteLockGraceMs(this._env);
         this._retryTimer = null;
         this._draining = false;
         this._lockError = null;
         this._lockWarningLogged = false;
+        pools.add(this);
     }
 
     get size() { return this._seats.length; }
@@ -158,6 +192,15 @@ export class LicensePool {
         }
     }
 
+    _incompleteLockExpired(seat) {
+        try {
+            const stat = this._fs.statSync(seat.lockPath);
+            return Date.now() - stat.mtimeMs >= this._incompleteLockGraceMs;
+        } catch {
+            return false;
+        }
+    }
+
     _tryLock(seat) {
         if (!this._locking) return true;
         this._ensureLockDir();
@@ -167,16 +210,15 @@ export class LicensePool {
             let fd;
             try {
                 fd = this._fs.openSync(seat.lockPath, 'wx', 0o600);
-                try {
-                    this._fs.writeSync(fd, `${this._pid}\n`);
-                } finally {
-                    this._fs.closeSync(fd);
-                }
+                this._fs.writeSync(fd, `${this._pid}\n`);
+                this._fs.fsyncSync(fd);
+                this._fs.closeSync(fd);
+                fd = undefined;
                 seat.lockHeld = true;
                 return true;
             } catch (error) {
                 if (fd !== undefined) {
-                    try { this._fs.closeSync(fd); } catch { /* best effort */ }
+                    try { this._fs.closeSync(fd); } catch {}
                     try { this._removeLock(seat); } catch (cleanupError) {
                         if (this._canFallback()) {
                             this._disableLocking(cleanupError);
@@ -195,7 +237,7 @@ export class LicensePool {
 
                 let ownerPid;
                 try {
-                    ownerPid = Number.parseInt(String(this._fs.readFileSync(seat.lockPath, 'utf8')).trim(), 10);
+                    ownerPid = parsePid(this._fs.readFileSync(seat.lockPath, 'utf8'));
                 } catch (readError) {
                     if (readError?.code === 'ENOENT') continue;
                     if (this._canFallback()) {
@@ -204,7 +246,8 @@ export class LicensePool {
                     }
                     throw readError;
                 }
-                if (this._isAlive(ownerPid)) return false;
+                if (ownerPid !== null && this._isAlive(ownerPid)) return false;
+                if (ownerPid === null && !this._incompleteLockExpired(seat)) return false;
                 try { this._removeLock(seat); }
                 catch (removeError) {
                     if (removeError?.code === 'ENOENT') continue;
@@ -263,14 +306,54 @@ export class LicensePool {
             release: () => {
                 if (released) return;   // idempotent: a double release must not free a seat twice
                 released = true;
-                if (seat.lockHeld) {
-                    seat.lockHeld = false;
-                    try { this._removeLock(seat); }
-                    catch (error) { log.warn('Failed to remove CloakBrowser seat lock', { reason: error?.code || error?.name || 'unknown' }); }
-                }
-                this._free(seat);
+                this._releaseSeat(seat);
             },
         };
+    }
+
+    _releaseSeat(seat) {
+        if (!seat.lockHeld) {
+            this._free(seat);
+            return;
+        }
+        try {
+            this._removeLock(seat);
+            seat.lockHeld = false;
+            seat.cleanupAttempt = 0;
+            this._free(seat);
+        } catch (error) {
+            this._scheduleCleanup(seat, error);
+        }
+    }
+
+    _scheduleCleanup(seat, error) {
+        if (!seat.cleanupWarned) {
+            seat.cleanupWarned = true;
+            log.warn('Failed to remove CloakBrowser seat lock; retrying', {
+                reason: error?.code || error?.name || 'unknown',
+            });
+        }
+        if (seat.cleanupTimer) return;
+        const delay = Math.min(this._lockRetryMs * (2 ** Math.min(seat.cleanupAttempt, 5)), MAX_CLEANUP_RETRY_MS);
+        seat.cleanupAttempt += 1;
+        seat.cleanupTimer = setTimeout(() => {
+            seat.cleanupTimer = null;
+            this._releaseSeat(seat);
+        }, delay);
+    }
+
+    _releaseAllLocks() {
+        for (const seat of this._seats) {
+            if (seat.cleanupTimer) {
+                clearTimeout(seat.cleanupTimer);
+                seat.cleanupTimer = null;
+            }
+            if (!seat.lockHeld) continue;
+            try {
+                this._removeLock(seat);
+                seat.lockHeld = false;
+            } catch {}
+        }
     }
 
     _free(seat) {
@@ -286,6 +369,13 @@ export class LicensePool {
         };
     }
 }
+
+export function releaseAllLicenseLocks() {
+    for (const pool of pools) {
+        try { pool._releaseAllLocks(); } catch {}
+    }
+}
+process.once('exit', releaseAllLicenseLocks);
 
 let _singleton = null;
 export function getLicensePool() {

@@ -117,6 +117,8 @@ per line in the git-ignored `config/cloakbrowser-keys.txt`. **Never commit keys.
 Seat ownership is coordinated across scraper processes with atomic lockfiles.
 By default they live in `~/.blacklight-cloakbrowser-seats/`, with one filename
 per hashed licence key and the owning PID stored in the file.
+Set `CLOAKBROWSER_LICENSE_LOCK_DIR` only when an alternate lock directory is
+required.
 Dead-owner locks are reclaimed automatically, and a process waits with a bounded
 poll interval when another live process owns a seat.
 If the implicit no-key seat cannot create its lock directory, it falls back to
