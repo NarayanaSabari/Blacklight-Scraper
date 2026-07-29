@@ -5,20 +5,21 @@ Glassdoor, and Indeed scrapers in production.
 
 ## Why a Windows machine for these three platforms
 
-The Hetzner VM (Linux, datacenter IP) handles **Monster, Dice, TechFetch**
-fine — those use HTTP-only or cookie-only flows that the platforms accept
-from a hosting IP.
+The Hetzner VM (Linux, with an ISP/residential proxy pool) handles **Monster,
+Dice, TechFetch**. Monster needs the pool for DataDome; Dice and TechFetch do
+not require a display.
 
 LinkedIn, Glassdoor, and Indeed are different:
 
 | Platform | Why VM doesn't work |
 |---|---|
 | **LinkedIn** | Requires a real Chrome with a logged-in session (CDP-based scraper). VM is headless and can't host an interactive login. |
-| **Glassdoor** | Visible-window Chromium (`headless: false`) needed to pass anti-bot. VM has no display. |
+| **Glassdoor** | `/graph` discovery needs a direct residential session; job descriptions are enriched through a separate pooled CloakBrowser path. The browser fallback is opt-in. |
 | **Indeed** | Cloudflare bot management blocks the VM IP at the edge (`HTTP 403`, `cf-mitigated: challenge`). Cookies don't help — IP reputation is the gate. |
 
-A residential Windows machine sidesteps all three: it's headed,
-display-attached, and has a residential IP that the platforms trust.
+A residential Windows machine sidesteps the LinkedIn and Indeed constraints:
+it's headed, display-attached, and has a residential IP that the platforms trust.
+Glassdoor's primary API path does not require a headed browser.
 
 ## Prerequisites
 
@@ -29,7 +30,7 @@ Install these on the Windows host once:
 | **Node.js** ≥ 20 LTS | Runtime | https://nodejs.org/ — pick "LTS" |
 | **Git for Windows** | Clone + pull | https://git-scm.com/download/win |
 | **Google Chrome** | LinkedIn CDP target | https://www.google.com/chrome/ |
-| **Microsoft Build Tools** | Native deps for Playwright | Comes with Node.js installer if you tick *"Tools for Native Modules"* during install |
+| **Microsoft Build Tools** | Native Node.js dependencies | Comes with Node.js installer if you tick *"Tools for Native Modules"* during install |
 
 Verify after install (open **PowerShell**):
 
@@ -48,11 +49,10 @@ cd C:\
 git clone https://github.com/NarayanaSabari/Blacklight-Scraper.git scraper
 cd scraper
 npm install
-npx playwright install chromium
+node -e "import('cloakbrowser').then(async m => { const b = await m.launch({headless:true}); await b.close(); })"
 ```
 
-`npm install` takes ~2 minutes, `playwright install` adds another ~1 minute
-of Chromium download.
+The first CloakBrowser launch downloads and caches its stealth Chromium.
 
 ## 2. Get a scraper API key for this host
 
@@ -74,6 +74,11 @@ In **central.qpeakhire.com**:
 This is the only thing that decides which platforms this host scrapes.
 Anything not in the allowlist is silently filtered out by the backend's
 queue endpoint.
+
+CloakBrowser launches are seat-pooled per licence key. Configure one key per
+browser platform you want to run concurrently; with fewer keys, the extra
+launches wait. See the [session-seat section of the scraper runbook](scraper-runbook.md#cloakbrowser-session-seats)
+for the key-file and no-key fallback details.
 
 ## 3. Configure credentials.json
 
@@ -102,7 +107,7 @@ from step 2):
 
 Both blocks are needed — `blacklight` controls queue + telemetry, and
 `scraperCredentials` controls the per-platform credential fetch (LinkedIn
-email/password, Glassdoor cookies, Indeed cookies).
+email/password and Indeed cookies).
 
 `config\credentials.json` is **gitignored**. Don't commit it.
 
@@ -124,15 +129,14 @@ once via central.qpeakhire.com:
   interactive login (see step 5 below)
 
 ### Glassdoor
-- **Dashboard → Credentials → Glassdoor → + Add Credential**
-- Solve the Glassdoor captcha in your real browser
-- DevTools → Application → Cookies → `glassdoor.com` → export as JSON
-  (any cookie-export extension works — see [Brave/Chrome cookie editor extension](https://chromewebstore.google.com/search/cookie%20editor))
-- Paste the exported JSON array into the dialog
+No credential is required for the primary `/graph` API path.
+Configure `PROXY_EXCLUDE_PLATFORMS=glassdoor` so discovery stays direct, and
+let the separate `glassdoor-jd` pool key handle job-page enrichment when a proxy
+pool is available.
 
 ### Indeed
 - **Dashboard → Credentials → Indeed → + Add Credential**
-- Same flow as Glassdoor: solve any Indeed captcha, export cookies, paste
+- Solve any Indeed captcha, export cookies, and paste the cookie array
 
 > The cookie format expected is the **array-of-objects** shape produced
 > by Cookie-Editor / EditThisCookie / Brave's built-in cookie export.
@@ -189,8 +193,9 @@ INFO [ORCHESTRATOR] Queue item acquired {"sessionId":"...","platforms":["linkedi
 That last line is the success signal — the backend handed your host a
 role with the three platforms in its allowlist. From there:
 
-- LinkedIn, Glassdoor, Indeed all run **in parallel** within each session
-- Wall-clock = max(LinkedIn ~6 min, Glassdoor ~75s, Indeed ~85s) ≈ 6 min
+- LinkedIn, Glassdoor, and Indeed start **in parallel** within each session;
+  CloakBrowser seat limits may queue browser launches
+- Wall-clock = max(LinkedIn ~6 min, Glassdoor ~10–18s for enrichment, Indeed ~85s) ≈ 6 min
 - The slowest scraper is LinkedIn (`maxPosts: 100` with 2s scroll delay)
 
 Confirm in central.qpeakhire.com → **Scraper → Active Sessions** that
@@ -279,7 +284,7 @@ dashboard).
   ```
 - Or kill any running Chrome (must be fully closed for `--remote-debugging-port` to bind)
 
-**`Loaded 0 cookies`** (Glassdoor or Indeed)
+**`Loaded 0 cookies`** (Indeed)
 - The credential's `credential_type` in the DB isn't `json_blob`. Open
   Dashboard → Platforms → click the platform → set **Requires
   Credentials** to `JSON / Cookies` → Save.
@@ -290,13 +295,18 @@ dashboard).
   log line `skipped cookie name=X domain=Y` for the offender — usually
   a session cookie with a weird value.
 
-**`Page 1: Found 0 jobs`** finishing in <10 seconds (Indeed or Glassdoor)
+**`Page 1: Found 0 jobs`** finishing in <10 seconds (Indeed)
 - Page is showing a security/captcha challenge instead of results. The
   IP got flagged. Solve the captcha in your real browser (same machine,
   same IP), re-export cookies, update the credential in the dashboard.
   Note: `config/credentials.json` is re-read on every scrape, so credential
   rotations take effect without a restart. This does NOT apply to the
   scraper source code — see the restart callout above.
+
+**Glassdoor API warm-up is blocked**
+- Keep `/graph` discovery direct with `PROXY_EXCLUDE_PLATFORMS=glassdoor`.
+- The scraper rotates and retries the warm-up automatically; a blocked
+  `glassdoor-jd` batch is intentionally returned with some `N/A` descriptions.
 
 **`Active session already exists` for many minutes**
 - A previous scrape session is stuck `in_progress` in the DB (zombie).
@@ -325,8 +335,8 @@ dashboard).
 
 | Host | Allowlist | Why |
 |---|---|---|
-| Hetzner VM (Linux, headless) | `monster, dice, techfetch` | HTTP/cookie-only flows; no display required; tolerates datacenter IP |
-| **Windows machine (residential)** | `linkedin, glassdoor, indeed` | Headed Chrome required + clean residential IP for anti-bot |
+| Hetzner VM (Linux, with ISP/residential proxy pool) | `monster, dice, techfetch` | Monster needs the pool for DataDome; no display required |
+| **Windows machine (residential)** | `linkedin, glassdoor, indeed` | Headed Chrome for LinkedIn plus a clean residential IP; Glassdoor discovery remains direct |
 
 Both hosts share the same code, the same backend, the same queue. The
 only thing that differs is the API key and its allowlist — the backend

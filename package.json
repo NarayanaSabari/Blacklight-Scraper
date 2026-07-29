@@ -9,7 +9,8 @@
     "setup": "node server.js --setup",
     "linkedin:login": "node scripts/linkedin-login.js",
     "linkedin:reset": "node scripts/linkedin-reset.js",
-    "creds:clean": "node scripts/clean-credentials.js"
+    "creds:clean": "node scripts/clean-credentials.js",
+    "test": "node --test"
   },
   "keywords": [
     "job-scraper",
@@ -26,7 +27,7 @@
   "license": "MIT",
   "dependencies": {
     "cheerio": "^1.0.0-rc.12",
-    "cloakbrowser": "^0.3.28",
+    "cloakbrowser": "^0.5.2",
     "crawlee": "^3.7.0",
     "express": "^4.18.2",
     "jsdom": "^23.0.1",

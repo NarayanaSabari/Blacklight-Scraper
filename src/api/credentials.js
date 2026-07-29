@@ -30,6 +30,11 @@ import { getMetrics } from '../metrics/registry.js';
 
 const log = createLogger('credentials');
 
+// Logical circuit-breaker label for the credentials API (SCR-15). Kept
+// separate from 'queue' so a credentials-API outage can't open the
+// circuit for submitJobs/completeSession traffic, and vice versa.
+const CIRCUIT_KEY = 'credentials';
+
 // Pure decision for the cookie-jar write-back (handoff §3/§4). No I/O.
 // Mirrors the backend's reject rules so we never POST a guaranteed-400:
 // local → no-op; jar must be a non-empty array containing a non-empty
@@ -122,7 +127,7 @@ export class CredentialsClient {
             method: 'POST',
             headers: this.headers,
             body: JSON.stringify(body),
-        });
+        }, { circuitKey: CIRCUIT_KEY });
         if (!response.ok) {
             throw new NetworkError(
                 `Credentials API ${action} failed: ${response.status} ${response.statusText}`,
@@ -156,7 +161,7 @@ export class CredentialsClient {
         log.info('Fetching credential from API', { platform });
         let response;
         try {
-            response = await requestWithRetry(url, { method: 'GET', headers: this.headers });
+            response = await requestWithRetry(url, { method: 'GET', headers: this.headers }, { circuitKey: CIRCUIT_KEY });
         } catch (error) {
             metrics.recordCredentialsFetch(platform, 'error');
             throw error;

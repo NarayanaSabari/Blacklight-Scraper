@@ -5,6 +5,12 @@
 import { requestWithRetry } from '../http/client.js';
 import { NetworkError } from '../core/errors.js';
 import { getMetrics } from '../metrics/registry.js';
+import { spoolUndeliverableSubmission } from '../core/submit-spool.js';
+
+// Logical circuit-breaker label for all Blacklight queue traffic (SCR-15).
+// Kept separate from 'credentials' so a credentials-API outage can't open
+// the circuit for queue calls, and vice versa.
+const CIRCUIT_KEY = 'queue';
 
 function statusBucket(status) {
     if (status >= 500) return '5xx';
@@ -26,7 +32,7 @@ export class BlacklightApiClient {
         });
     }
 
-    async #request(method, path, body = undefined) {
+    async #request(method, path, body = undefined, requestConfig = {}) {
         const url = `${this.apiUrl}${path}`;
         const options = { method, headers: this.headers };
         if (body !== undefined) options.body = JSON.stringify(body);
@@ -36,7 +42,7 @@ export class BlacklightApiClient {
 
         let response;
         try {
-            response = await requestWithRetry(url, options);
+            response = await requestWithRetry(url, options, { circuitKey: CIRCUIT_KEY, ...requestConfig });
         } catch (error) {
             metrics.recordBlacklightApiRequest(endpointLabel, 'error');
             throw error;
@@ -118,10 +124,25 @@ export class BlacklightApiClient {
             body.status = 'failed';
             body.error_message = errorMessage;
         }
-        return this.#request('POST', '/api/scraper/queue/jobs', body);
+        // SCR-15: submit is exempt from the circuit breaker entirely.
+        // Jobs are already scraped by this point — blocking the call on an
+        // open circuit (opened by, say, a credentials-API outage) would
+        // silently discard completed work instead of merely delaying it.
+        try {
+            return await this.#request('POST', '/api/scraper/queue/jobs', body, { bypassCircuit: true });
+        } catch (error) {
+            await spoolUndeliverableSubmission({
+                sessionId, platform, jobs, status, errorMessage,
+                deliveryError: error.message,
+            });
+            throw error;
+        }
     }
 
     async completeSession(sessionId) {
-        return this.#request('POST', '/api/scraper/queue/complete', { session_id: sessionId });
+        // SCR-15: exempt for the same reason as submitJobs — a blocked
+        // complete strands the session in `in_progress` until the 1-hour
+        // sweep instead of just delaying a claim.
+        return this.#request('POST', '/api/scraper/queue/complete', { session_id: sessionId }, { bypassCircuit: true });
     }
 }

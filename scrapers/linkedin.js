@@ -18,7 +18,7 @@
 
 import os from 'os';
 import path from 'path';
-import { launch, launchPersistentContext } from 'cloakbrowser';
+import { launch, launchPersistentContext } from '../src/core/browser-pool.js';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { parseProxyLine } from '../src/core/proxy-pool.js';
