@@ -825,7 +825,9 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
    - Title + Company + Location
    - Title + Company + Description similarity
 
-4. **Async Processing**: Job imports are processed asynchronously. The session completion happens after all batches finish processing.
+4. **Async Processing**: Job imports are processed asynchronously.
+   Session completion happens after all batches are accounted for, including
+   batches that permanently fail after retries are exhausted.
 
 5. **Rate Limiting**: There is no explicit rate limiting, but avoid sending more than 1 request per second per endpoint.
 
