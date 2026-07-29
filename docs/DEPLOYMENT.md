@@ -17,25 +17,27 @@ most-missed prerequisite.
 | **Glassdoor** | Anonymous `/graph` API | Cloudflare warm-up + per-IP detail-page rate limit | node-tls-client + CloakBrowser 0.5.2 | ✅ warmed API + description enrichment | Ready with direct discovery and pooled detail IPs |
 | **Indeed** | Profile (optional, `INDEED_PROFILE_DIR`) | Cloudflare + 60-min cooldown | CloakBrowser | ✅ anon page-1 + persistent-path wiring; ⚠️ full pagination needs a pre-existing profile | Ready anon; full needs a supplied profile + smoke |
 | **TechFetch** | Anonymous-first | None | CloakBrowser | ✅ 40 jobs/run; ⚠️ login fallback unverified | Ready anon; fallback needs smoke |
-| **LinkedIn** | Cookie (required) | Cloudflare/auth-wall | CloakBrowser | ⚠️ not run (no cookies present) | Code-ready; needs cookies + smoke |
+| **LinkedIn** | Persistent-profile cookie (required) | Cloudflare/auth-wall | CloakBrowser for login/template capture | ⚠️ not run (no cookies present) | Code-ready; needs cookies + smoke |
 
-LinkedIn is the only platform without `strictEmpty` — intentional (tuned in the server-robustness slice).
+LinkedIn now arms the registry's `strictEmpty`: permalinks arrive in the search
+payload, so a genuine empty result is distinguishable from a silent block.
+`SCRAPER_STRICT_EMPTY` remains a separate per-host environment flag.
 
 ---
 
 ## 2. Browser engine — CloakBrowser
 
-All browser paths run on **CloakBrowser 0.5.2** (stealth Chromium) - one engine, fleet-wide. Glassdoor's API discovery additionally uses `node-tls-client`; its description enrichment uses CloakBrowser. TechFetch was migrated off playwright-extra so there's no longer a second active browser stack. Playwright's own Chromium is not used by any active scraper (the only remaining importer, `src/core/browser.js`, is dead code).
+All browser-backed paths run on **CloakBrowser 0.5.2** (stealth Chromium) - one engine, fleet-wide. LinkedIn uses it for operator login and RSC template capture; its scrape requests are browserless. Glassdoor's API discovery additionally uses `node-tls-client`; its description enrichment uses CloakBrowser. TechFetch was migrated off playwright-extra so there's no longer a second active browser stack. Playwright's own Chromium is not used by any active scraper (the only remaining importer, `src/core/browser.js`, is dead code).
 
 | Engine | Scrapers | How the binary is provisioned |
 |---|---|---|
-| **CloakBrowser 0.5.2** (stealth Chromium) | LinkedIn, Monster, Dice, Indeed, Glassdoor detail enrichment, TechFetch | **Auto-downloaded (~350 MB) from GitHub on first `launch()`** → cached at `~/.cloakbrowser/`. NOT installed by `npm ci`, NOT by `playwright install`. |
+| **CloakBrowser 0.5.2** (stealth Chromium) | LinkedIn login/template capture, Monster, Dice, Indeed, Glassdoor detail enrichment, TechFetch | **Auto-downloaded (~350 MB) from GitHub on first `launch()`** → cached at `~/.cloakbrowser/`. NOT installed by `npm ci`, NOT by `playwright install`. |
 
-> **CRITICAL:** On a fresh/firewalled host, `npm ci` succeeding is NOT enough. The
-> first scrape of ANY platform triggers a ~350 MB download from
+> **CRITICAL:** On a fresh/firewalled host, `npm ci` succeeding is NOT enough for
+> browser-backed paths. The first browser launch triggers a ~350 MB download from
 > `github.com/CloakHQ/cloakbrowser/releases/download` (plus an
 > `api.github.com` release check + a GeoLite2 mmdb). If egress is blocked or
-> `~/.cloakbrowser/` isn't persisted, all 6 scrapers fail or hang.
+> `~/.cloakbrowser/` isn't persisted, browser-backed operations fail or hang.
 
 **Pre-warm the CloakBrowser binary (recommended, avoids a slow/failed first scrape):**
 ```bash
@@ -57,8 +59,8 @@ node -e "import('cloakbrowser').then(async m => { const b = await m.launch({head
 ```bash
 node --version                  # must be v24.x
 npm ci                          # from lockfile — stale node_modules breaks startup
-# All 6 scrapers use CloakBrowser, which self-provisions on first launch —
-# pre-warm it per §2 (no `playwright install` needed for any scraper).
+# Browser-backed paths use CloakBrowser, which self-provisions on first launch —
+# pre-warm it per §2 (no `playwright install` needed).
 # (Linux also needs headless-Chromium libs: libnss3, libatk, libgbm, etc.)
 # CloakBrowser self-provisions on first launch — pre-warm per §2.
 ```
@@ -96,7 +98,7 @@ Git-ignored. Copy `config/credentials.example.json` and fill in:
 ## 6. Persistent filesystem state — MUST survive restarts
 
 ```
-~/.cloakbrowser/                    ~350 MB stealth Chromium (ALL 6 scrapers)  ← most-missed
+~/.cloakbrowser/                    ~350 MB stealth Chromium for browser-backed paths  ← most-missed
 ~/.blacklight-monster-cooldown      Monster DataDome cooldown marker
 ~/.blacklight-indeed-cooldown       Indeed Cloudflare cooldown marker
 ~/.blacklight-glassdoor-cooldown    Glassdoor Cloudflare cooldown marker
@@ -112,7 +114,7 @@ Ephemeral container → volume-mount these. Otherwise: re-download the 350 MB br
 
 ## 7. Environment variables (optional; safe defaults)
 
-`PORT` (3001) · `NODE_ENV` (production) · `SCRAPER_MODE` (`daemon` = offline alerts) · `LOG_LEVEL` · `INSTANCE_ID` · `QUEUE_CHECK_INTERVAL_MS` (30000) · `PROXY_LIST` / `PROXY_LIST_FILE` · `PROXY_EXCLUDE_PLATFORMS` · `PROXY_BLOCK_COOLDOWN_MS` (600000) · `DICE_DETAIL_RENDER_WAIT_MS` (0) · `DICE_DETAIL_CONCURRENCY` (10) · `TECHFETCH_RETRY_BACKOFF_MS` (500) · `TECHFETCH_DETAIL_CONCURRENCY` (8) · `GLASSDOOR_FETCH_DESCRIPTIONS` (on) · `GLASSDOOR_DESC_CONCURRENCY` (6) · `INDEED_ALLOW_ANONYMOUS` (`1` = Indeed page-1 without a credential) · `LINKEDIN_MAX_CONCURRENCY` (2 — concurrent LinkedIn tabs on the one account; 1 = serialize, 3 = push harder/ban-risk; read at process start) · `LINKEDIN_SINGLEFLIGHT_RELOGIN` (off by default; `1`/`true` = on. When a LinkedIn cookie dies mid-scrape, run ONE coordinated re-login that rotates to a fresh pool account while concurrent tabs wait + retry, instead of wedging the session into a "lease unavailable" storm until a process restart. REMOTE pool mode only — needs ≥1 spare healthy account to rotate to) · `SCRAPER_DEFAULT_LOCATION` · CloakBrowser vars (§2).
+`PORT` (3001) · `NODE_ENV` (production) · `SCRAPER_MODE` (`daemon` = offline alerts) · `LOG_LEVEL` · `INSTANCE_ID` · `QUEUE_CHECK_INTERVAL_MS` (30000) · `PROXY_LIST` / `PROXY_LIST_FILE` · `PROXY_EXCLUDE_PLATFORMS` · `PROXY_BLOCK_COOLDOWN_MS` (600000) · `DICE_DETAIL_RENDER_WAIT_MS` (0) · `DICE_DETAIL_CONCURRENCY` (10) · `TECHFETCH_RETRY_BACKOFF_MS` (500) · `TECHFETCH_DETAIL_CONCURRENCY` (8) · `GLASSDOOR_FETCH_DESCRIPTIONS` (on) · `GLASSDOOR_DESC_CONCURRENCY` (6) · `INDEED_ALLOW_ANONYMOUS` (`1` = Indeed page-1 without a credential) · `LINKEDIN_RSC_COUNT` (10 by default, capped at 50 per request) · `LINKEDIN_RSC_COOKIE_TTL_MIN` (30 by default) · `LINKEDIN_RSC_TEMPLATE` (captured request-template path override) · `SCRAPER_DEFAULT_LOCATION` · CloakBrowser vars (§2).
 
 CloakBrowser launch seats and licence-key configuration are maintained in the
 [session-seat section of the scraper runbook](scraper-runbook.md#cloakbrowser-session-seats).
@@ -124,7 +126,7 @@ CloakBrowser launch seats and licence-key configuration are maintained in the
 ```
 [ ] 1. git pull   →  RESTART the node process after pulling
 [ ] 2. npm ci
-[ ] 3. pre-warm CloakBrowser (§2 one-liner)     (all 6 scrapers — one engine)
+[ ] 3. pre-warm CloakBrowser (§2 one-liner)     (browser-backed paths)
 [ ] 4. config/credentials.json → blacklight API filled in
 [ ] 5. persist the 5 paths in §6 (or volume-mount)
 [ ] 6. node server.js  →  curl localhost:3001/healthz  →  200 + gitSha matches deployed commit
@@ -147,7 +149,7 @@ CloakBrowser launch seats and licence-key configuration are maintained in the
 - **Monster (DataDome):** the appsapi can be suppressed after a page loads. The scraper records this as `datadome-suppressed`, cools the current IP, and retries on another pool IP. Keep the 3–5 second warm-up and inter-page pacing.
 - **Glassdoor:** `/graph` discovery requires a warmed direct session. Job descriptions come from concurrent server-rendered detail pages through the separate `glassdoor-jd` lease; a per-IP denial stops enrichment early and leaves some descriptions as `N/A`.
 - **IP geography:** validated from a non-US IP. Glassdoor handles it (geo-pin); Indeed/Monster returned US jobs. Different prod region → re-run §8 smokes.
-- **LinkedIn cookies expire** — recurring task; `/healthz` reports whether a fresh session jar is cached.
+- **LinkedIn cookies expire** — recurring task; `/healthz` reports whether a fresh profile session jar is cached. The RSC scraper reads that jar and does not inject cookies into a page.
 - **Two unverified code paths** (no creds to test here): Indeed full pagination, TechFetch login fallback. Reviewed + reasoned; step 9 is their first real exercise.
 
 ---
@@ -159,4 +161,4 @@ CloakBrowser launch seats and licence-key configuration are maintained in the
 | `GET /healthz` | liveness, identity, `gitSha`, and cached LinkedIn session state |
 | `GET /metrics` | Prometheus — `scraper_url_quality_total`, block/cooldown counters, per-platform success |
 
-Watch `scraper_url_quality_total{quality="empty"|"profile_in"}` and the `BlockedError` counters — a rise means a DOM drifted or an IP got flagged.
+Watch `scraper_url_quality_total{quality="empty"|"profile_in"}` and the `BlockedError` counters - a rise means a parser drifted or an IP got flagged.

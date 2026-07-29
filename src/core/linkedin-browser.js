@@ -73,16 +73,6 @@ export async function launchPersistentProfile({ profileKey = null, proxy = null 
         }
     }
     const context = await launcher(opts);
-    // "Copy link to post" (the only post-permalink source in LinkedIn's Jul-2026
-    // DOM) writes to the clipboard — grant read/write so resolvePostUrlViaMenu
-    // can read it back. Best-effort (unit-test launcher fakes have no grant).
-    try {
-        await context.grantPermissions?.(
-            ['clipboard-read', 'clipboard-write'], { origin: 'https://www.linkedin.com' });
-    } catch { /* non-fatal */ }
-    // Capture copied permalinks even when headless (clipboard.readText fails
-    // without a focused clipboard). Best-effort.
-    try { await context.addInitScript?.(CLIPBOARD_CAPTURE_INIT); } catch { /* non-fatal */ }
     logProgress('LinkedIn', '✅ CloakBrowser persistent profile ready');
     return context;
 }
