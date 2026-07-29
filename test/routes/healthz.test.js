@@ -62,4 +62,11 @@ test('GET /: legacy welcome route still works + surfaces gitSha', async () => {
     assert.equal(status, 200);
     assert.equal(body.status, 'Unified Job Scraper API is running');
     assert.equal(body.gitSha, 'abc1234');
+    assert.equal(body.endpoints.healthLinkedin, undefined);
+});
+
+test('GET /health/linkedin: the removed feed probe is not registered', async () => {
+    const app = inject({ bootInfo, getLinkedInSession: () => ({ isAlive: () => false, lease: null }) });
+    const { status } = await callHandler(app, 'GET', '/health/linkedin?probe=1');
+    assert.equal(status, 404);
 });

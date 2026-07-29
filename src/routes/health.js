@@ -1,9 +1,7 @@
-// GET / (welcome), GET /healthz (cheap state), GET /health/linkedin?probe=1
-// (real session probe — wired in a later task).
+// GET / (welcome), GET /healthz (cheap state).
 
 import { existsSync } from 'node:fs';
 import { PLATFORM_NAMES } from '../scrapers/registry.js';
-import { classifyLinkedinUrl } from '../setup/verify.js';
 
 export function registerHealthRoute(app, port, deps = {}) {
     const bootInfo = deps.bootInfo ?? { gitSha: 'unknown', pkgVersion: '0.0.0' };
@@ -20,7 +18,6 @@ export function registerHealthRoute(app, port, deps = {}) {
                 scrapeQueue: { method: 'POST', path: '/scrape-queue', description: 'Blacklight queue — automatic role selection.' },
                 metrics: { method: 'GET', path: '/metrics', description: 'Prometheus text format — current in-process counters and gauges.' },
                 healthz: { method: 'GET', path: '/healthz', description: 'Cheap liveness + identity payload.' },
-                healthLinkedin: { method: 'GET', path: '/health/linkedin?probe=1', description: 'Real in-session probe of the LinkedIn feed page.' },
             },
             examples: [
                 { description: 'Single platform', curl: `curl -X POST http://localhost:${port}/scrape -H "Content-Type: application/json" -d '{"platform":"monster","jobTitle":"DevOps Engineer","location":"california"}'` },
@@ -48,37 +45,5 @@ export function registerHealthRoute(app, port, deps = {}) {
             strict: !!bootInfo.strict,
             uptimeSec: Math.round(process.uptime()),
         });
-    });
-
-    app.get('/health/linkedin', async (req, res) => {
-        if (req.query.probe !== '1') {
-            return res.json({
-                probe: false,
-                hint: 'Add ?probe=1 to run an in-session feed check. Cheap state is on /healthz.',
-            });
-        }
-        const session = getLinkedInSession();
-        const sessionId = `healthcheck-${Date.now()}`;
-        try {
-            const { url, urlClass } = await session.withPage(sessionId, async (page) => {
-                await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 15000 });
-                const u = page.url();
-                return { url: u, urlClass: classifyLinkedinUrl(u) };
-            });
-            res.json({
-                probe: true,
-                checkedAt: new Date().toISOString(),
-                url,
-                urlClass,
-                loggedIn: urlClass === 'authed',
-            });
-        } catch (e) {
-            res.status(503).json({
-                probe: true,
-                checkedAt: new Date().toISOString(),
-                loggedIn: false,
-                error: e?.message ?? String(e),
-            });
-        }
     });
 }

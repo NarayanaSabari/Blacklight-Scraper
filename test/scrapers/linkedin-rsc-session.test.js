@@ -43,14 +43,15 @@ function fakeLease(overrides = {}) {
     };
 }
 
-function makeSession({ lease = fakeLease(), cookieReader, ttlMs = 60000, now = () => 1000 } = {}) {
+function makeSession({ lease = fakeLease(), cookieReader, ttlMs = 60000, now = () => 1000, templateLoader, cooldown } = {}) {
     const reads = { count: 0 };
     const session = new LinkedInRscSession({
         apiClient: { acquire: async () => lease },
         cookieReader: cookieReader ?? (async () => { reads.count++; return JAR; }),
-        templateLoader: () => TEMPLATE,
+        templateLoader: templateLoader ?? (() => TEMPLATE),
         ttlMs,
         now,
+        cooldown,
     });
     return { session, lease, reads };
 }
@@ -181,6 +182,85 @@ test('withCookies: an AuthError drops the cached jar so the next role re-reads i
     assert.equal(reads.count, 2, 'expected the jar to be re-read after an auth failure');
 });
 
+test('withCookies: cookie caches are isolated by profile key', async () => {
+    const jars = {
+        alpha: [{ name: 'li_at', value: 'alpha' }],
+        beta: [{ name: 'li_at', value: 'beta' }],
+    };
+    const leases = [
+        fakeLease({ credential: { id: 1, profile_key: 'alpha' } }),
+        fakeLease({ credential: { id: 2, profile_key: 'beta' } }),
+    ];
+    const reads = [];
+    const session = new LinkedInRscSession({
+        apiClient: { acquire: async () => leases.shift() },
+        cookieReader: async ({ profileKey }) => {
+            reads.push(profileKey);
+            return jars[profileKey];
+        },
+        templateLoader: () => TEMPLATE,
+    });
+
+    const seen = [];
+    await session.withCookies('a', async (cookies) => { seen.push(cookies[0].value); });
+    await session.withCookies('b', async (cookies) => { seen.push(cookies[0].value); });
+
+    assert.deepEqual(seen, ['alpha', 'beta']);
+    assert.deepEqual(reads, ['alpha', 'beta']);
+});
+
+test('withCookies: a fresh cache for one profile does not satisfy another profile', async () => {
+    const leases = [
+        fakeLease({ credential: { id: 1, profile_key: 'alpha' } }),
+        fakeLease({ credential: { id: 2, profile_key: 'beta' } }),
+    ];
+    const reads = [];
+    const session = new LinkedInRscSession({
+        apiClient: { acquire: async () => leases.shift() },
+        cookieReader: async ({ profileKey }) => {
+            reads.push(profileKey);
+            return [{ name: 'li_at', value: profileKey }];
+        },
+        templateLoader: () => TEMPLATE,
+        ttlMs: 60000,
+        now: () => 1000,
+    });
+
+    await session.withCookies('a', async () => 'alpha');
+    await session.withCookies('b', async () => 'beta');
+
+    assert.deepEqual(reads, ['alpha', 'beta']);
+});
+
+test('withCookies: auth failure invalidates only the affected profile cache', async () => {
+    const leases = [
+        fakeLease({ credential: { id: 1, profile_key: 'alpha' } }),
+        fakeLease({ credential: { id: 2, profile_key: 'beta' } }),
+        fakeLease({ credential: { id: 3, profile_key: 'alpha' } }),
+        fakeLease({ credential: { id: 4, profile_key: 'beta' } }),
+        fakeLease({ credential: { id: 5, profile_key: 'alpha' } }),
+    ];
+    const reads = [];
+    const session = new LinkedInRscSession({
+        apiClient: { acquire: async () => leases.shift() },
+        cookieReader: async ({ profileKey }) => {
+            reads.push(profileKey);
+            return [{ name: 'li_at', value: profileKey }];
+        },
+        templateLoader: () => TEMPLATE,
+    });
+
+    await session.withCookies('alpha-1', async () => 'ok');
+    await session.withCookies('beta-1', async () => 'ok');
+    await assert.rejects(() => session.withCookies('alpha-2', async () => {
+        throw new AuthError('dead', { platform: 'linkedin', code: 'NEEDS_RELOGIN' });
+    }), AuthError);
+
+    await session.withCookies('beta-2', async () => 'ok');
+    await session.withCookies('alpha-3', async () => 'ok');
+    assert.deepEqual(reads, ['alpha', 'beta', 'alpha']);
+});
+
 // --- withCookies: cookie caching -------------------------------------------
 
 test('withCookies: reuses the cached jar within the TTL, launching no second browser', async () => {
@@ -217,12 +297,55 @@ test('withCookies: concurrent roles share ONE cookie read', async () => {
     assert.equal(started, 1, 'single-flight refresh should read cookies once');
 });
 
+test('withCookies: concurrent roles with different profiles do not share a cookie read', async () => {
+    let started = 0;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const leases = [
+        fakeLease({ credential: { id: 1, profile_key: 'alpha' } }),
+        fakeLease({ credential: { id: 2, profile_key: 'beta' } }),
+    ];
+    const session = new LinkedInRscSession({
+        apiClient: { acquire: async () => leases.shift() },
+        cookieReader: async ({ profileKey }) => {
+            started++;
+            await gate;
+            return [{ name: 'li_at', value: profileKey }];
+        },
+        templateLoader: () => TEMPLATE,
+    });
+
+    const both = Promise.all([
+        session.withCookies('a', async () => 'alpha'),
+        session.withCookies('b', async () => 'beta'),
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(started, 2);
+    release();
+    assert.deepEqual(await both, ['alpha', 'beta']);
+});
+
 test('withCookies: a profile with no li_at asks for a re-login', async () => {
     const { session } = makeSession({ cookieReader: async () => [{ name: 'lang', value: 'en' }] });
     await assert.rejects(
         () => session.withCookies('s', async () => 'unused'),
         (err) => err instanceof AuthError && err.code === 'NEEDS_RELOGIN',
     );
+});
+
+test('withCookies: NEEDS_TEMPLATE does not report the credential or pause locally', async () => {
+    const cooldown = fakeCooldown();
+    const { session, lease } = makeSession({
+        cooldown,
+        templateLoader: () => {
+            throw new AuthError('template missing', { platform: 'linkedin', code: 'NEEDS_TEMPLATE' });
+        },
+    });
+
+    await assert.rejects(() => session.withCookies('s', async () => session.template()), AuthError);
+
+    assert.equal(lease.failures.length, 0);
+    assert.equal(cooldown.writes.length, 0);
 });
 
 // --- storm protection -------------------------------------------------------

@@ -24,6 +24,10 @@ const log = createLogger('linkedin-rsc-session');
 
 const DEFAULT_COOKIE_TTL_MS = 30 * 60 * 1000; // 30 min
 
+function cacheKey(profileKey) {
+    return profileKey || null;
+}
+
 export function cookieTtlMs(env = process.env) {
     const n = Number.parseInt(String(env?.LINKEDIN_RSC_COOKIE_TTL_MIN ?? ''), 10);
     if (!Number.isFinite(n) || n <= 0) return DEFAULT_COOKIE_TTL_MS;
@@ -105,10 +109,10 @@ export class LinkedInRscSession {
         this._ttlMs = ttlMs;
         this._now = now;
         this._cooldown = cooldown;
-        this._cookies = null;
-        this._cookiesAt = 0;
+        this._cookies = new Map();
+        this._cookiesAt = new Map();
         this._template = null;
-        this._refreshing = null;
+        this._refreshing = new Map();
     }
 
     /** Cached template; loaded once per process. */
@@ -117,17 +121,22 @@ export class LinkedInRscSession {
         return this._template;
     }
 
-    #cookiesFresh() {
+    #cookiesFresh(profileKey) {
         // Boolean, not the jar: isAlive() is reported over HTTP by /healthz and a
         // truthy-but-not-true value serialises misleadingly.
-        return Boolean(this._cookies) && (this._now() - this._cookiesAt) < this._ttlMs;
+        const key = cacheKey(profileKey);
+        const cookies = this._cookies.get(key);
+        const cachedAt = this._cookiesAt.get(key);
+        return Boolean(cookies) && Number.isFinite(cachedAt)
+            && (this._now() - cachedAt) < this._ttlMs;
     }
 
     /** Single-flight cookie refresh, so concurrent roles share one browser launch. */
     async #refreshCookies(profileKey) {
-        if (this.#cookiesFresh()) return this._cookies;
-        if (this._refreshing) return this._refreshing;
-        this._refreshing = (async () => {
+        const key = cacheKey(profileKey);
+        if (this.#cookiesFresh(key)) return this._cookies.get(key);
+        if (this._refreshing.has(key)) return this._refreshing.get(key);
+        const refresh = (async () => {
             const jar = await this._readCookies({ profileKey });
             if (!hasLiAt(jar)) {
                 throw new AuthError(
@@ -135,12 +144,21 @@ export class LinkedInRscSession {
                     { platform: 'linkedin', code: 'NEEDS_RELOGIN' },
                 );
             }
-            this._cookies = jar;
-            this._cookiesAt = this._now();
+            this._cookies.set(key, jar);
+            this._cookiesAt.set(key, this._now());
             log.info('Read LinkedIn session cookies from profile', { cookies: jar.length });
             return jar;
-        })().finally(() => { this._refreshing = null; });
-        return this._refreshing;
+        })();
+        this._refreshing.set(key, refresh);
+        refresh.then(
+            () => {
+                if (this._refreshing.get(key) === refresh) this._refreshing.delete(key);
+            },
+            () => {
+                if (this._refreshing.get(key) === refresh) this._refreshing.delete(key);
+            },
+        );
+        return refresh;
     }
 
     // Mode signal for storm protection. Treated as LOCAL unless we can positively
@@ -148,15 +166,21 @@ export class LinkedInRscSession {
     get isLocal() { return this._apiClient?.isLocal !== false; }
 
     /** True when a usable session jar is cached. Reported by /healthz. */
-    isAlive() { return this.#cookiesFresh(); }
+    isAlive() {
+        return [...this._cookies.keys()].some((key) => this.#cookiesFresh(key));
+    }
 
     /** No browser is held, so shutdown just drops the cached session. */
-    async shutdown() { this.invalidateCookies(); }
+    async shutdown() {
+        this._cookies.clear();
+        this._cookiesAt.clear();
+    }
 
     /** Drop the cached jar so the next role re-reads it (used after an auth failure). */
-    invalidateCookies() {
-        this._cookies = null;
-        this._cookiesAt = 0;
+    invalidateCookies(profileKey = null) {
+        const key = cacheKey(profileKey);
+        this._cookies.delete(key);
+        this._cookiesAt.delete(key);
     }
 
     // Best-effort platform pause. A marker-write failure must never mask the
@@ -199,12 +223,13 @@ export class LinkedInRscSession {
             throw err;
         }
         try {
-            const cookies = await this.#refreshCookies(lease.credential?.profile_key ?? null);
+            const profileKey = lease.credential?.profile_key ?? null;
+            const cookies = await this.#refreshCookies(profileKey);
             return await fn(cookies, lease);
         } catch (err) {
-            if (err instanceof AuthError) {
+            if (err instanceof AuthError && err.code !== 'NEEDS_TEMPLATE') {
                 // A dead session must not be reused by the next role...
-                this.invalidateCookies();
+                this.invalidateCookies(lease.credential?.profile_key ?? null);
                 // ...and the BACKEND has to know, or it keeps the credential
                 // "available" and the queue hands out LinkedIn roles that all
                 // instantly 403. That is the fast-fail storm this codebase has

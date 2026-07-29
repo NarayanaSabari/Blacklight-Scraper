@@ -147,7 +147,7 @@ CloakBrowser launch seats and licence-key configuration are maintained in the
 - **Monster (DataDome):** the appsapi can be suppressed after a page loads. The scraper records this as `datadome-suppressed`, cools the current IP, and retries on another pool IP. Keep the 3–5 second warm-up and inter-page pacing.
 - **Glassdoor:** `/graph` discovery requires a warmed direct session. Job descriptions come from concurrent server-rendered detail pages through the separate `glassdoor-jd` lease; a per-IP denial stops enrichment early and leaves some descriptions as `N/A`.
 - **IP geography:** validated from a non-US IP. Glassdoor handles it (geo-pin); Indeed/Monster returned US jobs. Different prod region → re-run §8 smokes.
-- **LinkedIn cookies expire** — recurring task; `/health/linkedin?probe=1` does a real in-session check.
+- **LinkedIn cookies expire** — recurring task; `/healthz` reports whether a fresh session jar is cached.
 - **Two unverified code paths** (no creds to test here): Indeed full pagination, TechFetch login fallback. Reviewed + reasoned; step 9 is their first real exercise.
 
 ---
@@ -156,8 +156,7 @@ CloakBrowser launch seats and licence-key configuration are maintained in the
 
 | Endpoint | Use |
 |---|---|
-| `GET /healthz` | liveness + `gitSha` (confirm prod is on the deployed commit) |
-| `GET /health/linkedin?probe=1` | real LinkedIn session probe |
+| `GET /healthz` | liveness, identity, `gitSha`, and cached LinkedIn session state |
 | `GET /metrics` | Prometheus — `scraper_url_quality_total`, block/cooldown counters, per-platform success |
 
 Watch `scraper_url_quality_total{quality="empty"|"profile_in"}` and the `BlockedError` counters — a rise means a DOM drifted or an IP got flagged.
