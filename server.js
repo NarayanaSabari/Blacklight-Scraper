@@ -33,7 +33,6 @@ import { registerHealthRoute } from './src/routes/health.js';
 import { registerScrapeRoute } from './src/routes/scrape.js';
 import { registerScrapeQueueRoute } from './src/routes/scrape-queue.js';
 import { registerMetricsRoute } from './src/routes/metrics.js';
-import { releaseAllLicenseLocks } from './src/core/license-pool.js';
 
 const log = createLogger('server');
 
@@ -177,7 +176,6 @@ async function main() {
             try { await withTimeout(label, promise); }
             catch (error) { log.error(`shutdown step '${label}' failed`, { err: error.message }); }
         }
-        releaseAllLicenseLocks();
 
         server.close(() => {
             log.info('Server closed', { reason: shutdownReason });

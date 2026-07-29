@@ -35,6 +35,7 @@ const DEFAULT_LOCK_RETRY_MS = 250;
 const DEFAULT_LOCK_DIR = '.blacklight-cloakbrowser-seats';
 const DEFAULT_INCOMPLETE_LOCK_GRACE_MS = 5_000;
 const MAX_CLEANUP_RETRY_MS = 5_000;
+const MAX_CLEANUP_ATTEMPTS = 6;
 
 export function lockDirectory(env = process.env) {
     const configured = env?.CLOAKBROWSER_LICENSE_LOCK_DIR;
@@ -75,8 +76,6 @@ function parsePid(raw) {
     const pid = Number(value.slice(0, -1));
     return Number.isSafeInteger(pid) ? pid : null;
 }
-
-const pools = new Set();
 
 // One key per line; blanks and `#` comments ignored.
 export function parseKeyLine(line) {
@@ -134,7 +133,6 @@ export class LicensePool {
         this._draining = false;
         this._lockError = null;
         this._lockWarningLogged = false;
-        pools.add(this);
     }
 
     get size() { return this._seats.length; }
@@ -333,27 +331,15 @@ export class LicensePool {
                 reason: error?.code || error?.name || 'unknown',
             });
         }
-        if (seat.cleanupTimer) return;
+        if (seat.cleanupTimer || seat.cleanupAttempt >= MAX_CLEANUP_ATTEMPTS) return;
         const delay = Math.min(this._lockRetryMs * (2 ** Math.min(seat.cleanupAttempt, 5)), MAX_CLEANUP_RETRY_MS);
         seat.cleanupAttempt += 1;
-        seat.cleanupTimer = setTimeout(() => {
+        const timer = setTimeout(() => {
             seat.cleanupTimer = null;
             this._releaseSeat(seat);
         }, delay);
-    }
-
-    _releaseAllLocks() {
-        for (const seat of this._seats) {
-            if (seat.cleanupTimer) {
-                clearTimeout(seat.cleanupTimer);
-                seat.cleanupTimer = null;
-            }
-            if (!seat.lockHeld) continue;
-            try {
-                this._removeLock(seat);
-                seat.lockHeld = false;
-            } catch {}
-        }
+        timer.unref?.();
+        seat.cleanupTimer = timer;
     }
 
     _free(seat) {
@@ -369,13 +355,6 @@ export class LicensePool {
         };
     }
 }
-
-export function releaseAllLicenseLocks() {
-    for (const pool of pools) {
-        try { pool._releaseAllLocks(); } catch {}
-    }
-}
-process.once('exit', releaseAllLicenseLocks);
 
 let _singleton = null;
 export function getLicensePool() {
