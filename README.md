@@ -29,10 +29,12 @@ on the key's allowlist. Adding a new host = registering a new key.
 ## 🚀 What this scraper does
 
 - **Queue-driven** — polls the Blacklight backend every 30s, claims a
-  role, scrapes all platforms in its allowlist **in parallel** within a
-  single session, submits jobs back, completes the session
+  role, starts all platforms in its allowlist **in parallel** within a
+  single session, submits jobs back, completes the session. CloakBrowser
+  launches are seat-pooled, so excess browser launches wait when the
+  configured licence keys are saturated.
 - **Multi-platform** - Monster (CloakBrowser + appsapi JSON behind
-  DataDome), Dice (Crawlee + Cheerio), TechFetch (CloakBrowser + login),
+  DataDome), Dice (CloakBrowser + Crawlee + Cheerio), TechFetch (CloakBrowser + login),
   LinkedIn (CDP to a real Chrome with persistent profile), Glassdoor
   (`/graph` API plus CloakBrowser detail enrichment, with an opt-in browser
   fallback), Indeed (mobile API with an opt-in browser fallback)
@@ -77,7 +79,7 @@ npm install
 This will install all required packages including:
 - Express.js (Web server)
 - Crawlee (Web scraping framework)
-- Playwright (Browser automation)
+- Playwright (browser automation used by Crawlee)
 - Cheerio (HTML parsing)
 - JSDOM (DOM manipulation)
 
@@ -287,7 +289,9 @@ Job-Scraper/
 │   ├── core/
 │   │   ├── errors.js         # Typed error hierarchy (ScraperError, AuthError, …)
 │   │   ├── base-scraper.js   # Shared scraper lifecycle + logging
-│   │   ├── browser.js        # Playwright launch helpers (withBrowser cleanup guarantee)
+│   │   ├── browser.js        # Legacy Playwright helpers (not used by active scrapers)
+│   │   ├── browser-pool.js   # CloakBrowser launchers with licence-seat leasing
+│   │   ├── license-pool.js    # Cross-process CloakBrowser licence-seat pool
 │   │   ├── fingerprints.js   # Shared UAs/viewports
 │   │   ├── cookies.js        # Unified cookie loader
 │   │   ├── delays.js         # humanDelay, randomDelay, backoff+jitter
@@ -311,12 +315,12 @@ Job-Scraper/
 │
 ├── scrapers/                 # Platform-specific scraping logic
 │   ├── monster.js            # Monster Jobs (HTTP API)
-│   ├── dice.js               # Dice Jobs (Playwright + Crawlee)
+│   ├── dice.js               # Dice Jobs (CloakBrowser + Crawlee)
 │   ├── techfetch.js          # TechFetch (requires login)
 │   ├── linkedin.js           # LinkedIn (CDP to existing Chrome)
 │   ├── glassdoor.js          # Glassdoor browser fallback + detail extraction
 │   ├── glassdoor-api.js      # Glassdoor /graph discovery + detail enrichment
-│   └── indeed.js             # Indeed (cookie auth + stealth)
+│   └── indeed.js             # Indeed mobile API + browser fallback
 │
 ├── schemas/
 │   └── master-schema.json
@@ -367,6 +371,9 @@ TELEMETRY_KEY=                  # Override telemetry key (default: blacklight.ap
 
 Platform routing, Glassdoor's per-IP detail-page limit, and all platform-specific
 performance knobs are maintained in the [scraper runbook](docs/scraper-runbook.md).
+
+See the [CloakBrowser session-seat runbook](docs/scraper-runbook.md#cloakbrowser-session-seats)
+for key sizing, the git-ignored key-file alternative, and the no-key fallback.
 
 ### LinkedIn — log in once to the persistent stealth profile
 

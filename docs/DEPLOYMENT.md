@@ -1,7 +1,8 @@
 # Blacklight Scraper — Production Deployment Runbook
 
 Pre-flight guide for pulling `main` into production and running it. All 6
-platforms are hardened (637 unit tests). Read §2 (browsers) and §6
+platforms are hardened (650 tests: 649 passing, with one known pre-existing
+failure). Read §2 (browsers) and §6
 (persistent state) carefully — the CloakBrowser binary download is the
 most-missed prerequisite.
 
@@ -22,7 +23,7 @@ LinkedIn is the only platform without `strictEmpty` — intentional (tuned in th
 
 ---
 
-## 2. Browser engine — CloakBrowser (ALL 6 scrapers)
+## 2. Browser engine — CloakBrowser
 
 All browser paths run on **CloakBrowser 0.5.2** (stealth Chromium) - one engine, fleet-wide. Glassdoor's API discovery additionally uses `node-tls-client`; its description enrichment uses CloakBrowser. TechFetch was migrated off playwright-extra so there's no longer a second active browser stack. Playwright's own Chromium is not used by any active scraper (the only remaining importer, `src/core/browser.js`, is dead code).
 
@@ -112,6 +113,9 @@ Ephemeral container → volume-mount these. Otherwise: re-download the 350 MB br
 ## 7. Environment variables (optional; safe defaults)
 
 `PORT` (3001) · `NODE_ENV` (production) · `SCRAPER_MODE` (`daemon` = offline alerts) · `LOG_LEVEL` · `INSTANCE_ID` · `QUEUE_CHECK_INTERVAL_MS` (30000) · `PROXY_LIST` / `PROXY_LIST_FILE` · `PROXY_EXCLUDE_PLATFORMS` · `PROXY_BLOCK_COOLDOWN_MS` (600000) · `DICE_DETAIL_RENDER_WAIT_MS` (0) · `DICE_DETAIL_CONCURRENCY` (10) · `TECHFETCH_RETRY_BACKOFF_MS` (500) · `TECHFETCH_DETAIL_CONCURRENCY` (8) · `GLASSDOOR_FETCH_DESCRIPTIONS` (on) · `GLASSDOOR_DESC_CONCURRENCY` (6) · `INDEED_ALLOW_ANONYMOUS` (`1` = Indeed page-1 without a credential) · `LINKEDIN_MAX_CONCURRENCY` (2 — concurrent LinkedIn tabs on the one account; 1 = serialize, 3 = push harder/ban-risk; read at process start) · `LINKEDIN_SINGLEFLIGHT_RELOGIN` (off by default; `1`/`true` = on. When a LinkedIn cookie dies mid-scrape, run ONE coordinated re-login that rotates to a fresh pool account while concurrent tabs wait + retry, instead of wedging the session into a "lease unavailable" storm until a process restart. REMOTE pool mode only — needs ≥1 spare healthy account to rotate to) · `SCRAPER_DEFAULT_LOCATION` · CloakBrowser vars (§2).
+
+CloakBrowser launch seats and licence-key configuration are maintained in the
+[session-seat section of the scraper runbook](scraper-runbook.md#cloakbrowser-session-seats).
 
 ---
 

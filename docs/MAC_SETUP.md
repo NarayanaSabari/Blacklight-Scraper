@@ -87,6 +87,11 @@ This is the only thing that decides which platforms this host scrapes.
 Anything not in the allowlist is silently filtered out by the backend's
 queue endpoint.
 
+CloakBrowser launches are seat-pooled per licence key. Configure one key per
+browser platform you want to run concurrently; with fewer keys, the extra
+launches wait. See the [session-seat section of the scraper runbook](scraper-runbook.md#cloakbrowser-session-seats)
+for the key-file and no-key fallback details.
+
 ## 3. Configure credentials.json
 
 ```bash
@@ -141,7 +146,7 @@ pool is available.
 
 ### Indeed
 - **Dashboard → Credentials → Indeed → + Add Credential**
-- Same flow as Glassdoor: solve any Indeed captcha, export cookies, paste
+- Solve any Indeed captcha, export cookies, and paste the cookie array
 
 > The cookie format expected is the **array-of-objects** shape produced
 > by Cookie-Editor / EditThisCookie / Brave's built-in cookie export.
@@ -198,7 +203,8 @@ INFO [ORCHESTRATOR] Queue item acquired {"sessionId":"...","platforms":["linkedi
 That last line is the success signal — the backend handed your host a
 role with the three platforms in its allowlist. From there:
 
-- LinkedIn, Glassdoor, Indeed all run **in parallel** within each session
+- LinkedIn, Glassdoor, and Indeed start **in parallel** within each session;
+  CloakBrowser seat limits may queue browser launches
 - Wall-clock = max(LinkedIn ~6 min, Glassdoor ~10–18s for enrichment, Indeed ~85s) ≈ 6 min
 - The slowest scraper is LinkedIn (`maxPosts: 100` with 2s scroll delay)
 
