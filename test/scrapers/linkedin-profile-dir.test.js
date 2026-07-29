@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { profileDirFor, linkedInProfileDir } from '../../scrapers/linkedin.js';
+import { linkedInProfileDir, profileDirFor } from '../../src/core/linkedin-profile.js';
 
 test('profileDirFor: null profileKey → legacy fixed dir (byte-identical)', () => {
     assert.equal(profileDirFor(null), linkedInProfileDir());

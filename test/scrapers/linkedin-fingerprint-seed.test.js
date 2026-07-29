@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fingerprintSeedFor } from '../../scrapers/linkedin.js';
+import { fingerprintSeedFor } from '../../src/core/linkedin-profile.js';
 
 test('fingerprintSeedFor: deterministic per profileKey, in [10000,99999]', () => {
     const a = fingerprintSeedFor('li-acct-1');

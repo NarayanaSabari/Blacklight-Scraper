@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pickSessionQuery } from '../../scrapers/linkedin.js';
+import { pickSessionQuery } from '../../src/core/linkedin-query.js';
 
 test('pickSessionQuery: null / non-array / empty → null', () => {
     assert.equal(pickSessionQuery(null), null);

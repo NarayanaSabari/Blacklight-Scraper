@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { launchPersistentProfile, fingerprintSeedFor, fingerprintPlatform } from '../../scrapers/linkedin.js';
+import { fingerprintPlatform, fingerprintSeedFor } from '../../src/core/linkedin-profile.js';
+import { launchPersistentProfile } from '../../src/core/linkedin-browser.js';
 
 test('fingerprintPlatform: macos on a Mac host, windows elsewhere, env override wins', () => {
     assert.equal(fingerprintPlatform({}, 'darwin'), 'macos');

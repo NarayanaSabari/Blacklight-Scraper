@@ -10,7 +10,8 @@
     "linkedin:login": "node scripts/linkedin-login.js",
     "linkedin:reset": "node scripts/linkedin-reset.js",
     "creds:clean": "node scripts/clean-credentials.js",
-    "test": "node --test"
+    "test": "node --test",
+    "linkedin:rsc-template": "node scripts/linkedin-rsc-template.js"
   },
   "keywords": [
     "job-scraper",

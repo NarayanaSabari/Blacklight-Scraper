@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { hasLiAt } from '../../scrapers/linkedin.js';
+import { hasLiAt } from '../../src/core/linkedin-profile.js';
 
 test('hasLiAt: null → false', () => {
     assert.equal(hasLiAt(null), false);

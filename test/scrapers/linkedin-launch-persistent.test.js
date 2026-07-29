@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { launchPersistentProfile, linkedInProfileDir } from '../../scrapers/linkedin.js';
+import { linkedInProfileDir } from '../../src/core/linkedin-profile.js';
+import { launchPersistentProfile } from '../../src/core/linkedin-browser.js';
 
 // The launcher is injectable as the last arg so we can assert on the options
 // without spinning up a real CloakBrowser. It returns a stub context.

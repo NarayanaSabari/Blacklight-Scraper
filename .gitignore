@@ -5,6 +5,7 @@ logs/
 
 # Secrets — NEVER commit
 config/credentials.json
+config/linkedin-rsc-template.json
 config/*.local.json
 config/proxies.txt
 config/cloakbrowser-keys.txt
