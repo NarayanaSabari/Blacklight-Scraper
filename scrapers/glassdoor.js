@@ -8,11 +8,12 @@
 // CloakBrowser eliminates all of that — anonymous fresh launches load
 // search-result pages cleanly.
 import * as cheerio from 'cheerio';
-import { launch } from 'cloakbrowser';
+import { launch } from '../src/core/browser-pool.js';
 import { createLogger } from '../src/logger/index.js';
 import { applyResourceBlocking } from '../src/core/resource-blocking.js';
 import { getProxyPool } from '../src/core/proxy-pool.js';
 import { stealthLaunchOptions } from '../src/core/launch-config.js';
+import { extractJobDetailsFromHTML } from '../src/core/glassdoor-jd.js';
 import { scrapeGlassdoorViaApi } from './glassdoor-api.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { BlockedError, DomChangedError, NetworkError } from '../src/core/errors.js';
@@ -450,56 +451,6 @@ export function parseGlassdoorCard($, $card, pageBaseUrl) {
     };
 }
 
-
-// Extract job details from detail page
-function extractJobDetailsFromHTML(html) {
-    const $ = cheerio.load(html);
-    const title = $('title').text().trim();
-
-    if (title.includes('Security') || title.includes('Just a moment')) {
-        return null;
-    }
-
-    const jobDescription = {};
-    const jsonLd = $('script[type="application/ld+json"]').html();
-
-    if (jsonLd) {
-        try {
-            const structuredData = JSON.parse(jsonLd);
-            if (structuredData.description) {
-                const descHtml = structuredData.description;
-                const $desc = cheerio.load(descHtml);
-                const fullDescription = $desc.text().trim();
-                if (fullDescription) {
-                    jobDescription.fullDescription = fullDescription;
-                }
-            }
-        } catch (e) {
-            // Ignore
-        }
-    }
-
-    if (!jobDescription.fullDescription) {
-        const descSelectors = [
-            '[data-test="job-description"]',
-            '.jobDescription',
-            '[class*="jobDescription"]'
-        ];
-
-        for (const selector of descSelectors) {
-            const descElement = $(selector);
-            if (descElement.length > 0) {
-                const description = descElement.text().trim();
-                if (description && description.length > 50) {
-                    jobDescription.fullDescription = description;
-                    break;
-                }
-            }
-        }
-    }
-
-    return jobDescription;
-}
 
 // Extract single job details using proper Glassdoor detail URL
 async function extractSingleJobDetails(page, job, jobIndex, totalJobs) {

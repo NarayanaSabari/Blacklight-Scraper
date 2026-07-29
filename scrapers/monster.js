@@ -12,7 +12,7 @@
 // from the API is roughly the same as the DOM ceiling, just paginated
 // via &page=N.
 
-import { launch, launchPersistentContext } from 'cloakbrowser';
+import { launch, launchPersistentContext } from '../src/core/browser-pool.js';
 import { createLogger } from '../src/logger/index.js';
 import { applyResourceBlocking } from '../src/core/resource-blocking.js';
 import { getProxyPool } from '../src/core/proxy-pool.js';
@@ -253,6 +253,36 @@ export function classifyMonsterPage({ url, bodyText, cardCount, sawApiResponse, 
     return { state: 'network_error', signal: 'no appsapi response, no positive page signal' };
 }
 
+// Verdict → error. Kept separate from the throw sites so the retry contract is
+// testable without a browser.
+//
+// 'network_error' means the page loaded but Monster's edge never let the appsapi
+// POST fire — DataDome suppressing us, not a broken socket (a genuine transport
+// failure throws from page.goto and never reaches here). It therefore has to be
+// a BlockedError: the retry loop only rotates IPs for Blocked/DomChanged, so
+// raising NetworkError here spent one attempt and gave up on a block that a
+// different IP usually clears. `kind` keeps the two block modes distinguishable
+// in metrics.
+export function monsterErrorForVerdict(verdict) {
+    const signal = verdict?.signal ?? 'unknown';
+    switch (verdict?.state) {
+        case 'soft_blocked':
+            return new BlockedError(`Monster blocked: ${signal}`, { platform: 'monster', kind: 'datadome' });
+        case 'dom_changed':
+            return new DomChangedError(`Monster DOM changed: ${signal}`, { platform: 'monster' });
+        case 'network_error':
+            return new BlockedError(`Monster edge refused the appsapi: ${signal}`, { platform: 'monster', kind: 'datadome-suppressed' });
+        default:
+            return new NetworkError(`Monster unexpected verdict '${verdict?.state}': ${signal}`, { platform: 'monster' });
+    }
+}
+
+// DataDome is per-IP and roughly a coin flip per attempt, so both block modes and
+// a suspicious 0-card render are worth retrying on a fresh IP.
+export function isRetryableMonsterError(e) {
+    return e?.name === 'BlockedError' || e?.name === 'DomChangedError';
+}
+
 // First-touch on /jobs/search returns 403 from DataDome on a brand-new
 // session. A brief visit to monster.com first establishes cookies and
 // lets the subsequent search-page navigation through.
@@ -323,8 +353,7 @@ export async function scrapeMonster(jobTitle, location, sessionId = null, option
             // Retry on DataDome block (BlockedError) AND the "appsapi responded
             // but 0 cards" case (DomChangedError) — both are transient DataDome
             // render/score outcomes that a fresh attempt on a different IP clears.
-            const retryable = e?.name === 'BlockedError' || e?.name === 'DomChangedError';
-            if (!retryable || attempt >= maxAttempts) throw e;
+            if (!isRetryableMonsterError(e) || attempt >= maxAttempts) throw e;
             // Cool this IP so acquire() rotates to a different one, then retry
             // (DataDome is per-IP + ~50/50).
             try { getProxyPool().reportBlocked('monster'); } catch { /* best-effort */ }
@@ -456,11 +485,11 @@ async function scrapeMonsterOnce(jobTitle, location, options = {}) {
                     path: cooldownPath(),
                 });
                 if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
-                throw new BlockedError(`Monster blocked: ${verdict.signal}`, { platform: 'monster', kind: 'datadome' });
+                throw monsterErrorForVerdict(verdict);
             }
             if (verdict.state === 'dom_changed') {
                 if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
-                throw new DomChangedError(`Monster DOM changed: ${verdict.signal}`, { platform: 'monster' });
+                throw monsterErrorForVerdict(verdict);
             }
             if (verdict.state === 'network_error') {
                 // Mode B: DataDome silently suppressed the appsapi POST (page rendered fine but
@@ -469,6 +498,8 @@ async function scrapeMonsterOnce(jobTitle, location, options = {}) {
                 // circuit at the entry gate instead of cascading wasted timeouts. The separate
                 // goto-throw catch path (Mode D: genuine network failure) does NOT route here,
                 // so this is correctly scoped to "page worked but Monster's edge refused us".
+                // monsterErrorForVerdict raises this as a BlockedError so the caller actually
+                // rotates IPs and retries instead of burning its one attempt.
                 writeCooldownMarker({
                     writeFile: defaultWriteFile(),
                     rename: defaultRename(),
@@ -477,7 +508,7 @@ async function scrapeMonsterOnce(jobTitle, location, options = {}) {
                     path: cooldownPath(),
                 });
                 if (collectedAnything) return { jobs: allJobs, emptyConfirmed: false, partial: true };
-                throw new NetworkError(`Monster page didn't load: ${verdict.signal}`, { platform: 'monster' });
+                throw monsterErrorForVerdict(verdict);
             }
             if (verdict.state === 'empty_confirmed') {
                 consecutiveEmpty++;

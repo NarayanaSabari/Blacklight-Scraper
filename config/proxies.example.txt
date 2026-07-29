@@ -1,5 +1,6 @@
-# Proxy pool for the 5 anti-bot-gated scrapers (dice/monster/indeed/glassdoor/
-# techfetch). LinkedIn does NOT use these — it runs direct on a logged-in profile.
+# Proxy pool for platforms that benefit from IP rotation (Monster, Glassdoor
+# job-detail enrichment, Indeed, and TechFetch). LinkedIn does NOT use these -
+# it runs direct on a logged-in profile. Dice also runs direct.
 #
 # SETUP: copy this file to  config/proxies.txt  (git-ignored) and put ONE proxy
 # per line in the format your provider gives:
@@ -16,5 +17,9 @@
 #   - host:port with no user/pass is allowed (IP-whitelisted pools).
 #   - The scrapers round-robin across all lines, one IP per scrape, and cool an
 #     IP down for ~10 min (PROXY_BLOCK_COOLDOWN_MS) if it gets a block.
+#   - Glassdoor /graph discovery should usually stay direct:
+#       PROXY_EXCLUDE_PLATFORMS=glassdoor
+#     Its job-detail enrichment uses the separate `glassdoor-jd` pool key.
+#     Add `glassdoor-jd` to the exclusion list too when both paths must be direct.
 #   - No config/proxies.txt present → scrapers run direct (current behavior).
 #   - Alternatively set env PROXY_LIST="line1,line2,..." instead of the file.
