@@ -1,8 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import nodeFs from 'node:fs';
+import path from 'node:path';
 import { LicensePool, loadLicenseKeys, parseKeyLine } from '../../src/core/license-pool.js';
 import { __setLauncherForTest, launch, launchPersistentContext } from '../../src/core/browser-pool.js';
 import { __resetLicensePoolForTest } from '../../src/core/license-pool.js';
+
+const browserLockDir = path.join(process.cwd(), '.test-license-pool-locks');
+nodeFs.rmSync(browserLockDir, { recursive: true, force: true });
+process.env.CLOAKBROWSER_LICENSE_LOCK_DIR = browserLockDir;
+test.after(() => {
+    delete process.env.CLOAKBROWSER_LICENSE_LOCK_DIR;
+    nodeFs.rmSync(browserLockDir, { recursive: true, force: true });
+});
 
 // CloakBrowser enforces its session limit PER LICENCE KEY, globally. Verified
 // live 2026-07-28: 2 browsers on one key → 1 alive, 1 killed with "Target page,
@@ -31,14 +41,14 @@ test('loadLicenseKeys: env wins over file, comma or newline, de-duped', () => {
 });
 
 test('seat count equals key count', () => {
-    assert.equal(new LicensePool(['a', 'b', 'c']).size, 3);
-    assert.equal(new LicensePool(['a']).size, 1);
+    assert.equal(new LicensePool(['a', 'b', 'c'], { locking: false }).size, 3);
+    assert.equal(new LicensePool(['a'], { locking: false }).size, 1);
 });
 
 test('no keys configured still yields ONE seat carrying a null key', async () => {
     // Null key matters: it lets cloakbrowser resolve its own env/file key while
     // still serialising launches so they cannot kill each other.
-    const pool = new LicensePool([]);
+    const pool = new LicensePool([], { locking: false });
     assert.equal(pool.size, 1);
     const lease = await pool.acquire();
     assert.equal(lease.key, null);
@@ -46,7 +56,7 @@ test('no keys configured still yields ONE seat carrying a null key', async () =>
 });
 
 test('acquire hands out each key once, then queues until a seat frees', async () => {
-    const pool = new LicensePool(['k1', 'k2']);
+    const pool = new LicensePool(['k1', 'k2'], { locking: false });
     const a = await pool.acquire();
     const b = await pool.acquire();
     assert.deepEqual([a.key, b.key].sort(), ['k1', 'k2']);
@@ -65,7 +75,7 @@ test('acquire hands out each key once, then queues until a seat frees', async ()
 });
 
 test('release is idempotent — a double release cannot free a seat twice', async () => {
-    const pool = new LicensePool(['k1']);
+    const pool = new LicensePool(['k1'], { locking: false });
     const lease = await pool.acquire();
     lease.release();
     lease.release();
@@ -77,7 +87,7 @@ test('release is idempotent — a double release cannot free a seat twice', asyn
 });
 
 test('queue is FIFO', async () => {
-    const pool = new LicensePool(['only']);
+    const pool = new LicensePool(['only'], { locking: false });
     const held = await pool.acquire();
     const order = [];
     const p1 = pool.acquire().then((l) => { order.push('first'); l.release(); });
@@ -85,6 +95,146 @@ test('queue is FIFO', async () => {
     held.release();
     await Promise.all([p1, p2]);
     assert.deepEqual(order, ['first', 'second']);
+});
+
+function fsError(code) {
+    const error = new Error(code);
+    error.code = code;
+    return error;
+}
+
+function fakeFs(initialFiles = new Map()) {
+    const files = new Map(initialFiles);
+    const descriptors = new Map();
+    let nextDescriptor = 1;
+    const calls = { mkdir: 0, open: 0, write: 0, close: 0, read: 0, unlink: 0 };
+    return {
+        files,
+        calls,
+        mkdirSync() { calls.mkdir += 1; },
+        openSync(file, flags) {
+            calls.open += 1;
+            assert.equal(flags, 'wx');
+            if (files.has(file)) throw fsError('EEXIST');
+            const fd = nextDescriptor++;
+            descriptors.set(fd, file);
+            files.set(file, '');
+            return fd;
+        },
+        writeSync(fd, data) {
+            calls.write += 1;
+            files.set(descriptors.get(fd), data);
+        },
+        closeSync(fd) {
+            calls.close += 1;
+            descriptors.delete(fd);
+        },
+        readFileSync(file) {
+            calls.read += 1;
+            if (!files.has(file)) throw fsError('ENOENT');
+            return files.get(file);
+        },
+        unlinkSync(file) {
+            calls.unlink += 1;
+            if (!files.delete(file)) throw fsError('ENOENT');
+        },
+    };
+}
+
+function fakeProcess(pid, alivePids = new Set()) {
+    return {
+        pid,
+        kill(targetPid, signal) {
+            assert.equal(signal, 0);
+            if (alivePids.has(targetPid)) return true;
+            throw fsError('ESRCH');
+        },
+    };
+}
+
+test('lock is acquired with O_EXCL and removed on release', async () => {
+    const deps = fakeFs();
+    const pool = new LicensePool(['shared-key'], {
+        fs: deps,
+        lockDir: '/locks',
+        pid: 101,
+        process: fakeProcess(101, new Set([101])),
+    });
+    const lease = await pool.acquire();
+    assert.equal(deps.files.size, 1);
+    assert.equal([...deps.files.values()][0], '101\n');
+    lease.release();
+    assert.equal(deps.files.size, 0);
+    assert.equal(deps.calls.unlink, 1);
+});
+
+test('a second pool waits for a key locked by another live process', async () => {
+    const deps = fakeFs();
+    const env = { CLOAKBROWSER_LICENSE_LOCK_RETRY_MS: '1' };
+    const first = new LicensePool(['shared-key'], {
+        fs: deps,
+        lockDir: '/locks',
+        pid: 101,
+        process: fakeProcess(101, new Set([101, 202])),
+        env,
+    });
+    const second = new LicensePool(['shared-key'], {
+        fs: deps,
+        lockDir: '/locks',
+        pid: 202,
+        process: fakeProcess(202, new Set([101, 202])),
+        env,
+    });
+    const firstLease = await first.acquire();
+    let secondLease;
+    const pending = second.acquire().then((lease) => { secondLease = lease; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(secondLease, undefined);
+    assert.equal(second.stats().waiting, 1);
+    firstLease.release();
+    await pending;
+    assert.equal(secondLease.key, 'shared-key');
+    secondLease.release();
+});
+
+test('a lock held by a dead process is reclaimed', async () => {
+    const pool = new LicensePool(['shared-key'], { fs: fakeFs(), lockDir: '/locks', pid: 202, process: fakeProcess(202) });
+    const stalePath = pool._seats[0].lockPath;
+    const deps = fakeFs(new Map([[stalePath, '101\n']]));
+    const reclaimingPool = new LicensePool(['shared-key'], {
+        fs: deps,
+        lockDir: '/locks',
+        pid: 202,
+        process: fakeProcess(202),
+    });
+    const lease = await reclaimingPool.acquire();
+    assert.equal(deps.files.get(stalePath), '202\n');
+    lease.release();
+});
+
+test('double release removes the lock exactly once', async () => {
+    const deps = fakeFs();
+    const pool = new LicensePool(['shared-key'], {
+        fs: deps,
+        lockDir: '/locks',
+        pid: 101,
+        process: fakeProcess(101, new Set([101])),
+    });
+    const lease = await pool.acquire();
+    lease.release();
+    lease.release();
+    assert.equal(deps.calls.unlink, 1);
+    assert.equal(deps.files.size, 0);
+});
+
+test('an unwritable lock directory falls back for the implicit seat', async () => {
+    const deps = fakeFs();
+    deps.mkdirSync = () => { throw fsError('EACCES'); };
+    const pool = new LicensePool([], { fs: deps, lockDir: '/unwritable', pid: 101, process: fakeProcess(101) });
+    const lease = await pool.acquire();
+    assert.equal(lease.key, null);
+    assert.equal(deps.calls.open, 0);
+    lease.release();
 });
 
 // ---- browser-pool wiring ----
@@ -163,6 +313,7 @@ test('the seat is released even when close() throws', async () => {
         await assert.rejects(() => b.close(), /close boom/);
         const b2 = await launch({});   // would hang if the seat leaked
         assert.ok(b2);
+        await b2.close();
     } finally {
         delete process.env.CLOAKBROWSER_LICENSE_KEYS;
         __setLauncherForTest(null);

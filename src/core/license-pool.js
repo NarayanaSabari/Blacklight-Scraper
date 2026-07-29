@@ -23,11 +23,32 @@
 // its own env/file resolution while still serialising launches.
 
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import { createLogger } from '../logger/index.js';
 
 const log = createLogger('license-pool');
 
 const DEFAULT_FILE = 'config/cloakbrowser-keys.txt';
+const DEFAULT_LOCK_RETRY_MS = 250;
+const DEFAULT_LOCK_DIR = '.blacklight-cloakbrowser-seats';
+
+export function lockDirectory() {
+    return path.join(os.homedir(), DEFAULT_LOCK_DIR);
+}
+
+function lockName(key) {
+    const value = key === null ? 'implicit-seat' : String(key);
+    return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function retryMs(env) {
+    const raw = env?.CLOAKBROWSER_LICENSE_LOCK_RETRY_MS;
+    if (raw === undefined || raw === null || raw === '') return DEFAULT_LOCK_RETRY_MS;
+    const value = Number.parseInt(String(raw), 10);
+    return Number.isFinite(value) && value > 0 ? value : DEFAULT_LOCK_RETRY_MS;
+}
 
 // One key per line; blanks and `#` comments ignored.
 export function parseKeyLine(line) {
@@ -57,43 +78,204 @@ export function loadLicenseKeys(env = process.env, deps = {}) {
 }
 
 export class LicensePool {
-    constructor(keys = []) {
+    constructor(keys = [], options = {}) {
         // No keys configured still means ONE seat: cloakbrowser resolves the key
         // itself from env or ~/.cloakbrowser/license.key, and serialising on a
         // single seat is what stops concurrent launches killing each other.
-        this._seats = (keys.length ? keys : [null]).map((key) => ({ key, busy: false }));
+        this._seats = (keys.length ? keys : [null]).map((key) => ({
+            key,
+            busy: false,
+            lockPath: path.join(options.lockDir ?? lockDirectory(), `${lockName(key)}.lock`),
+            lockHeld: false,
+        }));
         this._waiters = [];
+        this._fs = options.fs ?? fs;
+        this._process = options.process ?? process;
+        this._pid = options.pid ?? this._process.pid ?? process.pid;
+        this._env = options.env ?? process.env;
+        this._locking = options.locking ?? true;
+        this._lockDir = options.lockDir ?? lockDirectory();
+        this._lockDirReady = false;
+        this._lockRetryMs = retryMs(this._env);
+        this._retryTimer = null;
+        this._draining = false;
+        this._lockError = null;
+        this._lockWarningLogged = false;
     }
 
     get size() { return this._seats.length; }
 
-    // Resolves with a lease as soon as a seat is free; queues FIFO otherwise.
-    // Never rejects, and never hands out more leases than there are seats.
-    async acquire() {
-        const free = this._seats.find((s) => !s.busy);
-        if (free) return this._lease(free);
-        return new Promise((resolve) => { this._waiters.push(resolve); });
+    acquire() {
+        if (this._lockError) return Promise.reject(this._lockError);
+        return new Promise((resolve, reject) => {
+            this._waiters.push({ resolve, reject });
+            this._drain();
+        });
+    }
+
+    _canFallback() {
+        return this._seats.length === 1 && this._seats[0].key === null;
+    }
+
+    _disableLocking(error) {
+        this._locking = false;
+        if (!this._lockWarningLogged) {
+            this._lockWarningLogged = true;
+            log.warn('CloakBrowser seat lock unavailable; using in-process-only fallback', {
+                reason: error?.code || error?.name || 'unknown',
+            });
+        }
+    }
+
+    _ensureLockDir() {
+        if (!this._locking || this._lockDirReady) return;
+        try {
+            this._fs.mkdirSync(this._lockDir, { recursive: true, mode: 0o700 });
+            this._lockDirReady = true;
+        } catch (error) {
+            if (this._canFallback()) {
+                this._disableLocking(error);
+                return;
+            }
+            throw error;
+        }
+    }
+
+    _isAlive(pid) {
+        if (!Number.isInteger(pid) || pid <= 0) return false;
+        try {
+            this._process.kill(pid, 0);
+            return true;
+        } catch (error) {
+            return error?.code === 'EPERM';
+        }
+    }
+
+    _removeLock(seat) {
+        try { this._fs.unlinkSync(seat.lockPath); }
+        catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
+
+    _tryLock(seat) {
+        if (!this._locking) return true;
+        this._ensureLockDir();
+        if (!this._locking) return true;
+
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            let fd;
+            try {
+                fd = this._fs.openSync(seat.lockPath, 'wx', 0o600);
+                try {
+                    this._fs.writeSync(fd, `${this._pid}\n`);
+                } finally {
+                    this._fs.closeSync(fd);
+                }
+                seat.lockHeld = true;
+                return true;
+            } catch (error) {
+                if (fd !== undefined) {
+                    try { this._fs.closeSync(fd); } catch { /* best effort */ }
+                    try { this._removeLock(seat); } catch (cleanupError) {
+                        if (this._canFallback()) {
+                            this._disableLocking(cleanupError);
+                            return true;
+                        }
+                        throw cleanupError;
+                    }
+                }
+                if (error?.code !== 'EEXIST') {
+                    if (this._canFallback()) {
+                        this._disableLocking(error);
+                        return true;
+                    }
+                    throw error;
+                }
+
+                let ownerPid;
+                try {
+                    ownerPid = Number.parseInt(String(this._fs.readFileSync(seat.lockPath, 'utf8')).trim(), 10);
+                } catch (readError) {
+                    if (readError?.code === 'ENOENT') continue;
+                    if (this._canFallback()) {
+                        this._disableLocking(readError);
+                        return true;
+                    }
+                    throw readError;
+                }
+                if (this._isAlive(ownerPid)) return false;
+                try { this._removeLock(seat); }
+                catch (removeError) {
+                    if (removeError?.code === 'ENOENT') continue;
+                    if (this._canFallback()) {
+                        this._disableLocking(removeError);
+                        return true;
+                    }
+                    throw removeError;
+                }
+            }
+        }
+        return false;
+    }
+
+    _scheduleRetry() {
+        if (this._retryTimer || !this._waiters.length) return;
+        this._retryTimer = setTimeout(() => {
+            this._retryTimer = null;
+            this._drain();
+        }, this._lockRetryMs);
+    }
+
+    _drain() {
+        if (this._draining) return;
+        this._draining = true;
+        try {
+            for (const seat of this._seats) {
+                if (!this._waiters.length) break;
+                if (seat.busy) continue;
+                seat.busy = true;
+                let locked;
+                try { locked = this._tryLock(seat); }
+                catch (error) {
+                    seat.busy = false;
+                    this._lockError = error;
+                    for (const waiter of this._waiters.splice(0)) waiter.reject(error);
+                    break;
+                }
+                if (!locked) {
+                    seat.busy = false;
+                    continue;
+                }
+                const waiter = this._waiters.shift();
+                waiter.resolve(this._lease(seat));
+            }
+            if (this._waiters.length && this._seats.some((seat) => !seat.busy)) this._scheduleRetry();
+        } finally {
+            this._draining = false;
+        }
     }
 
     _lease(seat) {
-        seat.busy = true;
         let released = false;
         return {
             key: seat.key,
             release: () => {
                 if (released) return;   // idempotent: a double release must not free a seat twice
                 released = true;
+                if (seat.lockHeld) {
+                    seat.lockHeld = false;
+                    try { this._removeLock(seat); }
+                    catch (error) { log.warn('Failed to remove CloakBrowser seat lock', { reason: error?.code || error?.name || 'unknown' }); }
+                }
                 this._free(seat);
             },
         };
     }
 
     _free(seat) {
-        const next = this._waiters.shift();
-        // Hand the seat straight to whoever is waiting rather than freeing and
-        // re-taking it, so a queued caller can't lose the race to a new one.
-        if (next) { next(this._lease(seat)); return; }
         seat.busy = false;
+        this._drain();
     }
 
     stats() {
