@@ -1,8 +1,7 @@
 // LinkedIn scraper, RSC transport.
 //
-// Same signature and return contract as the DOM scraper in
-// scrapers/linkedin.js, so BaseScraper, the orchestrator and
-// formatJobForBlacklight need no changes. Selected via LINKEDIN_TRANSPORT.
+// Same signature and return contract as the former LinkedIn scraper, so
+// BaseScraper, the orchestrator and formatJobForBlacklight need no changes.
 //
 // What differs from the DOM path:
 //   • no scrolling, no per-post "Copy link" clipboard interaction — permalinks

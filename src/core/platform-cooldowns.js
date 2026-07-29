@@ -13,7 +13,7 @@ import * as linkedin from './linkedin-cooldown.js';
 
 // Platform name → its cooldown module. Only platforms with a cooldown marker
 // appear here; others (dice) are never cooled-down. LinkedIn cools down on
-// auth/cookie-expiry (set in scrapers/linkedin.js) so the orchestrator stops
+// auth/cookie-expiry (set in the LinkedIn RSC session) so the orchestrator stops
 // claiming it while the session is dead, instead of storming concurrent
 // re-establish failures until the operator re-runs `npm run linkedin:login`.
 const MODULES = Object.freeze({ monster, indeed, glassdoor, techfetch, linkedin });

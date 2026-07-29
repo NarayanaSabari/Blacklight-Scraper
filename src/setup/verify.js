@@ -9,12 +9,12 @@ export function classifyLinkedinUrl(url) {
     return 'unknown';
 }
 
-// Mirrors scrapers/linkedin.js loadCookies sameSite + expiry policy
-// (no passthrough; '' = session). See scrapers/linkedin.js lines 56-89.
+// Normalize exported cookies for the local LinkedIn verification browser
+// (no passthrough; '' = session).
 export function cookieToPlaywright(c) {
     // sameSite: only lowercase keys map to Playwright values; everything else
     // (including already-capitalised 'None'/'Strict'/'Lax', 'unspecified',
-    // missing) falls back to 'Lax'. Mirrors scrapers/linkedin.js:86-89.
+    // missing) falls back to 'Lax'.
     const s = c.sameSite;
     const sameSite = s === 'no_restriction' ? 'None'
         : s === 'strict' ? 'Strict'
@@ -24,7 +24,7 @@ export function cookieToPlaywright(c) {
         name: c.name, value: c.value, domain: c.domain,
         path: c.path || '/', httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite,
     };
-    // expiry: mirrors scrapers/linkedin.js::parseExpiry (lines 56-66).
+    // Expiry values are normalized to Playwright's integer seconds.
     // null/undefined/'' → omit; number → floor; numeric string (>0) → floor;
     // ISO string → Date.parse()/1000 floored; anything else → omit.
     const raw = c.expirationDate;

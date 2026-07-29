@@ -233,7 +233,7 @@ export class LinkedInRscSession {
                 // ...and the BACKEND has to know, or it keeps the credential
                 // "available" and the queue hands out LinkedIn roles that all
                 // instantly 403. That is the fast-fail storm this codebase has
-                // already been burned by (see scrapers/linkedin.js on PR #310).
+                // already been burned by the former LinkedIn path (PR #310).
                 // Best-effort: never mask the original error with a report failure.
                 try {
                     await lease.reportFailure?.(err.message, 0, { authDead: true });

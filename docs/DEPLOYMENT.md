@@ -1,7 +1,7 @@
 # Blacklight Scraper — Production Deployment Runbook
 
 Pre-flight guide for pulling `main` into production and running it. All 6
-platforms are hardened (650 tests: 649 passing, with one known pre-existing
+platforms are hardened (645 tests: 644 passing, with one known pre-existing
 failure). Read §2 (browsers) and §6
 (persistent state) carefully — the CloakBrowser binary download is the
 most-missed prerequisite.
@@ -17,7 +17,7 @@ most-missed prerequisite.
 | **Glassdoor** | Anonymous `/graph` API | Cloudflare warm-up + per-IP detail-page rate limit | node-tls-client + CloakBrowser 0.5.2 | ✅ warmed API + description enrichment | Ready with direct discovery and pooled detail IPs |
 | **Indeed** | Profile (optional, `INDEED_PROFILE_DIR`) | Cloudflare + 60-min cooldown | CloakBrowser | ✅ anon page-1 + persistent-path wiring; ⚠️ full pagination needs a pre-existing profile | Ready anon; full needs a supplied profile + smoke |
 | **TechFetch** | Anonymous-first | None | CloakBrowser | ✅ 40 jobs/run; ⚠️ login fallback unverified | Ready anon; fallback needs smoke |
-| **LinkedIn** | Persistent-profile cookie (required) | Cloudflare/auth-wall | CloakBrowser for login/template capture | ⚠️ not run (no cookies present) | Code-ready; needs cookies + smoke |
+| **LinkedIn** | Persistent-profile cookie (required) | Cloudflare/auth-wall | CloakBrowser for login/template capture | ✅ 337 production roles, 5,560 posts, 0 failures | Ready after profile + template setup |
 
 LinkedIn now arms the registry's `strictEmpty`: permalinks arrive in the search
 payload, so a genuine empty result is distinguishable from a silent block.
@@ -27,11 +27,11 @@ payload, so a genuine empty result is distinguishable from a silent block.
 
 ## 2. Browser engine — CloakBrowser
 
-All browser-backed paths run on **CloakBrowser 0.5.2** (stealth Chromium) - one engine, fleet-wide. LinkedIn uses it for operator login and RSC template capture; its scrape requests are browserless. Glassdoor's API discovery additionally uses `node-tls-client`; its description enrichment uses CloakBrowser. TechFetch was migrated off playwright-extra so there's no longer a second active browser stack. Playwright's own Chromium is not used by any active scraper (the only remaining importer, `src/core/browser.js`, is dead code).
+All browser-backed paths run on **CloakBrowser 0.5.2** (stealth Chromium) - one engine, fleet-wide. LinkedIn uses it for operator login, RSC template capture, and cached profile-cookie reads; its scrape requests are browserless. Glassdoor's API discovery additionally uses `node-tls-client`; its description enrichment uses CloakBrowser. TechFetch was migrated off playwright-extra so there's no longer a second active browser stack. Playwright's own Chromium is not used by any active scraper (the only remaining importer, `src/core/browser.js`, is dead code).
 
 | Engine | Scrapers | How the binary is provisioned |
 |---|---|---|
-| **CloakBrowser 0.5.2** (stealth Chromium) | LinkedIn login/template capture, Monster, Dice, Indeed, Glassdoor detail enrichment, TechFetch | **Auto-downloaded (~350 MB) from GitHub on first `launch()`** → cached at `~/.cloakbrowser/`. NOT installed by `npm ci`, NOT by `playwright install`. |
+| **CloakBrowser 0.5.2** (stealth Chromium) | LinkedIn login/template capture/profile-cookie reads, Monster, Dice, Indeed, Glassdoor detail enrichment, TechFetch | **Auto-downloaded (~350 MB) from GitHub on first `launch()`** → cached at `~/.cloakbrowser/`. NOT installed by `npm ci`, NOT by `playwright install`. |
 
 > **CRITICAL:** On a fresh/firewalled host, `npm ci` succeeding is NOT enough for
 > browser-backed paths. The first browser launch triggers a ~350 MB download from
@@ -75,7 +75,7 @@ Git-ignored. Copy `config/credentials.example.json` and fill in:
 {
   "blacklight":         { "apiUrl": "...", "apiKey": "..." },  // REQUIRED: job queue + telemetry
   "scraperCredentials": { "apiUrl": "...", "apiKey": "..." },  // optional: remote credential API
-  "linkedin":           { /* session cookies */ },             // for LinkedIn
+  "linkedin":           { /* local lease marker; auth lives in the profile */ }, // for LinkedIn
   "indeed":             { "credentials": [] },                  // for Indeed full pagination
   "techfetch":          { "email": "...", "password": "..." }   // only if TechFetch paywalls
 }
@@ -91,7 +91,7 @@ Git-ignored. Copy `config/credentials.example.json` and fill in:
 |---|---|---|
 | Dice / Monster / Glassdoor / TechFetch | nothing | Full function (TechFetch credential only used if search bounces to login) |
 | Indeed | Pre-existing profile at `INDEED_PROFILE_DIR` (login helper removed) | Page-1 only (~16 jobs) without a profile; full ~200 with one. No profile + no `INDEED_ALLOW_ANONYMOUS=1` → `AuthError`. |
-| LinkedIn | `npm run linkedin:login` once (persistent profile, headed) | Cannot scrape — throws `AuthError`. Session persists in-profile + rotates; re-login when it expires. |
+| LinkedIn | `npm run linkedin:login` once, then `npm run linkedin:rsc-template` (persistent profile, headed setup) | Cannot scrape - throws `AuthError`. Session persists in-profile; re-login when it expires. |
 
 ---
 
@@ -105,7 +105,6 @@ Git-ignored. Copy `config/credentials.example.json` and fill in:
 ~/.blacklight-techfetch-cooldown    TechFetch stub-page/block cooldown marker
 ~/.blacklight-linkedin-profile/     persistent LinkedIn browser profile (npm run linkedin:login)
 ~/.blacklight-indeed-profile/       persistent Indeed browser profile   (bring-your-own; login helper removed)
-~/.blacklight-scraper-backups/      LinkedIn cookie backups (0600)
 ```
 
 Ephemeral container → volume-mount these. Otherwise: re-download the 350 MB browser, re-trigger anti-bot blocks, and re-auth LinkedIn on every cold start.
@@ -135,7 +134,9 @@ CloakBrowser launch seats and licence-key configuration are maintained in the
          npm run linkedin:login
        (Indeed has no login helper — it runs anonymously at page-1 with
         INDEED_ALLOW_ANONYMOUS=1, or supply a pre-existing profile at INDEED_PROFILE_DIR)
-[ ] 8. verify end-to-end via the live queue (the per-platform smoke harness has
+[ ] 8. capture the LinkedIn RSC request template on that host:
+         npm run linkedin:rsc-template
+[ ] 9. verify end-to-end via the live queue (the per-platform smoke harness has
        been removed — verification is now the real queue flow):
          node server.js  → watch the log for a claim, then confirm in
          central.qpeakhire.com → Scraper → Active Sessions: a `running` row for

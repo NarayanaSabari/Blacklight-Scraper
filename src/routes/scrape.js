@@ -27,7 +27,7 @@ function resolvePlatforms(requested) {
 // payload). Gated behind SCRAPE_SAVE_RESULTS (see src/config/env.js), off by
 // default: this route runs unattended on a long-lived operator host, and an
 // unbounded results/ directory can fill the disk (SCR-28), which breaks the
-// persistent Chrome profile flush in LinkedInSession#teardown().
+// persistent LinkedIn profile flush on shutdown.
 function savePlatformResults(fsImpl, resultsDir, platformName, payload, jobTitle, location, timestamp) {
     try { fsImpl.mkdirSync(resultsDir, { recursive: true }); } catch { /* ignore */ }
 

@@ -295,9 +295,9 @@ export class QueueOrchestrator {
 
         // Run platforms IN PARALLEL within an assignment. Most scrapers are
         // self-contained (own browser context + credential lease per scrape).
-        // EXCEPTION: LinkedIn now shares ONE long-lived browser context +
-        // credential lease across roles (the LinkedInSession singleton, which
-        // is single-flight so concurrent borrowers don't double-lease/launch).
+        // EXCEPTION: LinkedIn shares a cached cookie jar and credential lease
+        // across roles (the LinkedInRscSession singleton, which is single-flight
+        // so concurrent borrowers don't double-read the profile).
         // Concurrency stays safe either way. Failures are isolated via
         // Promise.allSettled + per-task try/catch.
         //

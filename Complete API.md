@@ -638,14 +638,16 @@ def scrape_platform(platform_name: str, role: str, location: str, credential: di
         platform_name: Name of the platform (linkedin, indeed, etc.)
         role: Job role to search for
         location: Location to search in
-        credential: Optional dict with login credentials
-                   - LinkedIn/Techfetch: {"email": "...", "password": "..."}
+        credential: Optional dict with platform credential data
+                   - LinkedIn: credential lease for the host's persistent profile
+                   - Techfetch: {"email": "...", "password": "..."}
                    - Glassdoor: {"credentials": {"cookie": "...", "csrf_token": "..."}}
     """
     jobs = []
     
     if platform_name == "linkedin" and credential:
-        # Use credential["email"] and credential["password"] to login
+        # Read cookies from the already-authenticated persistent profile.
+        # The scraper does not perform a password login here.
         pass
     elif platform_name == "glassdoor" and credential:
         # Use credential["credentials"]["cookie"] for authenticated requests
@@ -679,7 +681,8 @@ Some platforms (LinkedIn, Glassdoor, Techfetch) require authentication credentia
 
 ### Get Credentials for a Platform
 
-Fetch the next available credential before scraping a platform that requires login.
+Fetch the next available credential before scraping a platform that requires an
+account or credential lease.
 
 ```
 GET /api/scraper-credentials/queue/{platform}/next
@@ -698,9 +701,14 @@ curl -X GET "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cred
   "platform": "linkedin",
   "name": "Account 1",
   "email": "user@example.com",
-  "password": "secret123"
+  "password": "secret123",
+  "profile_key": "li-acct-1"
 }
 ```
+
+For LinkedIn, `profile_key` selects the host's persistent profile. The
+scraper reads that profile's cookies for RSC requests and does not use the
+returned password to perform a login.
 
 #### Response - Glassdoor (200 OK)
 ```json
@@ -792,7 +800,7 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
 |--------|-------------|
 | `available` | Credential is ready to be used |
 | `in_use` | Credential is currently assigned to a scraper |
-| `failed` | Credential has failed (e.g., invalid password, account locked) |
+| `failed` | Credential has failed (e.g., an invalid account session or locked account) |
 | `disabled` | Credential is manually disabled by admin |
 | `cooldown` | Credential is temporarily unavailable (rate limited) |
 
@@ -802,7 +810,7 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
 
 | Platform | Auth Type | Fields Returned |
 |----------|-----------|-----------------|
-| `linkedin` | Email/Password | `email`, `password` |
+| `linkedin` | Persistent profile + credential lease | `email`, `password`, and `profile_key`; the host profile is configured by `npm run linkedin:login` |
 | `glassdoor` | Cookies/JSON | `credentials` (object with cookies, tokens) |
 | `techfetch` | Email/Password | `email`, `password` |
 | `indeed` | None | No credentials needed |

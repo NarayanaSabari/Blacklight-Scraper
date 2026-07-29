@@ -1,8 +1,6 @@
 // Pure helpers for LinkedIn persistent-profile paths and CloakBrowser
-// fingerprint pinning. Extracted from scrapers/linkedin.js so callers that need
-// only these (the RSC transport, boot-info, the login/reset scripts) do not pull
-// in the browser packages. scrapers/linkedin.js re-exports them, so existing
-// import sites are unchanged.
+// fingerprint pinning. Kept independent of the RSC transport so callers that
+// need only these helpers do not pull in the browser packages.
 
 import os from 'os';
 import path from 'path';

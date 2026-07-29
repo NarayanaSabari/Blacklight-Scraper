@@ -10,7 +10,7 @@ function defaultReadPkg(cwd = process.cwd()) {
     return JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf-8'));
 }
 
-// NB: this module deliberately does NOT import from scrapers/linkedin.js.
+// NB: this module deliberately does NOT import from the LinkedIn transport.
 // Callers (server.js) inject `profileDir: () => linkedInProfileDir()`.
 // The default is a sentinel so unit tests don't need a real profile path.
 

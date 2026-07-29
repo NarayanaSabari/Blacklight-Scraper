@@ -25,9 +25,8 @@ const DEFAULTS = Object.freeze({
     // Manual POST /scrape used to always write one JSON file per platform to
     // results/, with no retention (SCR-28). The scraper runs as a long-lived
     // process on an operator-managed host, so that grows unbounded — and a
-    // full disk breaks the persistent Chrome profile flush in
-    // LinkedInSession#teardown(), which is how the logged-in LinkedIn session
-    // survives restarts. The HTTP response already returns the full result,
+    // full disk breaks the persistent LinkedIn profile flush, which is how the
+    // logged-in LinkedIn session survives restarts. The HTTP response already returns the full result,
     // so the file is a debugging affordance now, off by default. Set
     // SCRAPE_SAVE_RESULTS=true to restore the old always-write behavior.
     SCRAPE_SAVE_RESULTS: false,

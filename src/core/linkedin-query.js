@@ -1,7 +1,6 @@
 // Pure helpers for building and choosing LinkedIn content-search queries.
-// Extracted from scrapers/linkedin.js so both the DOM and RSC transports share
-// one implementation and neither pulls in browser packages to get it.
-// scrapers/linkedin.js re-exports them, so existing import sites are unchanged.
+// Kept independent of the transport so pure query logic does not pull in
+// browser packages.
 
 // Anti-bot: choose exactly ONE query variant per browser session.
 // Uniformly random so repeated orchestrator cycles cover all variants
@@ -14,19 +13,19 @@ export function pickSessionQuery(queries, rng = Math.random) {
 
 /**
  * Build a LinkedIn boolean search query.
- * 
+ *
  * LinkedIn content search supports: "exact phrase", AND, OR, NOT, parentheses.
- * 
+ *
  * Examples:
  *   jobTitle="DevOps Engineer"
  *   => "DevOps Engineer" AND (c2c OR W2 OR 1099)
- * 
+ *
  *   jobTitle="Product Owner"
  *   => "Product Owner" AND (c2c OR W2 OR 1099)
- * 
+ *
  *   jobTitle="SRE"
  *   => "SRE" AND (c2c OR W2 OR 1099)
- * 
+ *
  * @param {string} jobTitle - The job title/role to search for
  * @returns {string} LinkedIn boolean search query string
  */

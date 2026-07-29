@@ -15,7 +15,7 @@ The six platforms split across two hosts based on what they tolerate:
 | Host | Platforms | Why |
 |---|---|---|
 | **Hetzner VM** (Linux, with an ISP/residential proxy pool) | `monster, dice, techfetch` | Monster needs the pool for DataDome; Dice and TechFetch can run headless |
-| **Windows machine** (residential IP) | `linkedin, glassdoor, indeed` | LinkedIn needs a headed Chrome; Glassdoor discovery stays direct while its detail enrichment can use the proxy pool; Indeed needs a clean residential IP |
+| **Windows machine** (residential IP) | `linkedin, glassdoor, indeed` | LinkedIn needs a headed CloakBrowser only for login/template setup; its RSC requests are browserless. Glassdoor discovery stays direct while its detail enrichment can use the proxy pool; Indeed needs a clean residential IP |
 
 Both hosts run the **same code**. Each gets its own scraper API key with
 a `platform_allowlist` set in the central dashboard (Dashboard → API
@@ -35,7 +35,7 @@ on the key's allowlist. Adding a new host = registering a new key.
   configured licence keys are saturated.
 - **Multi-platform** - Monster (CloakBrowser + appsapi JSON behind
   DataDome), Dice (CloakBrowser + Crawlee + Cheerio), TechFetch (CloakBrowser + login),
-  LinkedIn (CDP to a real Chrome with persistent profile), Glassdoor
+  LinkedIn (browserless RSC API with a persistent profile for auth), Glassdoor
   (`/graph` API plus CloakBrowser detail enrichment, with an opt-in browser
   fallback), Indeed (mobile API with an opt-in browser fallback)
 - **Express API** for manual scraping (`POST /scrape`)
@@ -48,7 +48,6 @@ on the key's allowlist. Adding a new host = registering a new key.
 
 - **Node.js** ≥ 20 LTS
 - **npm** ≥ 10
-- **Google Chrome** (only on hosts that scrape LinkedIn)
 - **CloakBrowser** - downloads its stealth Chromium on first launch
 
 ## 🔧 Installation (Linux dev / VM)
@@ -120,10 +119,11 @@ Then create `config/credentials.json`:
 
 `config/credentials.json` is **gitignored** — never commit it.
 
-Per-platform credentials (LinkedIn email/password, Indeed cookies,
-TechFetch login) live in the central dashboard
-(Dashboard → Credentials), not in this file. The scraper pulls them on
-demand via the `scraperCredentials` API config above.
+Per-platform credentials (LinkedIn account lease, Indeed cookies, TechFetch
+login) live in the central dashboard (Dashboard → Credentials), not in this
+file. The scraper pulls them on demand via the `scraperCredentials` API config
+above. LinkedIn's authenticated session itself lives in the host's persistent
+profile, configured with `npm run linkedin:login`.
 
 ## After updating
 
@@ -301,7 +301,8 @@ Job-Scraper/
 │   │   ├── proxy-pool.js     # Per-platform proxy leasing and cooldowns
 │   │   └── format.js         # Format for Blacklight API submission
 │   ├── scrapers/
-│   │   └── registry.js       # Platform → scraper mapping
+│   │   ├── registry.js       # Platform → scraper mapping
+│   │   └── linkedin-rsc/     # LinkedIn React Server Components transport
 │   ├── queue/
 │   │   ├── mutex.js          # Single-slot mutex
 │   │   └── orchestrator.js   # QueueOrchestrator (runOnce + auto checker)
@@ -317,7 +318,6 @@ Job-Scraper/
 │   ├── monster.js            # Monster Jobs (HTTP API)
 │   ├── dice.js               # Dice Jobs (CloakBrowser + Crawlee)
 │   ├── techfetch.js          # TechFetch (requires login)
-│   ├── linkedin.js           # LinkedIn (CDP to existing Chrome)
 │   ├── glassdoor.js          # Glassdoor browser fallback + detail extraction
 │   ├── glassdoor-api.js      # Glassdoor /graph discovery + detail enrichment
 │   └── indeed.js             # Indeed mobile API + browser fallback
@@ -341,9 +341,10 @@ LOG_LEVEL=info                  # debug | info | warn | error
 QUEUE_CHECK_INTERVAL_MS=30000   # Auto queue poll interval
 QUEUE_CHECK_STARTUP_DELAY_MS=5000
 
-# LinkedIn CDP
-CHROME_PATH=/usr/bin/google-chrome
-CDP_PORT=9222
+# LinkedIn RSC transport
+LINKEDIN_RSC_COUNT=10            # default 10, capped at 50 per request
+LINKEDIN_RSC_COOKIE_TTL_MIN=30
+LINKEDIN_RSC_TEMPLATE=            # optional captured-template path override
 
 # Proxies (host:port:user:pass per entry — creds NEVER committed)
 PROXY_LIST=                     # comma/newline separated; or use the git-ignored config/proxies.txt
@@ -375,11 +376,12 @@ performance knobs are maintained in the [scraper runbook](docs/scraper-runbook.m
 See the [CloakBrowser session-seat runbook](docs/scraper-runbook.md#cloakbrowser-session-seats)
 for key sizing, the git-ignored key-file alternative, and the no-key fallback.
 
-### LinkedIn — log in once to the persistent stealth profile
+### LinkedIn — log in once and capture the RSC template
 
 LinkedIn scraping uses a long-lived CloakBrowser stealth profile stored on
 disk. Log in by hand once; the session persists across scraper runs and
-rotates organically (no per-run cookie injection):
+rotates organically. The scraper reads cookies from this profile and sends
+browserless RSC requests; it does not inject cookies into a browser page.
 
 ```bash
 npm run linkedin:login
@@ -390,11 +392,19 @@ This:
   (`~/.blacklight-linkedin-profile`; override with `LINKEDIN_PROFILE_DIR`)
 - Navigates to `linkedin.com/login` — log in (and solve any challenge), then
   press Enter in the terminal to save + close
-- `npm start` then reuses this exact logged-in session (one warm browser for
-  the whole process, a fresh tab per role)
+- `npm start` then reuses this exact logged-in session for browserless requests.
 
 After logging in once, the session persists in the profile dir across
-restarts, so subsequent scraper runs remember your login.
+restarts, so subsequent scraper runs remember your login. Capture the request
+template once on the same host:
+
+```bash
+npm run linkedin:rsc-template
+```
+
+The template is written to the git-ignored `config/linkedin-rsc-template.json`.
+Re-run `npm run linkedin:login` when the profile expires, and re-capture the
+template when LinkedIn changes the request shape.
 
 ### Credentials
 
@@ -508,7 +518,7 @@ success/failure back so the backend can rotate / cool down bad creds.
 | Monster | None — HTTP API behind DataDome (uses a hardcoded reverse-engineered clientid) | n/a |
 | Dice | None — public scrape | n/a |
 | TechFetch | Email + password | Dashboard → Credentials → TechFetch |
-| LinkedIn | Email + password (one-time interactive login per host, then persistent profile) | Dashboard → Credentials → LinkedIn |
+| LinkedIn | Credential lease plus persistent profile (one-time interactive login per host) | Dashboard → Credentials → LinkedIn, then `npm run linkedin:login` and `npm run linkedin:rsc-template` |
 | Glassdoor | None for the primary `/graph` API; browser fallback is opt-in | n/a unless the fallback flow is enabled |
 | Indeed | JSON cookie array (export from a cleared browser) | Dashboard → Credentials → Indeed |
 

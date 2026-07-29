@@ -19,14 +19,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { defaultAsk } from '../src/setup/io.js';
 
-// Mirror of scrapers/linkedin.js::linkedInProfileDir — kept trivial and local
+// Mirror of src/core/linkedin-profile.js::linkedInProfileDir — kept trivial and local
 // so this maintenance tool has no heavy imports. The base-dir convention is
-// stable; if it ever changes in linkedin.js, change it here too.
+// stable; if it ever changes in linkedin-profile.js, change it here too.
 export function profileBaseDir(env = process.env, homedir = os.homedir()) {
     return env.LINKEDIN_PROFILE_DIR || path.join(homedir, '.blacklight-linkedin-profile');
 }
 
-// Same key-sanitization linkedin.js::profileDirFor applies when it CREATES a
+// Same key-sanitization linkedin-profile.js::profileDirFor applies when it CREATES a
 // per-account dir, so a key the operator types matches the on-disk suffix.
 function sanitizeKey(key) {
     return String(key).replace(/[^A-Za-z0-9._-]/g, '_').replace(/\.\./g, '__');

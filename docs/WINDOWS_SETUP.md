@@ -13,7 +13,7 @@ LinkedIn, Glassdoor, and Indeed are different:
 
 | Platform | Why VM doesn't work |
 |---|---|
-| **LinkedIn** | Requires a real Chrome with a logged-in session (CDP-based scraper). VM is headless and can't host an interactive login. |
+| **LinkedIn** | Needs a headed CloakBrowser only for one-time login and RSC-template capture. The scrape itself is browserless. |
 | **Glassdoor** | `/graph` discovery needs a direct residential session; job descriptions are enriched through a separate pooled CloakBrowser path. The browser fallback is opt-in. |
 | **Indeed** | Cloudflare bot management blocks the VM IP at the edge (`HTTP 403`, `cf-mitigated: challenge`). Cookies don't help — IP reputation is the gate. |
 
@@ -29,7 +29,6 @@ Install these on the Windows host once:
 |---|---|---|
 | **Node.js** ≥ 20 LTS | Runtime | https://nodejs.org/ — pick "LTS" |
 | **Git for Windows** | Clone + pull | https://git-scm.com/download/win |
-| **Google Chrome** | LinkedIn CDP target | https://www.google.com/chrome/ |
 | **Microsoft Build Tools** | Native Node.js dependencies | Comes with Node.js installer if you tick *"Tools for Native Modules"* during install |
 
 Verify after install (open **PowerShell**):
@@ -106,8 +105,8 @@ from step 2):
 ```
 
 Both blocks are needed — `blacklight` controls queue + telemetry, and
-`scraperCredentials` controls the per-platform credential fetch (LinkedIn
-email/password and Indeed cookies).
+`scraperCredentials` controls the per-platform credential lease (LinkedIn)
+and cookie fetch (Indeed).
 
 `config\credentials.json` is **gitignored**. Don't commit it.
 
@@ -124,9 +123,9 @@ once via central.qpeakhire.com:
 ### LinkedIn
 - **Dashboard → Credentials → LinkedIn → + Add Credential**
 - Name: any label (e.g. `linkedin-windows-1`)
-- Email + password of the LinkedIn account to scrape from
-- The first scrape after this key starts running will trigger an
-  interactive login (see step 5 below)
+- Add the LinkedIn account credential used for the per-role lease.
+- Run the local interactive login in step 5 before starting the scraper; the
+  scraper does not log in with the stored password.
 
 ### Glassdoor
 No credential is required for the primary `/graph` API path.
@@ -165,7 +164,14 @@ In that browser window:
 
 After this, the session persists in the profile dir, so the scraper
 reuses your logged-in session without further logins until LinkedIn
-invalidates it. Re-run `npm run linkedin:login` whenever the session dies.
+invalidates it. Re-run `npm run linkedin:login` whenever the session dies,
+then capture the request template on this host:
+
+```powershell
+npm run linkedin:rsc-template
+```
+
+This writes the git-ignored `config\linkedin-rsc-template.json`.
 
 To start a profile over from scratch (wrong/old account keeps opening, or you're
 switching the account behind a profile key), run `npm run linkedin:reset` — it
@@ -194,9 +200,9 @@ That last line is the success signal — the backend handed your host a
 role with the three platforms in its allowlist. From there:
 
 - LinkedIn, Glassdoor, and Indeed start **in parallel** within each session;
-  CloakBrowser seat limits may queue browser launches
-- Wall-clock = max(LinkedIn ~6 min, Glassdoor ~10–18s for enrichment, Indeed ~85s) ≈ 6 min
-- The slowest scraper is LinkedIn (`maxPosts: 100` with 2s scroll delay)
+  CloakBrowser seat limits may queue browser launches, including LinkedIn's
+  periodic profile-cookie reads
+- LinkedIn uses browserless RSC requests after its profile and template are set up
 
 Confirm in central.qpeakhire.com → **Scraper → Active Sessions** that
 your Windows host appears with `running` status.
@@ -277,12 +283,10 @@ dashboard).
 
 ## Troubleshooting
 
-**`Chrome failed to start within 10 seconds`** (LinkedIn)
-- Chrome is installed at a non-default path. Set `CHROME_PATH`:
-  ```powershell
-  $env:CHROME_PATH = "C:\Users\you\AppData\Local\Google\Chrome\Application\chrome.exe"
-  ```
-- Or kill any running Chrome (must be fully closed for `--remote-debugging-port` to bind)
+**CloakBrowser fails to launch** (LinkedIn setup)
+- Re-run the CloakBrowser pre-warm command from the installation section.
+- Confirm the host has a display for `npm run linkedin:login` and
+  `npm run linkedin:rsc-template`.
 
 **`Loaded 0 cookies`** (Indeed)
 - The credential's `credential_type` in the DB isn't `json_blob`. Open
@@ -322,7 +326,7 @@ dashboard).
 - If that fails: check Windows Firewall, corporate VPN, or DNS
 
 **Memory pressure / Chromium crash**
-- LinkedIn (Chrome) + Glassdoor (Chromium) + Indeed (Chromium) running
+- LinkedIn setup plus Glassdoor (Chromium) + Indeed (Chromium) running
   in parallel takes ~1 GB peak. On a 4 GB Windows host you may hit
   swap. Either close other apps or set `MaxOldSpaceSize` lower per
   scraper:
@@ -350,7 +354,7 @@ dashboard).
 | Host | Allowlist | Why |
 |---|---|---|
 | Hetzner VM (Linux, with ISP/residential proxy pool) | `monster, dice, techfetch` | Monster needs the pool for DataDome; no display required |
-| **Windows machine (residential)** | `linkedin, glassdoor, indeed` | Headed Chrome for LinkedIn plus a clean residential IP; Glassdoor discovery remains direct |
+| **Windows machine (residential)** | `linkedin, glassdoor, indeed` | Headed CloakBrowser setup for LinkedIn plus a clean residential IP; Glassdoor discovery remains direct |
 
 Both hosts share the same code, the same backend, the same queue. The
 only thing that differs is the API key and its allowlist — the backend

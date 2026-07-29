@@ -7,7 +7,7 @@ run. Last updated 2026-07-29.
 | Platform | Method | Needs |
 |---|---|---|
 | **Dice** | Browser, **direct** (works on any IP) | nothing |
-| **LinkedIn** | Browser on a **logged-in persistent profile** | valid cookies in `config/credentials.json` |
+| **LinkedIn** | Browserless RSC API using cookies from a **logged-in persistent profile** | valid profile cookies plus a captured RSC request template |
 | **Indeed** | **Mobile GraphQL API** (`apis.indeed.com`) — no Cloudflare wall | proxy (recommended) |
 | **Glassdoor** | **`/graph` API** via TLS-impersonation plus CloakBrowser job-page enrichment | direct discovery; pooled detail IPs recommended |
 | **Monster** | Browser (DOM warmup → DataDome mints cookie) → **parse appsapi JSON** → retry across IPs | **clean/fresh residential IPs** |
@@ -50,10 +50,12 @@ wait was removed.
 The 500 ms wait now applies only as retry backoff (`TECHFETCH_RETRY_BACKOFF_MS`).
 `TECHFETCH_DETAIL_CONCURRENCY` defaults to `8` and is tunable.
 
-### LinkedIn — logged-in profile
-Drives a **persistent** CloakBrowser profile that's already logged in.
-- `config/credentials.json` holds the real LinkedIn cookies — **git-ignored, never commit**. Cookies expire; re-auth when LinkedIn scrapes start failing.
-- `LINKEDIN_PROFILE_DIR` — persistent profile path. `LINKEDIN_HEADLESS` — headless toggle.
+### LinkedIn — browserless RSC transport
+Uses plain HTTP requests to LinkedIn's content-search RSC endpoint.
+- `npm run linkedin:login` creates or refreshes the persistent CloakBrowser profile; the scraper reads its cookies without navigating to LinkedIn.
+- `npm run linkedin:rsc-template` captures the request shape into the git-ignored `config/linkedin-rsc-template.json`.
+- `LINKEDIN_PROFILE_DIR` - persistent profile path. `LINKEDIN_RSC_TEMPLATE` - captured template path override.
+- `LINKEDIN_RSC_COUNT` defaults to 10 and is capped at 50 per request. `LINKEDIN_RSC_COOKIE_TTL_MIN` defaults to 30.
 - Backend concurrency cap = 2 (set server-side).
 
 ### Indeed — mobile API (primary), browser (opt-in fallback)
@@ -148,10 +150,10 @@ with a one-session limit, so extra concurrency means extra keys (or a paid plan)
 
 ## Deploy checklist
 1. `git pull` (Windows: restart after pull).
-2. Put `config/proxies.txt` (fresh, clean residential IPs) and `config/credentials.json` (LinkedIn cookies) on the box — both git-ignored.
+2. Put `config/proxies.txt` (fresh, clean residential IPs) and the git-ignored `config/credentials.json` on the box.
 3. Pre-warm hidden deps: launch once so CloakBrowser (~350 MB) and the node-tls-client Go lib download.
 4. Set `PROXY_EXCLUDE_PLATFORMS=glassdoor` when a populated pool is available and Glassdoor discovery must stay direct.
-5. Indeed/Glassdoor/Dice/LinkedIn work immediately. Monster works as long as the pool has clean IPs.
+5. Run `npm run linkedin:login` and `npm run linkedin:rsc-template` before using LinkedIn. Indeed/Glassdoor/Dice then work immediately. Monster works as long as the pool has clean IPs.
 6. Verify: hit `/healthz` and run one scrape per platform.
 
 See also: `docs/antibot-bypass-plan.md` (the research + why each method was chosen).
