@@ -20,7 +20,7 @@ import { getConfig, reloadConfig } from './src/config/env.js';
 import { ensureApiKey } from './src/setup/ensure-api-key.js';
 import { createLogger, attachLokiSink, attachMetricsSink } from './src/logger/index.js';
 import { initializeCredentialsClient, getCredentialsClient } from './src/api/credentials.js';
-import { getLinkedInSession } from './src/scrapers/linkedin-session.js';
+import { getLinkedInRscSession } from './src/scrapers/linkedin-rsc/session.js';
 import { QueueOrchestrator } from './src/queue/orchestrator.js';
 import { getMetrics } from './src/metrics/registry.js';
 import { getPusher } from './src/metrics/push.js';
@@ -28,7 +28,7 @@ import { Heartbeat } from './src/metrics/heartbeat.js';
 import { initializeLokiTransport } from './src/logger/loki-transport.js';
 import { resolveBootInfo } from './src/config/boot-info.js';
 import { exitCodeFor, EXIT_REASONS } from './src/server/exit-codes.js';
-import { linkedInProfileDir } from './scrapers/linkedin.js';
+import { linkedInProfileDir } from './src/core/linkedin-profile.js';
 import { registerHealthRoute } from './src/routes/health.js';
 import { registerScrapeRoute } from './src/routes/scrape.js';
 import { registerScrapeQueueRoute } from './src/routes/scrape-queue.js';
@@ -118,7 +118,7 @@ async function main() {
     const app = express();
     app.use(express.json({ limit: '1mb' }));
 
-    registerHealthRoute(app, config.port, { bootInfo, getLinkedInSession });
+    registerHealthRoute(app, config.port, { bootInfo, getLinkedInSession: getLinkedInRscSession });
     registerMetricsRoute(app);
     registerScrapeRoute(app);
     registerScrapeQueueRoute(app, orchestrator);
@@ -169,7 +169,7 @@ async function main() {
         const steps = [
             ['pusher', telemetry.pusher.stop({ finalPush: true })],
             ['loki', telemetry.lokiTransport.stop({ finalFlush: true })],
-            ['linkedin-session', getLinkedInSession().shutdown()],
+            ['linkedin-session', getLinkedInRscSession().shutdown()],
             ['credentials', getCredentialsClient().releaseAll()],
         ];
         for (const [label, promise] of steps) {
