@@ -1,5 +1,12 @@
 // Translates a normalized job into the Blacklight API request body.
 // Moved out of common/utils.js so server.js has zero scraping concerns.
+//
+// MATCHED PAIR NOTICE: the field list emitted by formatJobForBlacklight()
+// below is mirrored by ScrapedJobPayload in
+// server/app/schemas/scraper_ingest_schema.py, which validates this exact
+// shape at the POST /api/scraper/queue/jobs ingest boundary. If you add,
+// rename, or remove a field here, update that schema too — see SCR-19 /
+// issue #402.
 
 import { hashString } from './html.js';
 
