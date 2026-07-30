@@ -125,7 +125,11 @@ No body - queue is empty, nothing to scrape.
 
 ### 2. Check Current Session (Optional)
 
-Check if the scraper has an active session. Useful for resuming after a restart.
+Check whether this scraper has a recent session eligible for orphan recovery after a restart.
+
+This endpoint is specifically for recovering a claim whose response may have been lost, rather than for listing every active session.
+It considers only `in_progress` sessions started within `SCRAPER_ORPHAN_RECOVERY_WINDOW_SECONDS` (5 minutes by default), returns the newest matching session, and returns at most one session.
+If the scraper has only older active sessions, this endpoint returns `has_active_session: false`; those sessions must not be resumed by this recovery path.
 
 ```
 GET /api/scraper/queue/current-session
@@ -137,7 +141,7 @@ curl -X GET "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper/queu
   -H "X-Scraper-API-Key: your-api-key"
 ```
 
-#### Has Active Session (200 OK)
+#### Has Resumable Session (200 OK)
 ```json
 {
   "has_active_session": true,
@@ -156,7 +160,7 @@ curl -X GET "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper/queu
 }
 ```
 
-#### No Active Session (200 OK)
+#### No Resumable Session (200 OK)
 ```json
 {
   "has_active_session": false,
@@ -882,6 +886,20 @@ credential and acquire another lease before continuing.
 
 ---
 
+### Stale Lease Recovery
+
+The backend reaper runs every 10 minutes and reclaims `in_use` credentials whose `assigned_at` has not been refreshed for 10 minutes.
+A reap clears the lease and increments the credential's consecutive-reap streak.
+
+Before the streak reaches `SCRAPER_REAP_ESCALATE_AFTER` (3 by default), the credential enters `cooldown` for `SCRAPER_REAP_COOLDOWN_SECONDS` (5 minutes by default).
+A successful lease report resets the streak.
+When the threshold is reached, a credential with `profile_key` moves to `needs_relogin`; other credentials move to `failed`.
+The cooldown cron runs every 5 minutes and returns expired cooldowns to `available` without operator action.
+
+The backend settings are configurable with `SCRAPER_ORPHAN_RECOVERY_WINDOW_SECONDS`, `SCRAPER_REAP_COOLDOWN_SECONDS`, and `SCRAPER_REAP_ESCALATE_AFTER`.
+
+---
+
 ### Release a Credential
 
 Release a lease without recording success or failure.
@@ -904,7 +922,7 @@ but at least one identifier is required; sending neither returns `400`.
 | `in_use` | Credential is currently assigned to a scraper |
 | `failed` | Credential has failed (e.g., an invalid account session or locked account) |
 | `disabled` | Credential is manually disabled by admin |
-| `cooldown` | Credential is temporarily unavailable (rate limited) |
+| `cooldown` | Credential is temporarily unavailable, such as after rate limiting or a stale-lease reap |
 | `needs_relogin` | Warm profile needs operator re-login |
 
 ---
