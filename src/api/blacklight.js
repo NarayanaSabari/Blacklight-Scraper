@@ -120,7 +120,9 @@ export class BlacklightApiClient {
         return this.#request('GET', '/api/scraper-credentials/queue/availability');
     }
 
-    async submitJobs(sessionId, platform, jobs, status = 'success', errorMessage = null) {
+    async submitJobs(
+        sessionId, platform, jobs, status = 'success', errorMessage = null, meta = {},
+    ) {
         const body = {
             session_id: sessionId,
             platform,
@@ -129,6 +131,13 @@ export class BlacklightApiClient {
         if (status === 'failed') {
             body.status = 'failed';
             body.error_message = errorMessage;
+        }
+        // SCR-20 (#403): only sent for a zero-job success, which is the only case
+        // it means anything. Omitted otherwise so the field's presence itself
+        // signals "this is the empty-result case", and so older backends that
+        // don't know the field are unaffected on the normal path.
+        if (status === 'success' && jobs.length === 0 && typeof meta.emptyConfirmed === 'boolean') {
+            body.empty_confirmed = meta.emptyConfirmed;
         }
         // SCR-15: submit is exempt from the circuit breaker entirely.
         // Jobs are already scraped by this point — blocking the call on an

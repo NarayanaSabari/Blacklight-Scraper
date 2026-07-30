@@ -329,24 +329,35 @@ export class QueueOrchestrator {
                 // Pass AI-generated LinkedIn search queries (if any)
                 // through to the scraper. Only LinkedIn looks at it
                 // today; others ignore the extra option.
-                const jobs = await scraper.execute(role.name, location, sessionId, {
-                    searchQueries: role.search_queries || null,
-                });
+                const { jobs, emptyConfirmed } = await scraper.executeWithMeta(
+                    role.name, location, sessionId, {
+                        searchQueries: role.search_queries || null,
+                    },
+                );
                 const formatted = jobs.map((job) => formatJobForBlacklight(job, platformName));
-                const submitResponse = await this.client.submitJobs(sessionId, platformName, formatted, 'success');
+                const submitResponse = await this.client.submitJobs(
+                    sessionId, platformName, formatted, 'success', null, { emptyConfirmed },
+                );
 
                 if (formatted.length === 0) {
-                    // O9 (spec): the wire status stays 'success' (changing it
-                    // needs backend coordination — deferred), but a 0-job
-                    // "success" is the silent-block signature. Emit a distinct
-                    // Loki-queryable signal so it is not buried among healthy
-                    // submissions. The metric dimension is already covered by
-                    // scraper_zero_result_sessions_total (Plan 1B, scraper layer).
-                    log.warn('Submitted 0 jobs as success — possible silent block / empty result', {
-                        platform: platformName,
-                        sessionId,
-                        scraper_alert: 'submitted_zero',
-                    });
+                    // SCR-20 (#403): the wire status stays 'success', but it now
+                    // carries `empty_confirmed` so the backend can tell a
+                    // positively-verified empty result from the silent-block
+                    // signature. That was the "needs backend coordination"
+                    // piece this comment used to defer.
+                    log.warn(
+                        emptyConfirmed
+                            ? 'Submitted 0 jobs — confirmed empty (no results for this query)'
+                            : 'Submitted 0 jobs as success — possible silent block',
+                        {
+                            platform: platformName,
+                            sessionId,
+                            emptyConfirmed,
+                            // Keep the alert tag ONLY for the suspicious case; a
+                            // confirmed empty is normal and must not page anyone.
+                            scraper_alert: emptyConfirmed ? undefined : 'submitted_zero',
+                        },
+                    );
                 } else {
                     log.info('Jobs submitted', {
                         platform: platformName,

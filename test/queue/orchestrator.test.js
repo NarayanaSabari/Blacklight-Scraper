@@ -72,7 +72,7 @@ function assignmentClient(extra = {}) {
 }
 
 const allThrowResolver = () => ({
-    execute: async () => { throw new Error('boom'); },
+    executeWithMeta: async () => { throw new Error('boom'); },
 });
 
 test('C3: when every platform fails, recordSessionAllFailed fires and completeSession is still called', async () => {
@@ -94,7 +94,9 @@ test('C3: when at least one platform succeeds, recordSessionAllFailed does NOT f
     const m = fakeMetrics();
     const c = assignmentClient();
     const mixedResolver = (name) => ({
-        execute: async () => (name === 'indeed' ? [{ id: 1 }] : (() => { throw new Error('boom'); })()),
+        executeWithMeta: async () => (name === 'indeed'
+            ? { jobs: [{ id: 1 }], emptyConfirmed: false }
+            : (() => { throw new Error('boom'); })()),
     });
     const o = new QueueOrchestrator({
         queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
@@ -136,7 +138,9 @@ test('B: a claim that times out recovers and RESUMES the orphaned active session
             };
         },
     });
-    const resolver = () => ({ execute: async () => [{ id: 1 }] });
+    const resolver = () => ({
+        executeWithMeta: async () => ({ jobs: [{ id: 1 }], emptyConfirmed: false }),
+    });
     const o = new QueueOrchestrator({
         queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
         client: c,
@@ -172,7 +176,11 @@ test('O9: a platform returning 0 jobs still submits success but is recorded dist
             };
         },
     });
-    const emptyResolver = () => ({ execute: async () => [] }); // 0 jobs, no throw
+    // 0 jobs, no throw. emptyConfirmed:false is the SUSPICIOUS case — a zero-job
+    // success the scraper could NOT verify as a genuine empty (SCR-20 / #403).
+    const emptyResolver = () => ({
+        executeWithMeta: async () => ({ jobs: [], emptyConfirmed: false }),
+    });
     const o = new QueueOrchestrator({
         queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
         client: c,

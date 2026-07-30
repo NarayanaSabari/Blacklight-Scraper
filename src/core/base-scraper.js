@@ -58,7 +58,30 @@ export class BaseScraper {
      *   boolean variants from the backend); other scrapers ignore.
      * @returns {Promise<Array<object>>}
      */
+    /**
+     * Scrape and return just the jobs array.
+     *
+     * Kept returning a bare array deliberately: the ad-hoc /scrape route and the
+     * existing tests depend on that shape. Callers that need the
+     * confirmed-empty signal use {@link executeWithMeta} instead.
+     *
+     * @returns {Promise<Array<object>>}
+     */
     async execute(jobTitle, location, sessionId = null, options = {}) {
+        const { jobs } = await this.executeWithMeta(jobTitle, location, sessionId, options);
+        return jobs;
+    }
+
+    /**
+     * Scrape and return the jobs plus whether an empty result was CONFIRMED.
+     *
+     * SCR-20 (#403): `emptyConfirmed` was computed here and then discarded, so a
+     * zero-job scrape reached the backend looking identical to a silent block.
+     * The orchestrator now forwards it on the wire.
+     *
+     * @returns {Promise<{jobs: Array<object>, emptyConfirmed: boolean}>}
+     */
+    async executeWithMeta(jobTitle, location, sessionId = null, options = {}) {
         const start = Date.now();
         const metrics = this._metrics ?? getMetrics();
         this.log.info('Starting scrape', { jobTitle, location, sessionId });
@@ -98,7 +121,10 @@ export class BaseScraper {
             metrics.recordJobsScraped(this.platform, jobCount);
             // This scrape's proxy IP worked — clear any cooldown on it.
             try { getProxyPool().reportOk(this.platform); } catch { /* never crash the path */ }
-            return jobs;
+            // `emptyConfirmed` is only meaningful when jobCount === 0. A non-empty
+            // result is reported false so the backend never has to reason about
+            // "confirmed empty but 12 jobs".
+            return { jobs, emptyConfirmed: jobCount === 0 && emptyConfirmed === true };
         } catch (error) {
             const durationMs = Date.now() - start;
             const reason = classifyError(error);
