@@ -179,14 +179,45 @@ than 22.19.0, install it now — the rest of this guide assumes it.
 
 ## 1. Clone and install
 
+There are two valid sources. Pick by whether the host needs to build or only
+run.
+
+### A deploy host — clone the mirror (simplest)
+
+```bash
+git clone https://github.com/NarayanaSabari/Blacklight-Scraper.git /path/to/scraper
+cd /path/to/scraper
+npm ci
+```
+
+`Blacklight-Scraper` is a **public, scraper-only mirror** of the monorepo's
+`scraper/` directory, re-published by CI within a minute or two of every `main`
+push that touches it (`.github/workflows/mirror-scraper.yml`). For a host that
+only ever pulls, this is the better source: it is public, so the host needs **no
+GitHub credentials at all**, and it carries only the scraper rather than the
+whole monorepo.
+
+The tradeoff is that CI **force-pushes** it, so its history is rewritten and
+`git pull` will eventually fail. Update a mirror clone with:
+
+```bash
+git fetch origin
+git reset --hard origin/main
+```
+
+Never commit here — the next mirror run overwrites it.
+
+### A development host — clone the monorepo
+
 ```bash
 git clone https://github.com/NarayanaSabari/Blacklight.git
 cd Blacklight/scraper
 npm ci
 ```
 
-The scraper lives in `scraper/` inside the monorepo. Do not clone the
-`Blacklight-Scraper` mirror — it is read-only and CI overwrites it.
+Use this if you intend to change the scraper. The monorepo is **private**, so
+this host needs GitHub credentials (a PAT via the credential helper, or an SSH
+key). Update it with `git pull origin main`.
 
 ## 2. Get an API key for this host
 
@@ -433,13 +464,24 @@ resumes unattended.
 
 ## 9. Updating
 
+Use the command that matches how this host was cloned (§1):
+
 ```bash
+# mirror clone (deploy host) — history is force-pushed, so pull will fail
+git fetch origin && git reset --hard origin/main
+
+# monorepo clone (development host)
 git pull origin main
-npm ci               # only if package.json changed
+```
+
+then:
+
+```bash
+npm ci               # only if package.json or the lockfile changed
 # then restart the service
 ```
 
-> **Node does not hot-reload. After `git pull` you MUST restart.**
+> **Node does not hot-reload. After updating you MUST restart.**
 >
 > Skipping it is silent: the running process keeps executing the old code while
 > `git log` shows the new commit. Confirm what is actually live by comparing
