@@ -1,14 +1,14 @@
 # Backend Spec — Credential Cookie-Jar Refresh (write-back)
 
 > **Audience:** Blacklight backend engineer.
-> **Status:** rough spec / proposal for review — 2026-05-19. Backend paths are `server/`-relative and follow the conventions in [`SCRAPER_BACKEND_API.md`](./SCRAPER_BACKEND_API.md) and [`SCRAPER_AUTH_AND_ROLES.md`](./SCRAPER_AUTH_AND_ROLES.md).
-> **One-line ask:** add a way for a scraper that holds a credential lease to **push the rotated cookie jar back**, so the next lease hands out a *fresh* jar instead of the frozen seed.
+> **Status:** implemented endpoint reference. Backend paths are `server/`-relative and follow the conventions in [`SCRAPER_BACKEND_API.md`](./SCRAPER_BACKEND_API.md) and [`SCRAPER_AUTH_AND_ROLES.md`](./SCRAPER_AUTH_AND_ROLES.md).
+> **One-line contract:** a compatible scraper holding a credential lease can **push the rotated cookie jar back**, so the next lease hands out a *fresh* jar instead of the frozen seed.
 
 ---
 
 ## 0. Why this is needed (empirically verified)
 
-The scraper currently **replays a frozen cookie export** every run and never persists what the site rotated. We proved on a real LinkedIn account that in a **single ~3-minute authenticated session** the jar diverges from the seed:
+Before the persistent-profile implementation, the scraper **replayed a frozen cookie export** every run and never persisted what the site rotated. We proved on a real LinkedIn account that in a **single ~3-minute authenticated session** the jar diverges from the seed:
 
 - `lidc` value **rotated** (routing/affinity cookie — rolls every session)
 - `bcookie` same value but expiry **renewed +185 days** (sliding expiration)
@@ -19,7 +19,8 @@ The scraper currently **replays a frozen cookie export** every run and never per
 
 A frozen seed therefore drifts within days into something a real returning browser never looks like (stale `lidc`, un-renewed `bcookie`, missing anti-abuse cookies) — **that drift is itself an expiry / bot-flag trigger**, independent of `li_at`'s nominal date. Write-back keeps the pooled credential coherent and current, continuously renews sliding cookies, and — critically — **captures the new `li_at` the moment the site rotates it, before the old one is invalidated**.
 
-The whole scraper↔backend credential contract today is **lease → success / failure / release**. There is **no path to persist a refreshed jar**. This spec fills exactly that gap. Everything scraper-side is ready; this backend endpoint is the only blocker.
+The scraper↔backend credential contract also includes heartbeat and lease-token ownership for long-lived leases.
+This spec owns only the separate cookie-refresh path; the current lease lifecycle is authoritative in [Complete API](../Complete%20API.md).
 
 ---
 
@@ -27,7 +28,8 @@ The whole scraper↔backend credential contract today is **lease → success / f
 
 **In scope:** persist a refreshed cookie jar for a *cookie-type* leased credential; hand out the latest jar on the next lease; ownership/concurrency/validation rules; observability.
 
-**Out of scope:** email/password credentials (no jar — refresh is N/A / never called); changing the lease, success/failure, cooldown, or availability semantics; the scraper-side capture logic (summarized in §7 for context only).
+**Out of scope:** email/password credentials (no jar — refresh is N/A / never called); defining the lease lifecycle, terminal/non-terminal success, heartbeat, or cooldown/availability semantics; the scraper-side capture logic (summarized in §7 for context only).
+The current lease-token ownership and heartbeat contract is authoritative in [Complete API](../Complete%20API.md).
 
 **Design principle:** additive and backward-compatible. A scraper that never calls the new endpoint behaves exactly as today (keeps using the seed, expires as today). No existing endpoint changes behavior.
 
@@ -35,15 +37,16 @@ The whole scraper↔backend credential contract today is **lease → success / f
 
 ## 2. The endpoint
 
-Recommended: a **dedicated, single-responsibility endpoint** (Option B). An alternative folded-into-`success` variant is in §6 — pick one; B is recommended.
+The implemented endpoint is a **dedicated, single-responsibility endpoint** (Option B). The folded-into-`success` variant in §6 is retained as a rejected alternative.
 
 ```
-POST /api/scraper-credentials/queue/<lease_id>/refresh
+POST /api/scraper-credentials/queue/<credential_id>/refresh
 X-Scraper-API-Key: <raw key>
 Content-Type: application/json
 ```
 
-- `<lease_id>` is the **same lease id** used for `…/success` / `…/failure` / `…/release` (scraper client: `lease.id`).
+- `<credential_id>` identifies the credential row being refreshed.
+- The refresh body still carries the acquiring `session_id`; the lease-token ownership contract for `…/success`, `…/failure`, `…/release`, and `…/heartbeat` is authoritative in [Complete API](../Complete%20API.md).
 - Same auth as every scraper endpoint: `require_scraper_auth` → `g.scraper_key` (see `SCRAPER_AUTH_AND_ROLES.md §1.3`). No new auth mechanism.
 
 ### 2.1 Request body
@@ -94,8 +97,8 @@ These are the backend-side guarantees that keep the pool from being poisoned. Im
 
 | # | Rule | On violation |
 |---|------|--------------|
-| 1 | **Lease ownership.** `<lease_id>` must be an **active** lease, owned by **this** `g.scraper_key`, for a cookie-type credential. | `403` if not owner; `404` if lease/credential unknown |
-| 2 | **Lease still valid.** Lease not expired, not already `released`/`success`/`failure`-finalized, and the underlying credential has not been re-leased/replaced since this lease was issued (optimistic concurrency — compare a credential `version`/`updated_at` captured at lease time). | `409 {"error":"lease superseded"}` — a slow scraper must never clobber a credential someone else has since refreshed |
+| 1 | **Lease ownership.** `<credential_id>` must identify an active cookie-type credential, and the request's `session_id` must match its current assignment. | `409` if the lease is superseded; `404` if the credential is unknown |
+| 2 | **Lease still valid.** The credential must still be `in_use` and assigned to the supplied session when the refresh is applied. | `409 {"error":"lease superseded"}` - a slow scraper must never clobber a credential someone else has since leased |
 | 3 | **Auth-cookie presence (anti-poison).** The jar **must contain the platform's required auth cookie** with a non-empty value. Per-platform map, backend-owned; e.g. `linkedin → li_at`. A jar missing it is a logged-out/auth-walled session — refuse it. | `400 {"error":"jar missing required auth cookie for <platform>"}` — **do not persist** |
 | 4 | **Well-formed.** `cookies` is a non-empty array; each entry has at least `name`,`value`,`domain`. | `400` |
 | 5 | **Size cap.** Body ≤ 64 KB. | `413` |
@@ -126,7 +129,7 @@ The key behavioral change: **`GET /api/scraper-credentials/queue/<platform>/next
 
 ## 5. Lifecycle & interaction with existing endpoints
 
-- **Independent of verdict.** Refresh does not finalize the lease. Normal scraper order: `refresh` (if authed & jar changed) → then `POST …/success`. The lease is still released by `success`/`failure`/`release` as today.
+- **Independent of verdict.** Refresh does not finalize the lease. Normal scraper order: `refresh` (if authed & jar changed) → then a terminal or non-terminal success report, as appropriate; see [Complete API](../Complete%20API.md) for the current lease lifecycle.
 - **Failure path.** If the session ended unauthenticated, the scraper reports `failure` and **does not** call refresh (and Rule 3 would reject it anyway). Existing `cooldown_minutes` benching is unchanged. A benched/cooled credential simply keeps whatever jar it last had.
 - **Re-lease.** Next `…/next` for that platform hands out the freshest jar. Pool-selection (if you pick “freshest” / least-recently-failed) can use `cookies_updated_at` / `auth_cookie_expires_at`.
 - **Concurrency.** Leasing is exclusive (one active lease per credential), so within a lease last-write-wins is correct; Rule 2 prevents a stale lease from overwriting a credential that has since moved on.
@@ -139,7 +142,7 @@ The key behavioral change: **`GET /api/scraper-credentials/queue/<platform>/next
 If you prefer one fewer round-trip, accept an optional field on the existing success call:
 
 ```
-POST /api/scraper-credentials/queue/<lease_id>/success
+POST /api/scraper-credentials/queue/<credential_id>/success
 { "message": "...", "refreshed_cookies": [ ... ] }   // optional; absent = behave exactly as today
 ```
 
@@ -147,15 +150,16 @@ Backend applies §3 validation to `refreshed_cookies`; if it fails validation, *
 
 ---
 
-## 7. Scraper-side companion (context only — not backend work)
+## 7. Scraper-side companion (context only - not backend work)
 
-So you know your caller. At session close the scraper will:
+For clients that use this endpoint, the caller should:
 
 1. Only if the session ended **authenticated** (page state = results/feed, not auth-wall/checkpoint) **and** the jar changed vs the leased one,
 2. capture the full `context.cookies()` (same array shape as §2.1),
-3. `POST …/<lease_id>/refresh` with it, **then** `POST …/success`.
+3. `POST …/<credential_id>/refresh` with it, **then** `POST …/success`.
 
-It will **never** send a jar from a logged-out/auth-walled session (Rule 3 is the backend backstop). It sends the complete jar, never a delta. This is gated behind the scraper being in REMOTE mode with a valid lease; nothing ships scraper-side until this endpoint exists.
+It will **never** send a jar from a logged-out/auth-walled session (Rule 3 is the backend backstop). It sends the complete jar, never a delta.
+The persistent LinkedIn path keeps its live jar in the on-disk profile and does not call this endpoint per role.
 
 ---
 
@@ -166,7 +170,7 @@ It will **never** send a jar from a logged-out/auth-walled session (Rule 3 is th
 | `200` | Jar stored (or idempotent no-op) | Proceed to `…/success` |
 | `400` | Malformed jar, or missing the platform’s required auth cookie | Log; do **not** retry; proceed to `…/success` without refresh (don’t fail the scrape over it) |
 | `401` | Missing/invalid/revoked key | Fatal — fix the key |
-| `403` | Caller is not the lease holder | Abandon refresh; continue |
+| `403` | Caller is not authenticated | Fix the scraper key |
 | `404` | Lease / credential not found | Abandon refresh; continue |
 | `409` | Lease expired or superseded since issue | Abandon refresh (a newer lease owns the credential); continue |
 | `413` | Jar too large | Log; skip refresh |
@@ -180,7 +184,7 @@ Refresh is **best-effort**: a failed refresh must never fail the scrape or the l
 ## 9. Acceptance criteria
 
 1. New cookie-type credential: first `…/next` returns the seed; after a `…/refresh`, the **next** `…/next` returns the **refreshed** jar byte-for-byte.
-2. `…/refresh` from a non-lease-holder key → `403`; unknown lease → `404`; finalized/superseded lease → `409`; jar without `li_at` (LinkedIn) → `400` and **stored jar unchanged**.
+2. `…/refresh` from a non-lease-holder session → `409`; unknown credential → `404`; superseded lease → `409`; jar without `li_at` (LinkedIn) → `400` and **stored jar unchanged**.
 3. Posting the identical jar twice → `200` both times, `rotation_count` increments only on actual change.
 4. Cookie values never appear in logs/audit/metrics; jar encrypted at rest if seeds are.
 5. Existing scrapers that never call `…/refresh` are byte-for-byte unaffected.

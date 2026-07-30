@@ -512,6 +512,8 @@ All per-platform credentials are managed through the central dashboard
 (Dashboard → Credentials). The scraper fetches them on demand via the
 `scraperCredentials` API config in `config/credentials.json` and reports
 success/failure back so the backend can rotate / cool down bad creds.
+Long-lived LinkedIn sessions heartbeat their lease and use the returned
+`lease_token` for ownership checks.
 
 | Platform | Credential type | Where to set it |
 |---|---|---|

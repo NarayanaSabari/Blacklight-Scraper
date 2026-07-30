@@ -85,7 +85,13 @@ export class CredentialsClient {
     #issueLease(platform, id, data, sessionId = null) {
         const nonce = this.nextNonce++;
         const leaseKey = `${platform}:${id}:${nonce}`;
-        const lease = { leaseKey, platform, id, data, sessionId };
+        // SCR-22: lease_token is the opaque per-lease identity the backend
+        // mints at assign_to_scraper() time — independent of sessionId, which
+        // a long-lived lease can outlive the scrape session that acquired it.
+        // `data` is the raw credential response body;
+        // local (credentials.json) leases have no lease_token.
+        const leaseToken = data?.lease_token ?? null;
+        const lease = { leaseKey, platform, id, data, sessionId, leaseToken, lost: false, released: false };
         this.leases.set(leaseKey, lease);
         this.latestByPlatform.set(platform, leaseKey);
         return lease;
@@ -113,6 +119,7 @@ export class CredentialsClient {
     }
 
     #forgetLease(lease) {
+        lease.released = true;
         this.leases.delete(lease.leaseKey);
         if (this.latestByPlatform.get(lease.platform) === lease.leaseKey) {
             this.latestByPlatform.delete(lease.platform);
@@ -195,15 +202,26 @@ export class CredentialsClient {
     }
 
     #wrapLease(lease) {
+        const noteLoss = (result) => {
+            if (['superseded', 'no_lease'].includes(result?.reason)) lease.lost = true;
+            return result;
+        };
         return {
             get leaseKey() { return lease.leaseKey; },
             get credential() { return lease.data; },
             get platform() { return lease.platform; },
             get sessionId() { return lease.sessionId; },
-            reportSuccess: (message) => this.reportSuccess(lease.leaseKey, message),
-            reportFailure: (msg, cooldownMinutes, opts) => this.reportFailure(lease.leaseKey, msg, cooldownMinutes, opts),
-            refreshCookies: (cookies) => this.refreshCookies(lease.leaseKey, cookies),
-            release: () => this.release(lease.leaseKey),
+            get leaseToken() { return lease.leaseToken; },
+            get lost() { return lease.lost; },
+            get released() { return lease.released; },
+            reportSuccess: async (message, options) => noteLoss(
+                await this.reportSuccess(lease.leaseKey, message, options)),
+            reportFailure: async (msg, cooldownMinutes, opts) => noteLoss(
+                await this.reportFailure(lease.leaseKey, msg, cooldownMinutes, opts)),
+            refreshCookies: async (cookies) => noteLoss(
+                await this.refreshCookies(lease.leaseKey, cookies)),
+            release: async () => noteLoss(await this.release(lease.leaseKey)),
+            heartbeat: async () => noteLoss(await this.heartbeat(lease.leaseKey)),
         };
     }
 
@@ -214,23 +232,34 @@ export class CredentialsClient {
         return lease ? lease.credential : null;
     }
 
-    async reportSuccess(leaseKeyOrPlatform, message = null) {
+    async reportSuccess(leaseKeyOrPlatform, message = null, { release = true } = {}) {
         const lease = this.#resolveLease(leaseKeyOrPlatform);
         if (!lease) {
             log.warn('No active credential to report success for', { key: leaseKeyOrPlatform });
-            return;
+            return { ok: false, reason: 'no_lease' };
         }
         if (this.isLocal || String(lease.id).startsWith('local-')) {
-            this.#forgetLease(lease);
+            if (release) this.#forgetLease(lease);
             return;
         }
         try {
-            await this.#postLeaseAction(lease, 'success', message ? { message } : {});
-            log.info('Credential released (success)', { platform: lease.platform });
+            await this.#postLeaseAction(lease, 'success', {
+                ...(message ? { message } : {}),
+                terminal: release,
+                lease_token: lease.leaseToken ?? null,
+                session_id: lease.sessionId ?? null,
+            });
+            log.info(release ? 'Credential released (success)' : 'Credential success recorded', {
+                platform: lease.platform,
+            });
+            return { ok: true };
         } catch (error) {
+            const lost = this.#markLeaseLost(lease, 'success', error);
+            if (lost) return lost;
             log.error('Failed to report credential success', { platform: lease.platform, err: error.message });
+            return { ok: false, reason: 'error', error };
         } finally {
-            this.#forgetLease(lease);
+            if (release) this.#forgetLease(lease);
         }
     }
 
@@ -238,7 +267,7 @@ export class CredentialsClient {
         const lease = this.#resolveLease(leaseKeyOrPlatform);
         if (!lease) {
             log.warn('No active credential to refresh cookies for', { key: leaseKeyOrPlatform });
-            return;
+            return { ok: false, reason: 'no_lease' };
         }
         const metrics = getMetrics();
         const isLocal = this.isLocal || String(lease.id).startsWith('local-');
@@ -253,6 +282,8 @@ export class CredentialsClient {
             metrics.recordCredentialRefresh(lease.platform, 'refreshed');
             log.info('Credential jar refreshed', { platform: lease.platform });
         } catch (error) {
+            const lost = this.#markLeaseLost(lease, 'refresh', error);
+            if (lost) return lost;
             metrics.recordCredentialRefresh(lease.platform, 'error');
             log.warn('Credential refresh failed (best-effort, ignored)', { platform: lease.platform, err: error.message });
         }
@@ -264,17 +295,25 @@ export class CredentialsClient {
         const lease = this.#resolveLease(leaseKeyOrPlatform);
         if (!lease) {
             log.warn('No active credential to report failure for', { key: leaseKeyOrPlatform });
-            return;
+            return { ok: false, reason: 'no_lease' };
         }
         if (this.isLocal || String(lease.id).startsWith('local-')) {
             this.#forgetLease(lease);
             return;
         }
         try {
-            await this.#postLeaseAction(lease, 'failure', planFailureBody({ errorMessage, cooldownMinutes, authDead }));
+            await this.#postLeaseAction(lease, 'failure', {
+                ...planFailureBody({ errorMessage, cooldownMinutes, authDead }),
+                lease_token: lease.leaseToken ?? null,
+                session_id: lease.sessionId ?? null,
+            });
             log.warn('Credential marked failed', { platform: lease.platform, cooldownMinutes, authDead });
+            return { ok: true };
         } catch (error) {
+            const lost = this.#markLeaseLost(lease, 'failure', error);
+            if (lost) return lost;
             log.error('Failed to report credential failure', { platform: lease.platform, err: error.message });
+            return { ok: false, reason: 'error', error };
         } finally {
             this.#forgetLease(lease);
         }
@@ -282,17 +321,71 @@ export class CredentialsClient {
 
     async release(leaseKeyOrPlatform) {
         const lease = this.#resolveLease(leaseKeyOrPlatform);
-        if (!lease) return;
+        if (!lease) return { ok: false, reason: 'no_lease' };
         if (this.isLocal || String(lease.id).startsWith('local-')) {
             this.#forgetLease(lease);
             return;
         }
         try {
-            await this.#postLeaseAction(lease, 'release');
+            await this.#postLeaseAction(lease, 'release', {
+                lease_token: lease.leaseToken ?? null,
+                session_id: lease.sessionId ?? null,
+            });
+            return { ok: true };
         } catch (error) {
+            const lost = this.#markLeaseLost(lease, 'release', error);
+            if (lost) return lost;
             log.error('Failed to release credential', { platform: lease.platform, err: error.message });
+            return { ok: false, reason: 'error', error };
         } finally {
             this.#forgetLease(lease);
+        }
+    }
+
+    #markLeaseLost(lease, action, error) {
+        if (!(error instanceof NetworkError) || error.statusCode !== 409) return null;
+        lease.lost = true;
+        this.#forgetLease(lease);
+        log.warn(`Credential lease superseded on ${action} — dropping local lease`, {
+            platform: lease.platform, credentialId: lease.id,
+        });
+        return { ok: false, reason: 'superseded' };
+    }
+
+    // Keep a long-lived lease alive (SCR-4/SCR-22). The LinkedIn RSC scraper
+    // can hold a credential across scrape sessions and must ping this more
+    // often than the backend's stale-assignment reaper (~10 min) or the pool
+    // releases it mid-use.
+    //
+    // Returns { ok: true } on success, or on failure:
+    //   { ok: false, reason: 'no_lease' }   — nothing to heartbeat
+    //   { ok: false, reason: 'superseded' } — 409: someone else now holds
+    //     this credential. The lease is forgotten locally so the caller
+    //     doesn't keep reporting success/failure against a dead reference;
+    //     it must re-`acquire()` rather than continue scraping with a
+    //     credential it no longer owns.
+    //   { ok: false, reason: 'error', error } — network/other failure,
+    //     best-effort — the lease is NOT dropped, the caller should just
+    //     retry on the next tick.
+    async heartbeat(leaseKeyOrPlatform) {
+        const lease = this.#resolveLease(leaseKeyOrPlatform);
+        if (!lease) return { ok: false, reason: 'no_lease' };
+        if (this.isLocal || String(lease.id).startsWith('local-')) {
+            return { ok: true, local: true };
+        }
+        try {
+            await this.#postLeaseAction(lease, 'heartbeat', {
+                lease_token: lease.leaseToken ?? null,
+                session_id: lease.sessionId ?? null,
+            });
+            return { ok: true };
+        } catch (error) {
+            const lost = this.#markLeaseLost(lease, 'heartbeat', error);
+            if (lost) return lost;
+            log.warn('Heartbeat failed (best-effort, ignored)', {
+                platform: lease.platform, err: error.message,
+            });
+            return { ok: false, reason: 'error', error };
         }
     }
 

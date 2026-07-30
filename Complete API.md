@@ -40,13 +40,14 @@ X-Scraper-API-Key: your-api-key-here
 │  2. For each platform:                                                  │
 │     a. If platform requires credentials (linkedin, glassdoor, etc.):   │
 │        GET /api/scraper-credentials/queue/{platform}/next              │
-│        └── Returns: email, password (or cookies for glassdoor)         │
+│        └── Returns: credentials plus lease_token                       │
 │                                                                         │
 │     b. Scrape jobs using credentials (if applicable)                   │
 │                                                                         │
 │     c. Report credential result:                                        │
-│        - POST .../queue/{id}/success  (success - release credential)   │
+│        - POST .../queue/{id}/success  (terminal or role success)       │
 │        - POST .../queue/{id}/failure  (failed - mark as failed)        │
+│        - POST .../queue/{id}/heartbeat (long-lived lease)              │
 │                                                                         │
 │  3. POST /api/scraper/queue/jobs (once per platform)                   │
 │     └── Submit jobs for: linkedin, indeed, monster, etc.               │
@@ -457,17 +458,29 @@ def get_credential(platform: str, session_id: str) -> Optional[dict]:
     return response.json()
 
 
-def report_credential_success(credential_id: int):
+def report_credential_success(credential_id: int, lease_token: str, terminal: bool = True):
     """Report successful use of a credential."""
+    payload = {"lease_token": lease_token, "terminal": terminal}
     requests.post(
         f"{BASE_URL}/api/scraper-credentials/queue/{credential_id}/success",
-        headers=HEADERS
+        headers=HEADERS,
+        json=payload
     )
 
 
-def report_credential_failure(credential_id: int, error: str, cooldown_minutes: int = None):
+def report_credential_failure(
+    credential_id: int,
+    lease_token: str,
+    error: str,
+    cooldown_minutes: int = None,
+    auth_dead: bool = False,
+):
     """Report credential failure."""
-    payload = {"error_message": error}
+    payload = {
+        "error_message": error,
+        "lease_token": lease_token,
+        "auth_dead": auth_dead,
+    }
     if cooldown_minutes:
         payload["cooldown_minutes"] = cooldown_minutes
     
@@ -475,6 +488,15 @@ def report_credential_failure(credential_id: int, error: str, cooldown_minutes: 
         f"{BASE_URL}/api/scraper-credentials/queue/{credential_id}/failure",
         headers=HEADERS,
         json=payload
+    )
+
+
+def heartbeat_credential(credential_id: int, lease_token: str):
+    """Keep a long-lived credential lease alive."""
+    requests.post(
+        f"{BASE_URL}/api/scraper-credentials/queue/{credential_id}/heartbeat",
+        headers=HEADERS,
+        json={"lease_token": lease_token},
     )
 
 
@@ -514,6 +536,7 @@ def scrape_jobs(default_location="United States"):
             
             credential = None
             credential_id = None
+            lease_token = None
             
             try:
                 # Get credentials if needed
@@ -535,6 +558,7 @@ def scrape_jobs(default_location="United States"):
                         continue
                     
                     credential_id = credential["id"]
+                    lease_token = credential["lease_token"]
                     print(f"    Using credential: {credential.get('email') or credential.get('name')}")
                 
                 # Your scraping logic here
@@ -542,7 +566,7 @@ def scrape_jobs(default_location="United States"):
                 
                 # Report credential success if used
                 if credential_id:
-                    report_credential_success(credential_id)
+                    report_credential_success(credential_id, lease_token)
                 
                 # Submit jobs
                 response = requests.post(
@@ -561,7 +585,9 @@ def scrape_jobs(default_location="United States"):
             except RateLimitError as e:
                 # Rate limited - put credential on cooldown
                 if credential_id:
-                    report_credential_failure(credential_id, str(e), cooldown_minutes=60)
+                    report_credential_failure(
+                        credential_id, lease_token, str(e), cooldown_minutes=60
+                    )
                 
                 requests.post(
                     f"{BASE_URL}/api/scraper/queue/jobs",
@@ -579,7 +605,7 @@ def scrape_jobs(default_location="United States"):
             except LoginError as e:
                 # Login failed - mark credential as failed
                 if credential_id:
-                    report_credential_failure(credential_id, str(e))
+                    report_credential_failure(credential_id, lease_token, str(e))
                 
                 requests.post(
                     f"{BASE_URL}/api/scraper/queue/jobs",
@@ -599,7 +625,8 @@ def scrape_jobs(default_location="United States"):
                 if credential_id:
                     requests.post(
                         f"{BASE_URL}/api/scraper-credentials/queue/{credential_id}/release",
-                        headers=HEADERS
+                        headers=HEADERS,
+                        json={"lease_token": lease_token},
                     )
                 
                 requests.post(
@@ -639,7 +666,7 @@ def scrape_platform(platform_name: str, role: str, location: str, credential: di
         role: Job role to search for
         location: Location to search in
         credential: Optional dict with platform credential data
-                   - LinkedIn: credential lease for the host's persistent profile
+                   - LinkedIn: {"profile_key": "...", "lease_token": "...", "email": "...", "password": "..."}
                    - Techfetch: {"email": "...", "password": "..."}
                    - Glassdoor: {"credentials": {"cookie": "...", "csrf_token": "..."}}
     """
@@ -647,7 +674,8 @@ def scrape_platform(platform_name: str, role: str, location: str, credential: di
     
     if platform_name == "linkedin" and credential:
         # Read cookies from the already-authenticated persistent profile.
-        # The scraper does not perform a password login here.
+        # Reuse the persistent profile selected by credential["profile_key"];
+        # email/password remain available for the login fallback.
         pass
     elif platform_name == "glassdoor" and credential:
         # Use credential["credentials"]["cookie"] for authenticated requests
@@ -678,6 +706,8 @@ if __name__ == "__main__":
 ## Platform Credentials
 
 Some platforms (LinkedIn, Glassdoor, Techfetch) require authentication credentials to scrape. The API provides endpoints to fetch and manage credentials for these platforms.
+The response includes an opaque `lease_token` minted for that assignment.
+Send that token on every heartbeat and terminal or non-terminal lease action.
 
 ### Get Credentials for a Platform
 
@@ -700,9 +730,11 @@ curl -X GET "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cred
   "id": 1,
   "platform": "linkedin",
   "name": "Account 1",
+  "profile_key": "li-acct-1",
+  "proxy": null,
+  "lease_token": "<opaque-lease-token>",
   "email": "user@example.com",
-  "password": "secret123",
-  "profile_key": "li-acct-1"
+  "password": "secret123"
 }
 ```
 
@@ -716,6 +748,7 @@ returned password to perform a login.
   "id": 1,
   "platform": "glassdoor",
   "name": "Cookie Set 1",
+  "lease_token": "<opaque-lease-token>",
   "credentials": {
     "cookie": "session_id=abc123",
     "csrf_token": "xyz789"
@@ -724,13 +757,17 @@ returned password to perform a login.
 ```
 
 #### No Credentials Available (204 No Content)
-No body - all credentials are either in use, failed, or on cooldown.
+No body - all credentials are either in use, failed, on cooldown, or awaiting
+operator re-login.
 
 ---
 
 ### Report Credential Success
 
-After successfully using a credential, report success to release it back to the pool.
+After successfully using a credential, report success.
+By default this releases the credential back to the pool.
+For a long-lived lease, send `terminal: false` to record role success without
+releasing the credential.
 
 ```
 POST /api/scraper-credentials/queue/{credential_id}/success
@@ -741,8 +778,12 @@ POST /api/scraper-credentials/queue/{credential_id}/success
 curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-credentials/queue/1/success" \
   -H "X-Scraper-API-Key: your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"message": "Scraped 50 jobs successfully"}'
+  -d '{"message": "Scraped 50 jobs successfully", "lease_token": "<opaque-lease-token>"}'
 ```
+
+`lease_token` is preferred.
+The deprecated `session_id` fallback is accepted during rolling deployment,
+but at least one identifier is required; sending neither returns `400`.
 
 #### Response (200 OK)
 ```json
@@ -751,6 +792,10 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
   "status": "available"
 }
 ```
+
+Use `"terminal": false` for a non-terminal role report.
+The response then has `"message": "Credential success recorded"` and
+`"status": "in_use"`.
 
 ---
 
@@ -768,9 +813,14 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
   -H "X-Scraper-API-Key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "error_message": "Login failed: Invalid credentials"
+    "error_message": "Login failed: Invalid credentials",
+    "lease_token": "<opaque-lease-token>"
   }'
 ```
+
+`lease_token` is preferred.
+The deprecated `session_id` fallback is accepted for older scraper builds,
+but at least one identifier is required; sending neither returns `400`.
 
 #### Request with Cooldown (Rate Limited)
 ```bash
@@ -779,7 +829,8 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
   -H "Content-Type: application/json" \
   -d '{
     "error_message": "Rate limited by LinkedIn",
-    "cooldown_minutes": 60
+    "cooldown_minutes": 60,
+    "lease_token": "<opaque-lease-token>"
   }'
 ```
 
@@ -792,6 +843,57 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
 }
 ```
 
+Set `"auth_dead": true` when the account needs operator re-login.
+That response uses status `needs_relogin` and removes the credential from the
+claimable pool.
+
+If a supplied `lease_token` or legacy `session_id` no longer owns the
+credential, the endpoint returns `409 Conflict` and leaves the current lease
+untouched.
+
+---
+
+### Heartbeat a Long-Lived Lease
+
+Any long-running scraper operation must heartbeat its credential more often
+than the 10-minute stale-assignment timeout.
+The heartbeat refreshes `assigned_at`; it does not release the lease.
+The LinkedIn RSC scraper runs this ticker for the duration of `withCookies()`;
+its HTTP scrape does not keep a browser session open.
+
+```
+POST /api/scraper-credentials/queue/{credential_id}/heartbeat
+```
+
+#### Request
+
+```bash
+curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-credentials/queue/1/heartbeat" \
+  -H "X-Scraper-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"lease_token": "<opaque-lease-token>"}'
+```
+
+`lease_token` is preferred.
+The legacy `session_id` may be supplied instead during rolling deployment,
+but at least one identifier is required for heartbeat.
+An ownership failure returns `409 Conflict`; the scraper must stop using that
+credential and acquire another lease before continuing.
+
+---
+
+### Release a Credential
+
+Release a lease without recording success or failure.
+
+```
+POST /api/scraper-credentials/queue/{credential_id}/release
+```
+
+Send `lease_token` in the JSON body.
+The legacy `session_id` fallback remains accepted for old scraper hosts,
+but at least one identifier is required; sending neither returns `400`.
+
 ---
 
 ### Credential Statuses
@@ -803,6 +905,7 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
 | `failed` | Credential has failed (e.g., an invalid account session or locked account) |
 | `disabled` | Credential is manually disabled by admin |
 | `cooldown` | Credential is temporarily unavailable (rate limited) |
+| `needs_relogin` | Warm profile needs operator re-login |
 
 ---
 
@@ -810,7 +913,7 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
 
 | Platform | Auth Type | Fields Returned |
 |----------|-----------|-----------------|
-| `linkedin` | Persistent profile + credential lease | `email`, `password`, and `profile_key`; the host profile is configured by `npm run linkedin:login` |
+| `linkedin` | Persistent/warm profile or email/password + credential lease | `profile_key`, `lease_token`, `email`, `password` |
 | `glassdoor` | Cookies/JSON | `credentials` (object with cookies, tokens) |
 | `techfetch` | Email/Password | `email`, `password` |
 | `indeed` | None | No credentials needed |
@@ -853,5 +956,5 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper-cre
 | 400 | Bad Request (invalid input) |
 | 401 | Unauthorized (invalid API key) |
 | 404 | Not Found (session not found) |
-| 409 | Conflict (active session exists) |
+| 409 | Conflict (active session or lease ownership conflict) |
 | 500 | Internal Server Error |

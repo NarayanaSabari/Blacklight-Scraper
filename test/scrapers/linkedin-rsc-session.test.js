@@ -9,6 +9,7 @@ import path from 'node:path';
 import {
     LinkedInRscSession,
     cookieTtlMs,
+    heartbeatIntervalMs,
     templatePath,
     loadTemplate,
 } from '../../src/scrapers/linkedin-rsc/session.js';
@@ -43,15 +44,35 @@ function fakeLease(overrides = {}) {
     };
 }
 
-function makeSession({ lease = fakeLease(), cookieReader, ttlMs = 60000, now = () => 1000, templateLoader, cooldown } = {}) {
+// A scheduler whose interval never fires on its own — the test drives each tick
+// so heartbeat behaviour is asserted deterministically, with no real timers.
+function fakeScheduler() {
+    const state = { fn: null, ms: null, cleared: 0 };
+    return {
+        state,
+        scheduler: {
+            setInterval: (fn, ms) => { state.fn = fn; state.ms = ms; return { id: 1 }; },
+            clearInterval: () => { state.cleared++; },
+        },
+        // Fire one tick and let its async body settle.
+        tick: async () => { await state.fn?.(); },
+    };
+}
+
+function makeSession({
+    lease = fakeLease(), cookieReader, ttlMs = 60000, now = () => 1000,
+    templateLoader, cooldown, heartbeatMs, scheduler, isLocal,
+} = {}) {
     const reads = { count: 0 };
     const session = new LinkedInRscSession({
-        apiClient: { acquire: async () => lease },
+        apiClient: { acquire: async () => lease, ...(isLocal === undefined ? {} : { isLocal }) },
         cookieReader: cookieReader ?? (async () => { reads.count++; return JAR; }),
         templateLoader: templateLoader ?? (() => TEMPLATE),
         ttlMs,
         now,
         cooldown,
+        ...(heartbeatMs === undefined ? {} : { heartbeatMs }),
+        ...(scheduler ? { scheduler } : {}),
     });
     return { session, lease, reads };
 }
@@ -63,6 +84,16 @@ test('cookieTtlMs: defaults to 30 minutes and ignores garbage', () => {
     assert.equal(cookieTtlMs({ LINKEDIN_RSC_COOKIE_TTL_MIN: '5' }), 5 * 60 * 1000);
     assert.equal(cookieTtlMs({ LINKEDIN_RSC_COOKIE_TTL_MIN: '0' }), 30 * 60 * 1000);
     assert.equal(cookieTtlMs({ LINKEDIN_RSC_COOKIE_TTL_MIN: 'abc' }), 30 * 60 * 1000);
+});
+
+test('heartbeatIntervalMs: defaults to 2 min and is clamped below the 10-min reaper', () => {
+    assert.equal(heartbeatIntervalMs({}), 2 * 60 * 1000);
+    assert.equal(heartbeatIntervalMs({ LINKEDIN_LEASE_HEARTBEAT_MIN: '1' }), 60 * 1000);
+    assert.equal(heartbeatIntervalMs({ LINKEDIN_LEASE_HEARTBEAT_MIN: 'abc' }), 2 * 60 * 1000);
+    assert.equal(heartbeatIntervalMs({ LINKEDIN_LEASE_HEARTBEAT_MIN: '0' }), 2 * 60 * 1000);
+    // A misconfigured 15 min would put the lease back inside the reaper's reach,
+    // which is exactly SCR-4 — cap it rather than honour it.
+    assert.equal(heartbeatIntervalMs({ LINKEDIN_LEASE_HEARTBEAT_MIN: '15' }), 5 * 60 * 1000);
 });
 
 test('templatePath: honours the env override', () => {
@@ -115,6 +146,142 @@ test('withCookies: releases the lease when the scrape throws', async () => {
     const { session, lease } = makeSession();
     await assert.rejects(() => session.withCookies('s', async () => { throw new Error('boom'); }));
     assert.equal(lease.released, 1);
+});
+
+// --- withCookies: lease heartbeat (SCR-4) ----------------------------------
+// A paginated RSC scrape can outlive the backend's 10-min stale-assignment
+// reaper. Without these ticks the pool reclaims the credential mid-scrape and
+// hands it to another worker.
+
+test('withCookies: keeps the lease alive while the scrape runs', async () => {
+    const beats = { count: 0 };
+    const lease = fakeLease({ heartbeat: async () => { beats.count++; return { ok: true }; } });
+    const { state, scheduler, tick } = fakeScheduler();
+    const { session } = makeSession({ lease, scheduler, isLocal: false });
+
+    await session.withCookies('s', async () => {
+        assert.equal(state.ms, 2 * 60 * 1000, 'ticker armed at the configured interval');
+        await tick();
+        await tick();
+        return 'ok';
+    });
+    assert.equal(beats.count, 2, 'the held lease was pinged on every tick');
+});
+
+test('withCookies: stops the heartbeat once the scrape finishes', async () => {
+    const lease = fakeLease({ heartbeat: async () => ({ ok: true }) });
+    const { state, scheduler } = fakeScheduler();
+    const { session } = makeSession({ lease, scheduler, isLocal: false });
+    await session.withCookies('s', async () => 'ok');
+    assert.equal(state.cleared, 1, 'no ticker leaks past the scrape');
+});
+
+test('withCookies: stops the heartbeat when the scrape throws', async () => {
+    const lease = fakeLease({ heartbeat: async () => ({ ok: true }) });
+    const { state, scheduler } = fakeScheduler();
+    const { session } = makeSession({ lease, scheduler, isLocal: false });
+    await assert.rejects(() => session.withCookies('s', async () => { throw new Error('boom'); }));
+    assert.equal(state.cleared, 1);
+});
+
+test('withCookies: a superseded lease stops the ticker instead of pinging forever', async () => {
+    // 409 from the backend means another worker owns this credential now. There
+    // is nothing left to keep alive, so the ticker must give up.
+    const beats = { count: 0 };
+    const lease = fakeLease({
+        heartbeat: async () => {
+            beats.count++;
+            return { ok: false, reason: 'superseded' };
+        },
+    });
+    const { state, scheduler, tick } = fakeScheduler();
+    const { session } = makeSession({ lease, scheduler, isLocal: false });
+
+    await session.withCookies('s', async () => {
+        await tick();
+        assert.equal(state.cleared, 1, 'ticker cleared on the superseded reply');
+        await tick();   // a tick already queued must be a no-op
+        return 'ok';
+    });
+    assert.equal(beats.count, 1, 'stopped after the terminal reply, did not keep pinging');
+});
+
+test('withCookies: an already-released lease stops the ticker (per-role reportSuccess)', async () => {
+    // scraper.js calls reportSuccess() inside the callback, which releases the
+    // lease; heartbeat() then answers 'no_lease'. That is terminal, not an error.
+    const beats = { count: 0 };
+    const lease = fakeLease({
+        heartbeat: async () => { beats.count++; return { ok: false, reason: 'no_lease' }; },
+    });
+    const { state, scheduler, tick } = fakeScheduler();
+    const { session } = makeSession({ lease, scheduler, isLocal: false });
+
+    await session.withCookies('s', async () => { await tick(); await tick(); return 'ok'; });
+    assert.equal(beats.count, 1);
+    assert.equal(state.cleared, 1);
+});
+
+test('withCookies: a transient heartbeat failure keeps ticking and never fails the scrape', async () => {
+    const beats = { count: 0 };
+    const lease = fakeLease({
+        heartbeat: async () => {
+            beats.count++;
+            return { ok: false, reason: 'error', error: new Error('ETIMEDOUT') };
+        },
+    });
+    const { state, scheduler, tick } = fakeScheduler();
+    const { session } = makeSession({ lease, scheduler, isLocal: false });
+
+    const out = await session.withCookies('s', async () => { await tick(); await tick(); return 'ok'; });
+    assert.equal(out, 'ok', 'a failed tick is invisible to the scrape');
+    assert.equal(beats.count, 2, 'a network blip is retried on the next tick, not fatal');
+    assert.equal(state.cleared, 1);
+});
+
+test('withCookies: a throwing heartbeat does not break the scrape', async () => {
+    const lease = fakeLease({ heartbeat: async () => { throw new Error('unexpected'); } });
+    const { scheduler, tick } = fakeScheduler();
+    const { session } = makeSession({ lease, scheduler, isLocal: false });
+    const out = await session.withCookies('s', async () => { await tick(); return 'ok'; });
+    assert.equal(out, 'ok');
+});
+
+test('withCookies: a lease with no heartbeat() support is handled, not crashed', async () => {
+    // Local (single-account) mode issues leases without the pool's methods.
+    const { state, scheduler } = fakeScheduler();
+    const { session } = makeSession({ lease: fakeLease(), scheduler, isLocal: true });
+    const out = await session.withCookies('s', async () => 'ok');
+    assert.equal(out, 'ok');
+    assert.equal(state.fn, null, 'no ticker armed when there is nothing to ping');
+});
+
+test('withCookies: a local session does not arm a heartbeat ticker', async () => {
+    const beats = { count: 0 };
+    const lease = fakeLease({ heartbeat: async () => { beats.count++; return { ok: true, local: true }; } });
+    const { state, scheduler } = fakeScheduler();
+    const { session } = makeSession({ lease, scheduler, isLocal: true });
+
+    const out = await session.withCookies('s', async () => 'ok');
+    assert.equal(out, 'ok');
+    assert.equal(state.fn, null);
+    assert.equal(beats.count, 0);
+});
+
+test('withCookies: a local heartbeat reply stops a remote ticker', async () => {
+    const beats = { count: 0 };
+    const lease = fakeLease({
+        heartbeat: async () => { beats.count++; return { ok: true, local: true }; },
+    });
+    const { state, scheduler, tick } = fakeScheduler();
+    const { session } = makeSession({ lease, scheduler, isLocal: false });
+
+    await session.withCookies('s', async () => {
+        await tick();
+        await tick();
+        return 'ok';
+    });
+    assert.equal(beats.count, 1);
+    assert.equal(state.cleared, 1);
 });
 
 test('withCookies: a sync release() does not crash the finally block', async () => {

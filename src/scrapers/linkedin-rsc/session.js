@@ -24,6 +24,13 @@ const log = createLogger('linkedin-rsc-session');
 
 const DEFAULT_COOKIE_TTL_MS = 30 * 60 * 1000; // 30 min
 
+// The backend reaps in_use credentials that have not been touched for 10 min
+// (`cleanup_stale_assignments(timeout_minutes=10)`), so the lease must be
+// pinged well inside that window. 2 min leaves room for several consecutive
+// failed ticks before the reaper wins.
+const DEFAULT_HEARTBEAT_MS = 2 * 60 * 1000;
+const REAPER_TIMEOUT_MS = 10 * 60 * 1000;
+
 function cacheKey(profileKey) {
     return profileKey || null;
 }
@@ -32,6 +39,17 @@ export function cookieTtlMs(env = process.env) {
     const n = Number.parseInt(String(env?.LINKEDIN_RSC_COOKIE_TTL_MIN ?? ''), 10);
     if (!Number.isFinite(n) || n <= 0) return DEFAULT_COOKIE_TTL_MS;
     return n * 60 * 1000;
+}
+
+/**
+ * Lease-heartbeat interval. Clamped below the backend reaper's window: an
+ * operator who sets this to 15 min would silently reintroduce SCR-4, so a
+ * too-large value is capped rather than honoured.
+ */
+export function heartbeatIntervalMs(env = process.env) {
+    const n = Number.parseInt(String(env?.LINKEDIN_LEASE_HEARTBEAT_MIN ?? ''), 10);
+    if (!Number.isFinite(n) || n <= 0) return DEFAULT_HEARTBEAT_MS;
+    return Math.min(n * 60 * 1000, REAPER_TIMEOUT_MS / 2);
 }
 
 export function templatePath(env = process.env) {
@@ -101,6 +119,8 @@ export class LinkedInRscSession {
         ttlMs = cookieTtlMs(),
         now = () => Date.now(),
         cooldown = linkedinCooldown,
+        heartbeatMs = heartbeatIntervalMs(),
+        scheduler = { setInterval, clearInterval },
     } = {}) {
         this._apiClient = apiClient ?? getCredentialsAPIClient();
         this._platform = platform;
@@ -109,6 +129,8 @@ export class LinkedInRscSession {
         this._ttlMs = ttlMs;
         this._now = now;
         this._cooldown = cooldown;
+        this._heartbeatMs = heartbeatMs;
+        this._scheduler = scheduler;
         this._cookies = new Map();
         this._cookiesAt = new Map();
         this._template = null;
@@ -204,6 +226,63 @@ export class LinkedInRscSession {
     }
 
     /**
+     * Keep `lease` alive for as long as the scrape runs (SCR-4).
+     *
+     * A paginated RSC scrape can outlive the backend's 10-min stale-assignment
+     * reaper, and a reaped lease means the pool hands this same credential to
+     * another worker while we are still using it. The lease exposes
+     * heartbeat() but nothing called it, which is the bug SCR-4 describes.
+     *
+     * Best-effort by design: a failed tick is retried on the next one and never
+     * touches the scrape. The terminal cases that DO stop the ticker mean there
+     * is nothing left to keep alive:
+     *   - a local reply: no remote lease needs a heartbeat.
+     *   - 'superseded': someone else owns the credential now.
+     *   - 'no_lease':   already released (the per-role reportSuccess does this).
+     *
+     * @returns {() => void} stop
+     */
+    #startHeartbeat(lease) {
+        if (this.isLocal || typeof lease?.heartbeat !== 'function' || !(this._heartbeatMs > 0)) {
+            return () => {};
+        }
+        let stopped = false;
+        let inFlight = false;
+        const timer = this._scheduler.setInterval(async () => {
+            // A tick slower than the interval must not stack up requests.
+            if (stopped || inFlight) return;
+            inFlight = true;
+            try {
+                const result = await lease.heartbeat();
+                if (result?.ok === true && result.local === true) {
+                    stop();
+                } else if (result && result.ok === false
+                    && ['superseded', 'no_lease'].includes(result.reason)) {
+                    stop();
+                    log.warn('Stopped lease heartbeat — lease is gone', {
+                        platform: this._platform, reason: result.reason,
+                    });
+                }
+            } catch (err) {
+                // heartbeat() swallows its own errors; this is belt-and-braces
+                // so an unexpected throw can never surface as an unhandled
+                // rejection from a bare timer callback.
+                log.warn('Lease heartbeat threw (ignored)', { err: err?.message });
+            } finally {
+                inFlight = false;
+            }
+        }, this._heartbeatMs);
+        // A pending heartbeat must never be the reason the process stays alive.
+        timer?.unref?.();
+        const stop = () => {
+            if (stopped) return;
+            stopped = true;
+            this._scheduler.clearInterval(timer);
+        };
+        return stop;
+    }
+
+    /**
      * Lease a credential, supply its cookie jar, and release the lease afterwards.
      * The lease is what the orchestrator's availability gate keys on, so it is
      * still taken even though no browser is held for the scrape itself.
@@ -222,6 +301,7 @@ export class LinkedInRscSession {
             err.skipNoCreds = true;
             throw err;
         }
+        const stopHeartbeat = this.#startHeartbeat(lease);
         try {
             const profileKey = lease.credential?.profile_key ?? null;
             const cookies = await this.#refreshCookies(profileKey);
@@ -252,6 +332,9 @@ export class LinkedInRscSession {
             }
             throw err;
         } finally {
+            // Stop ticking BEFORE releasing, so a tick already scheduled cannot
+            // land on a lease this block is about to hand back.
+            stopHeartbeat();
             // release() is async today, but a sync one would make `.catch` on its
             // return value throw from inside finally and mask the real error.
             try {
