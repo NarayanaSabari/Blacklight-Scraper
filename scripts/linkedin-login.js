@@ -6,6 +6,10 @@
 // — no per-run cookie injection from the credentials API.
 //
 // Fully interactive — run `npm run linkedin:login` and answer the prompts:
+//   • CloakBrowser licence key — asked ONLY when none is configured. Free, and
+//     it upgrades the stealth binary from Chromium v146 to v150; without it
+//     LinkedIn's login tends to serve an unsolvable reCAPTCHA loop. The command
+//     also updates the cloakbrowser package itself when a newer one exists.
 //   • Account / profile key — blank for the default single profile, or a
 //     profile_key to open the pinned-fingerprint per-account profile.
 //   • Proxy (only asked WHEN a profile key is given) — host:port:user:pass to
@@ -24,6 +28,7 @@ import { linkedInProfileDir } from '../src/core/linkedin-profile.js';
 import { launchPersistentProfile } from '../src/core/linkedin-browser.js';
 import { saveLinkedinCredential } from '../src/setup/linkedin-credential.js';
 import { defaultAsk } from '../src/setup/io.js';
+import { cloakbrowserPreflight } from '../src/setup/cloakbrowser-preflight.js';
 
 // Collect the login config interactively. `ask` is injected (the EOF-safe
 // prompt from src/setup/io.js in production; a fake in tests). No browser or
@@ -43,6 +48,12 @@ export async function promptConfig(ask) {
 async function main() {
     const ask = defaultAsk();
     try {
+        // Before opening any window: make sure CloakBrowser is current and
+        // licensed. An unlicensed CloakBrowser runs Chromium v146 against a
+        // v150 world, which is what makes LinkedIn's login serve an
+        // unsolvable reCAPTCHA loop. See src/setup/cloakbrowser-preflight.js.
+        await cloakbrowserPreflight({ ask, cwd: process.cwd() });
+
         const { profileKey, proxy } = await promptConfig(ask);
 
         let context;
