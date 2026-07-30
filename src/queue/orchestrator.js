@@ -41,6 +41,9 @@ export class QueueOrchestrator {
         this.defaultLocation = defaultLocation || 'United States';
         this.mutex = new Mutex();
         this.autoInterval = null;
+        // SCR-18 (#401): at most ONE follow-up poll may be pending at a time.
+        // See #schedulePoll.
+        this._pollScheduled = false;
         // Injection seams (default to the production singletons). Behavior-
         // neutral: server.js passes none of these, so construction is
         // identical to before. Tests inject fakes to exercise the workflow
@@ -66,6 +69,45 @@ export class QueueOrchestrator {
      * that already have in-flight sessions for this scraper, which
      * prevents over-claiming when polls overlap with running work.
      */
+    /**
+     * Schedule ONE follow-up claim after a platform settles (SCR-18 / #401).
+     *
+     * Every settling platform used to fire its own `setImmediate(runOnce)`, so a
+     * 6-platform assignment produced up to 6 polls. The claim mutex made the
+     * overlapping ones cheap — they returned `{skipped:true}` — but platforms
+     * that settle at DIFFERENT times do not overlap, so each one became a real
+     * backend claim. Fast-failing platforms (no credentials, unsupported) settle
+     * almost together and amplified hardest.
+     *
+     * Coalescing keeps the intent — a fast-finishing platform must not wait for
+     * slow siblings before the next claim — while collapsing a burst into a
+     * single poll. There is deliberately NO added delay: a pending poll is
+     * dropped rather than deferred, so the first trigger still runs on the next
+     * tick and latency is unchanged.
+     */
+    #schedulePoll(platformName) {
+        if (this._pollScheduled) return;
+        this._pollScheduled = true;
+        setImmediate(() => {
+            // Cleared BEFORE the run so a platform settling during this poll can
+            // schedule the next one; clearing after would swallow it.
+            this._pollScheduled = false;
+            this.runOnce().catch((err) => {
+                log.error('Post-platform claim failed', {
+                    platform: platformName, err: err.message,
+                });
+            });
+        });
+    }
+
+    // Test-only seam onto #schedulePoll, matching the _issueLeaseForTest /
+    // _hasActiveLease convention in api/credentials.js. The coalescing is the
+    // behaviour under test and is otherwise only reachable through a full
+    // assignment run.
+    _schedulePollForTest(platformName = 'test') {
+        this.#schedulePoll(platformName);
+    }
+
     async runOnce() {
         if (!this.mutex.tryAcquire()) {
             log.info('Queue run skipped — claim already in flight');
@@ -310,13 +352,7 @@ export class QueueOrchestrator {
             const platformName = platformInfo.name.toLowerCase();
             const scraper = this._resolveScraper(platformName);
 
-            const triggerNextPoll = () => {
-                setImmediate(() => this.runOnce().catch((err) => {
-                    log.error('Post-platform claim failed', {
-                        platform: platformName, err: err.message,
-                    });
-                }));
-            };
+            const triggerNextPoll = () => this.#schedulePoll(platformName);
 
             if (!scraper) {
                 log.warn('Unknown platform', { platformName });
