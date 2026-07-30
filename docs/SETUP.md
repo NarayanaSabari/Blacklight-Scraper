@@ -1,0 +1,352 @@
+# Scraper setup
+
+One guide for every host. Follow it top to bottom; the only per-OS differences
+are marked 🐧 Linux / 🍎 macOS / 🪟 Windows.
+
+**What a host is.** The scraper is one Node process that polls the Blacklight
+backend, claims a role, scrapes the platforms its API key allows, submits the
+jobs back, and completes the session. Which platforms a host handles is set by
+its API key's `platform_allowlist` in the dashboard, not by config here. Adding
+a host means registering a new key.
+
+## Prerequisites
+
+| Software | Why |
+|---|---|
+| **Node.js ≥ 22.19.0** | Runtime |
+| **Git** | Clone + pull |
+| A **desktop session** | Only for the two one-time LinkedIn steps (§6). Day-to-day running is headless. |
+
+🐧 `sudo apt install -y nodejs npm git` (or NodeSource for 22.19.0+)
+🍎 Install Node.js 22.19.0+ and Git with Homebrew or from nodejs.org.
+🪟 Install Node.js from nodejs.org (tick *Tools for Native Modules*) and Git for
+   Windows. Use **PowerShell** for every command below.
+
+Node 20.x is not supported: the directly imported `undici` 8 transport requires
+Node 22.19.0 or newer. Upgrade a Node 20 host before deploying the scraper.
+
+Verify:
+
+```bash
+node --version   # v22.19.0 or higher
+npm --version
+git --version
+```
+
+CloakBrowser downloads its own stealth Chromium on first launch, so there is no
+separate browser install. Pre-warm it once to get the download out of the way:
+
+```bash
+node -e "import('cloakbrowser').then(m=>m.ensureBinary()).then(()=>console.log('ok'))"
+```
+
+## 1. Clone and install
+
+```bash
+git clone https://github.com/NarayanaSabari/Blacklight.git
+cd Blacklight/scraper
+npm ci
+```
+
+The scraper lives in `scraper/` inside the monorepo. Do not clone the
+`Blacklight-Scraper` mirror — it is read-only and CI overwrites it.
+
+## 2. Get an API key for this host
+
+In the central dashboard (**Dashboard → API Keys**): create a key, name it after
+the host, and set its **platform allowlist** to the platforms this host should
+scrape. The backend only ever hands this host roles for those platforms.
+
+Current split:
+
+| Host type | Platforms | Why |
+|---|---|---|
+| Linux VM with an ISP/residential proxy pool | `monster`, `dice`, `techfetch` | Monster needs the pool for DataDome; Dice and TechFetch run fine headless |
+| Residential machine (Windows/macOS) | `linkedin`, `glassdoor`, `indeed` | Indeed needs a clean residential IP; LinkedIn needs a warm logged-in profile |
+
+## 3. `config/credentials.json`
+
+Copy the example and fill in the backend URL and the key from §2:
+
+```bash
+cp config/credentials.example.json config/credentials.json
+```
+
+```json
+{
+  "blacklight": {
+    "apiUrl": "https://api.qpeakhire.com",
+    "apiKey": "<the key from step 2>"
+  },
+  "scraperCredentials": {
+    "apiUrl": "https://api.qpeakhire.com",
+    "apiKey": "<same key>"
+  }
+}
+```
+
+This file is git-ignored. **Never commit it.**
+
+With `blacklight.apiUrl` + `apiKey` set, platform logins are fetched from the
+dashboard on demand, and metrics/logs are proxied to Grafana through the same
+API — no extra telemetry config.
+
+Omitting them puts the credentials client in **local mode**, where it reads
+platform logins from this same file instead (useful for a laptop). Local mode
+hands out the same credential to every concurrent caller, so it does **not**
+model production lease behaviour.
+
+## 4. `.env` (optional)
+
+```bash
+cp .env.example .env
+```
+
+Every value has a working default; `.env.example` documents what each knob does.
+The ones that actually matter per host:
+
+| Variable | Use |
+|---|---|
+| `SCRAPER_MODE` | `daemon` on always-on hosts (enables offline alerts), `interactive` on laptops |
+| `SCRAPER_DEFAULT_LOCATION` | Search location, default `United States` |
+| `SCRAPER_STRICT_EMPTY` | Fallback for callers without a registry override; active platform entries already treat unexplained 0-job scrapes as failures. |
+| `LINKEDIN_RSC_COUNT` | Results per LinkedIn request (default 10, hard cap 50) |
+
+## 5. Proxies
+
+Only needed on hosts scraping **Monster, Glassdoor detail enrichment, Indeed, or
+TechFetch**. LinkedIn and Dice always run direct.
+
+```bash
+cp config/proxies.example.txt config/proxies.txt
+```
+
+One proxy per line, in your provider's format:
+
+```
+host:port:username:password
+```
+
+`config/proxies.txt` is git-ignored. Alternatively set `PROXY_LIST` (comma or
+newline separated) or point `PROXY_LIST_FILE` elsewhere. With neither, every
+platform runs direct.
+
+Two knobs worth knowing:
+
+- `PROXY_EXCLUDE_PLATFORMS` — platforms that must never be proxied. Defaults to
+  `glassdoor`, whose discovery API rejects proxied requests while its detail
+  enrichment is happy to use them.
+- `PROXY_BLOCK_COOLDOWN_MS` — how long a proxy IP is benched after a block
+  (default 10 min). A scrape that gets blocked cools its own exit IP so the next
+  one rotates.
+
+**LinkedIn ignores the proxy pool entirely.** Its transport is plain HTTP with no
+proxy support, so a LinkedIn host's own IP is what LinkedIn sees. That is
+deliberate: the residential IP is the asset. Do not put a VPN on that host.
+
+## 6. LinkedIn: two one-time steps
+
+Only on hosts whose allowlist includes `linkedin`. **Both need a real desktop
+session** — over SSH alone they cannot render. Everything after this is headless.
+
+### 6a. Log in
+
+```bash
+npm run linkedin:login
+```
+
+Opens a headed browser on a persistent profile
+(`~/.blacklight-linkedin-profile`, or `%USERPROFILE%\.blacklight-linkedin-profile`;
+override with `LINKEDIN_PROFILE_DIR`). Sign in, clear any *"confirm it's you"* /
+2FA prompt, wait for the feed, then press Enter in the terminal to save.
+
+The session lives in that directory and survives restarts. **Keep it intact.**
+Re-run this whenever LinkedIn invalidates the session.
+
+To start a profile over (wrong account keeps opening), `npm run linkedin:reset`
+lists the on-disk profiles and deletes the ones you pick. It refuses to run while
+the scraper is up, since a profile an open Chromium holds cannot be deleted.
+
+### 6b. Capture the request template
+
+```bash
+npm run linkedin:rsc-template
+```
+
+LinkedIn's content search is a React-Server-Components app. The scraper replays
+one of its requests, and that request's client-version headers and body shape
+cannot be invented — so they are captured once per host into
+`config/linkedin-rsc-template.json` (git-ignored).
+
+Cookies and csrf-token are stripped before writing, so the file holds no
+credentials; the scraper derives those per request from the profile's live jar.
+
+Re-run this if LinkedIn ships a client version that breaks the saved template.
+That surfaces as an auth/DOM failure, never as a silent empty result. Until it
+exists the scraper fails fast with `NEEDS_TEMPLATE` naming this command.
+
+## 7. Run
+
+```bash
+npm start
+```
+
+The process starts an Express server on `PORT` (default 3001) and begins polling
+the queue every 30s. Check it:
+
+```bash
+curl http://localhost:3001/healthz
+```
+
+Confirm the host shows as `running` under **Scraper → Active Sessions** in the
+dashboard.
+
+For a manual one-off scrape:
+
+```bash
+curl -X POST http://localhost:3001/scrape \
+  -H 'content-type: application/json' \
+  -d '{"platform":"dice","jobTitle":"Data Engineer"}'
+```
+
+## 8. Keep it running
+
+`npm start` dies with the terminal. On an always-on host, wrap it.
+
+### 🪟 Windows — NSSM
+
+Download NSSM from https://nssm.cc/download, extract to `C:\Tools\nssm\`:
+
+```powershell
+C:\Tools\nssm\nssm.exe install qp-scraper "C:\Program Files\nodejs\node.exe" "C:\scraper\server.js"
+C:\Tools\nssm\nssm.exe set qp-scraper AppDirectory C:\scraper
+C:\Tools\nssm\nssm.exe set qp-scraper AppEnvironmentExtra NODE_ENV=production SCRAPER_MODE=daemon
+C:\Tools\nssm\nssm.exe set qp-scraper AppStdout C:\scraper\logs\stdout.log
+C:\Tools\nssm\nssm.exe set qp-scraper AppStderr C:\scraper\logs\stderr.log
+C:\Tools\nssm\nssm.exe set qp-scraper Start SERVICE_AUTO_START
+C:\Tools\nssm\nssm.exe start qp-scraper
+```
+
+Manage via `services.msc` or `nssm restart|stop|status qp-scraper`.
+
+### 🍎 macOS — launchd
+
+Create `~/Library/LaunchAgents/com.qpeakhire.scraper.plist`. Replace
+`YOUR_USERNAME` and the repo path, and note the node path differs by
+architecture: `/opt/homebrew` on Apple Silicon, `/usr/local` on Intel.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.qpeakhire.scraper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/YOUR_USERNAME/Blacklight/scraper/server.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOUR_USERNAME/Blacklight/scraper</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>SCRAPER_MODE</key>
+    <string>daemon</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USERNAME/Blacklight/scraper/logs/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USERNAME/Blacklight/scraper/logs/stderr.log</string>
+</dict>
+</plist>
+```
+
+```bash
+sed -i '' "s|YOUR_USERNAME|$(whoami)|g" ~/Library/LaunchAgents/com.qpeakhire.scraper.plist
+mkdir -p logs
+launchctl load ~/Library/LaunchAgents/com.qpeakhire.scraper.plist
+launchctl list | grep qpeakhire
+```
+
+Reload after a code change with `launchctl unload` then `load`.
+
+### 🐧 Linux — systemd
+
+A unit with `ExecStart=/usr/bin/node /srv/scraper/server.js`,
+`WorkingDirectory=/srv/scraper`, `Environment=SCRAPER_MODE=daemon`,
+`Restart=always`, then `systemctl enable --now qp-scraper`.
+
+### Do not let the host sleep
+
+A sleeping host silently stops scraping.
+
+🪟 `powercfg /change standby-timeout-ac 0` and `hibernate-timeout-ac 0`
+🍎 System Settings → Battery → Options → *Prevent sleeping when display is off*
+🐧 `sudo systemctl mask sleep.target suspend.target`
+
+Also set the BIOS/UEFI to restore power state after an outage, so scraping
+resumes unattended.
+
+## 9. Updating
+
+```bash
+git pull origin main
+npm ci               # only if package.json changed
+# then restart the service
+```
+
+> **Node does not hot-reload. After `git pull` you MUST restart.**
+>
+> Skipping it is silent: the running process keeps executing the old code while
+> `git log` shows the new commit. Confirm what is actually live by comparing
+> `/healthz`'s `gitSha` against `git rev-parse --short HEAD`. If they differ, the
+> process is stale.
+
+Restart between sessions rather than mid-scrape. Killing a running scrape leaves
+the backend session open and the orchestrator reports *"Active session already
+exists"* until an admin terminates it in the dashboard.
+
+## Troubleshooting
+
+**`NEEDS_TEMPLATE` / LinkedIn RSC template not found**
+Run `npm run linkedin:rsc-template` (§6b) on this host. Needs a desktop session.
+
+**LinkedIn returns nothing, or `/healthz` reports no cached session jar**
+The profile's session died. Re-run `npm run linkedin:login` (§6a).
+
+**CloakBrowser fails to launch**
+Re-run the pre-warm command from Prerequisites. On a licence-key host, confirm
+`CLOAKBROWSER_LICENSE_KEYS` is set — seats are capped per key **globally, across
+processes**, so concurrent platform scrapes need one key each or they queue.
+A free-plan key starts killing sessions after a handful of rapid launches.
+
+**Glassdoor fails at warm-up with HTTP 403**
+Its discovery API is challenging this IP. Confirm `glassdoor` is in
+`PROXY_EXCLUDE_PLATFORMS` (proxied warm-ups get rejected). This happens before
+any browser launches, so browser settings cannot fix it.
+
+**`Loaded 0 cookies` (Indeed)**
+The credential's `credential_type` is not `json_blob`. Dashboard → Platforms →
+the platform → set **Requires Credentials** to `JSON / Cookies` → Save.
+
+**`addCookies: Invalid parameters`**
+One pasted cookie has a malformed field. The per-cookie retry skips it and
+continues; the log line `skipped cookie name=X domain=Y` names the offender.
+
+**A scrape reports 0 jobs and you are not sure why**
+With `SCRAPER_STRICT_EMPTY=true` an unexplained empty becomes a classified
+failure with a cooldown instead of a silent success. Turn it on before trusting
+a zero.
+
+## Related
+
+- [DEPLOYMENT.md](DEPLOYMENT.md) — per-platform behaviour, observability, prod topology
+- [scraper-runbook.md](scraper-runbook.md) — performance knobs, CloakBrowser seats
+- [BACKEND_API.md](BACKEND_API.md) — the backend API this scraper talks to

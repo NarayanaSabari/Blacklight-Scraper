@@ -145,7 +145,9 @@ with a one-session limit, so extra concurrency means extra keys (or a paid plan)
 ## Global knobs
 - `SCRAPER_HEADLESS` — default headless; `false`/`0`/`no`/`off` → **headful** (a stronger stealth posture for DataDome/Cloudflare; on Linux use `xvfb-run -a`).
 - `SCRAPER_BLOCK_RESOURCES` — block images/media/fonts to cut proxy bandwidth (`SCRAPER_BLOCK_RESOURCE_TYPES` to customize). Measured ~20% bandwidth savings.
-- `SCRAPER_STRICT_EMPTY` — treat unconfirmed-empty results as a failure (block signal) rather than a genuine 0.
+- `SCRAPER_STRICT_EMPTY` — the fallback for scrapers without a registry override;
+  active registry entries already enable strict handling and return confirmed-empty
+  signals where the platform can prove a genuine zero.
 - `PROXY_BLOCK_COOLDOWN_MS` — per-IP cooldown after a block (default 600000).
 
 ## Deploy checklist
@@ -156,4 +158,4 @@ with a one-session limit, so extra concurrency means extra keys (or a paid plan)
 5. Run `npm run linkedin:login` and `npm run linkedin:rsc-template` before using LinkedIn. Indeed/Glassdoor/Dice then work immediately. Monster works as long as the pool has clean IPs.
 6. Verify: hit `/healthz` and run one scrape per platform.
 
-See also: `docs/antibot-bypass-plan.md` (the research + why each method was chosen).
+The anti-bot research that motivated these knobs is in the repository's git history.

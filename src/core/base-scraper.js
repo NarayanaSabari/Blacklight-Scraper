@@ -10,9 +10,9 @@
 //   - an Array of jobs (legacy; treated as emptyConfirmed:false), or
 //   - { jobs: Array, emptyConfirmed?: boolean }
 // `emptyConfirmed` must be set true ONLY when the scraper positively
-// confirmed a real empty result set (Plan 1C). Default production
-// behavior is unchanged: unconfirmed-empty still returns [] and records
-// success unless opt-in strict mode is enabled.
+// confirmed a real empty result set. The generic wrapper defaults to
+// compatibility mode; the active registry opts every platform into strict
+// handling.
 
 import { createLogger } from '../logger/index.js';
 import { ScraperError, BlockedError } from './errors.js';

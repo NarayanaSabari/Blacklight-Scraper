@@ -23,8 +23,7 @@ Keys), and the backend routes each queued role to the right host based
 on the key's allowlist. Adding a new host = registering a new key.
 
 **Setting up a fresh residential host**:
-- 🪟 [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)
-- 🍎 [docs/MAC_SETUP.md](docs/MAC_SETUP.md)
+- 📗 [docs/SETUP.md](docs/SETUP.md) — one guide, all hosts
 
 ## 🚀 What this scraper does
 
@@ -46,33 +45,30 @@ on the key's allowlist. Adding a new host = registering a new key.
 
 ## 📋 Prerequisites
 
-- **Node.js** ≥ 20 LTS
+- **Node.js** ≥ 22.19.0
 - **npm** ≥ 10
 - **CloakBrowser** - downloads its stealth Chromium on first launch
 
-## 🔧 Installation (Linux dev / VM)
+## 🔧 Installation
 
 If you're setting up a fresh **residential** host for production, use
-the OS-specific runbooks instead — they cover dashboard setup,
-launchd/NSSM service wrapping, and the exact troubleshooting we've
-hit:
-- 🪟 [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)
-- 🍎 [docs/MAC_SETUP.md](docs/MAC_SETUP.md)
+the single setup guide — it covers dashboard setup, launchd/NSSM service
+wrapping, and host-specific troubleshooting:
+- 📗 [docs/SETUP.md](docs/SETUP.md) — one guide, all hosts
 
-The instructions below cover the manual / dev-laptop path on
-Linux/macOS.
+The quick-start path below is for a manual or development run.
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/NarayanaSabari/Blacklight-Scraper.git
-cd Blacklight-Scraper
+git clone https://github.com/NarayanaSabari/Blacklight.git
+cd Blacklight/scraper
 ```
 
 ### 2. Install Dependencies
 
 ```bash
-npm install
+npm ci
 ```
 
 This will install all required packages including:
@@ -134,8 +130,7 @@ must match `git rev-parse --short HEAD`.
 
 Platform-specific recipes:
 
-- macOS: see [docs/MAC_SETUP.md](docs/MAC_SETUP.md#updating)
-- Windows: see [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md#updating)
+- See [docs/SETUP.md](docs/SETUP.md#9-updating)
 
 ## Exit codes
 
@@ -163,13 +158,10 @@ The server will start on `http://localhost:3001` with:
 - ✅ Auto queue checker running (checks every 30 seconds)
 - ✅ Connects to Blacklight backend for queue and credentials
 
-### Development Mode (with auto-restart)
+### Development Mode
 
-```bash
-npm run dev
-```
-
-Auto-restarts the server when you make code changes.
+There is no file-watching script in this package. Run `npm start` and restart
+the process after source changes.
 
 ## 📡 API Endpoints
 
@@ -261,7 +253,7 @@ Job-Scraper/
 ├── server.js                 # Thin HTTP entry (~85 lines) — wires routes + graceful shutdown
 ├── package.json
 ├── README.md
-├── Complete API.md           # Blacklight API documentation
+├── docs/BACKEND_API.md       # Blacklight API documentation
 ├── .gitignore
 ├── .env.example              # Environment variable template
 │
@@ -288,11 +280,9 @@ Job-Scraper/
 │   ├── core/
 │   │   ├── errors.js         # Typed error hierarchy (ScraperError, AuthError, …)
 │   │   ├── base-scraper.js   # Shared scraper lifecycle + logging
-│   │   ├── browser.js        # Legacy Playwright helpers (not used by active scrapers)
 │   │   ├── browser-pool.js   # CloakBrowser launchers with licence-seat leasing
 │   │   ├── license-pool.js    # Cross-process CloakBrowser licence-seat pool
 │   │   ├── fingerprints.js   # Shared UAs/viewports
-│   │   ├── cookies.js        # Unified cookie loader
 │   │   ├── delays.js         # humanDelay, randomDelay, backoff+jitter
 │   │   ├── html.js           # stripHtmlTags, sanitizeFilename, hashString
 │   │   ├── normalize.js      # Unified master schema normalization
@@ -331,79 +321,17 @@ Job-Scraper/
 
 ### Environment Variables
 
-Copy `.env.example` to `.env` and adjust as needed:
-
-```bash
-NODE_ENV=production             # 'development' disables auto queue + uses local credentials
-PORT=3001
-LOG_LEVEL=info                  # debug | info | warn | error
-QUEUE_CHECK_INTERVAL_MS=30000   # Auto queue poll interval
-QUEUE_CHECK_STARTUP_DELAY_MS=5000
-
-# LinkedIn RSC transport
-LINKEDIN_RSC_COUNT=10            # default 10, capped at 50 per request
-LINKEDIN_RSC_COOKIE_TTL_MIN=30
-LINKEDIN_RSC_TEMPLATE=            # optional captured-template path override
-
-# Proxies (host:port:user:pass per entry — creds NEVER committed)
-PROXY_LIST=                     # comma/newline separated; or use the git-ignored config/proxies.txt
-PROXY_EXCLUDE_PLATFORMS=glassdoor   # Glassdoor discovery direct; glassdoor-jd enrichment remains pooled
-
-# Platform performance overrides (see docs/scraper-runbook.md)
-DICE_SEARCH_RENDER_WAIT_MS=2000
-DICE_DETAIL_RENDER_WAIT_MS=0
-DICE_DETAIL_CONCURRENCY=10
-TECHFETCH_RETRY_BACKOFF_MS=500
-TECHFETCH_DETAIL_CONCURRENCY=8
-GLASSDOOR_FETCH_DESCRIPTIONS=true
-GLASSDOOR_DESC_CONCURRENCY=6
-
-# CloakBrowser session seats — ONE key per concurrent browser platform.
-# Comma/newline separated, or one per line in git-ignored config/cloakbrowser-keys.txt
-CLOAKBROWSER_LICENSE_KEYS=
-
-# Observability (optional — auto-enabled when blacklight.apiUrl is configured)
-INSTANCE_ID=                    # Unique host identifier; defaults to os.hostname()
-SCRAPER_MODE=interactive        # daemon | interactive (daemon fires offline alerts)
-TELEMETRY_URL=                  # Override telemetry base URL (default: blacklight.apiUrl)
-TELEMETRY_KEY=                  # Override telemetry key (default: blacklight.apiKey)
-```
-
-Platform routing, Glassdoor's per-IP detail-page limit, and all platform-specific
-performance knobs are maintained in the [scraper runbook](docs/scraper-runbook.md).
-
-See the [CloakBrowser session-seat runbook](docs/scraper-runbook.md#cloakbrowser-session-seats)
-for key sizing, the git-ignored key-file alternative, and the no-key fallback.
+Copy [`.env.example`](.env.example) to `.env` and adjust as needed.
+It is the authoritative reference for supported variables and defaults.
+For host-oriented configuration, see [the setup guide](docs/SETUP.md#4-env-optional)
+and the [scraper runbook](docs/scraper-runbook.md).
 
 ### LinkedIn — log in once and capture the RSC template
 
-LinkedIn scraping uses a long-lived CloakBrowser stealth profile stored on
-disk. Log in by hand once; the session persists across scraper runs and
-rotates organically. The scraper reads cookies from this profile and sends
-browserless RSC requests; it does not inject cookies into a browser page.
-
-```bash
-npm run linkedin:login
-```
-
-This:
-- Opens a **headed** CloakBrowser on the scraper's persistent profile dir
-  (`~/.blacklight-linkedin-profile`; override with `LINKEDIN_PROFILE_DIR`)
-- Navigates to `linkedin.com/login` — log in (and solve any challenge), then
-  press Enter in the terminal to save + close
-- `npm start` then reuses this exact logged-in session for browserless requests.
-
-After logging in once, the session persists in the profile dir across
-restarts, so subsequent scraper runs remember your login. Capture the request
-template once on the same host:
-
-```bash
-npm run linkedin:rsc-template
-```
-
-The template is written to the git-ignored `config/linkedin-rsc-template.json`.
-Re-run `npm run linkedin:login` when the profile expires, and re-capture the
-template when LinkedIn changes the request shape.
+LinkedIn uses a persistent profile for authentication and browserless RSC
+requests.
+Follow [the LinkedIn setup steps](docs/SETUP.md#6-linkedin-two-one-time-steps)
+to log in and capture the request template.
 
 ### Credentials
 
@@ -584,7 +512,7 @@ The scraper provides detailed console logs:
 
 ## 📚 API Documentation
 
-Full Blacklight API documentation is available in [Complete API.md](Complete%20API.md)
+Full Blacklight API documentation is available in [docs/BACKEND_API.md](docs/BACKEND_API.md)
 
 ## 🤝 Contributing
 
@@ -604,8 +532,7 @@ MIT License - See LICENSE file for details
 - **Blacklight Backend (production)**: https://api.qpeakhire.com
 - **Central Dashboard**: https://central.qpeakhire.com
 - **Grafana**: https://grafana.qpeakhire.com
-- **Windows host setup**: [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)
-- **Mac host setup**: [docs/MAC_SETUP.md](docs/MAC_SETUP.md)
+- **Host setup (all platforms)**: [docs/SETUP.md](docs/SETUP.md)
 
 ## 💡 Tips
 
@@ -620,7 +547,7 @@ MIT License - See LICENSE file for details
 For issues, questions, or contributions:
 - Open an issue on GitHub
 - Check existing issues for solutions
-- Review the API documentation in `Complete API.md`
+- Review the API documentation in `docs/BACKEND_API.md`
 
 ---
 

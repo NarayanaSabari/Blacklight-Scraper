@@ -50,7 +50,10 @@ export function parseSalary(baseSalary) {
     const currency = baseSalary.currency || 'USD';
     const period = baseSalary.unitText || null;
     if (min === null && max === null) return { ...fallback, currency, period };
-    const fmt = (v) => (v !== null && v !== undefined) ? `$${Number(v).toLocaleString()}` : null;
+    // Pin the locale: toLocaleString() follows the HOST locale, so an en-IN box
+    // formats 100000 as "1,00,000" and ships malformed salaries.
+    const fmt = (v) => (v !== null && v !== undefined)
+        ? `$${Number(v).toLocaleString('en-US')}` : null;
     const suffix = period === 'HOUR' ? '/hr' : period === 'YEAR' ? '/yr' : '';
     const formatted = [fmt(min), fmt(max)].filter(Boolean).join(' - ') + suffix;
     return { min, max, currency, period, formatted };

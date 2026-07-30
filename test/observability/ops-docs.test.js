@@ -13,12 +13,20 @@ test('.env.example documents SCRAPER_STRICT_EMPTY (default false)', () => {
     assert.match(e, /strict/i);
 });
 
-test('MAC_SETUP launchd plist sets SCRAPER_MODE=daemon', () => {
-    const m = read('docs/MAC_SETUP.md');
-    assert.match(m, /<key>SCRAPER_MODE<\/key>\s*\n\s*<string>daemon<\/string>/);
+// The per-OS setup guides were consolidated into docs/SETUP.md. The assertion
+// that matters is unchanged: an always-on host must be told to run in daemon
+// mode, or offline alerts never fire.
+test('SETUP launchd plist sets SCRAPER_MODE=daemon', () => {
+    const s = read('docs/SETUP.md');
+    assert.match(s, /<key>SCRAPER_MODE<\/key>\s*\n\s*<string>daemon<\/string>/);
 });
 
-test('WINDOWS_SETUP NSSM env sets SCRAPER_MODE=daemon', () => {
-    const w = read('docs/WINDOWS_SETUP.md');
-    assert.match(w, /AppEnvironmentExtra[^\n]*SCRAPER_MODE=daemon/);
+test('SETUP NSSM env sets SCRAPER_MODE=daemon', () => {
+    const s = read('docs/SETUP.md');
+    assert.match(s, /AppEnvironmentExtra[^\n]*SCRAPER_MODE=daemon/);
+});
+
+test('SETUP systemd example sets SCRAPER_MODE=daemon', () => {
+    const s = read('docs/SETUP.md');
+    assert.match(s, /Environment=SCRAPER_MODE=daemon/);
 });

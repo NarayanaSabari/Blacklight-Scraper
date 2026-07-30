@@ -22,9 +22,9 @@ blocked most must run daemon mode AND have these rules loaded.
 
 ## Status of detection
 
-Until Plan 1C wires `assertNotBlocked()` into the scrapers, a block still
-surfaces primarily as "0 jobs" (→ `scraper_zero_result_sessions_total` +
-`scraper_jobs_last_scraped` flatline), not as a `blocked` failure. The
-`ScraperZeroResultRatioHigh` / `ScraperNoNonzeroScrape` alerts are the
-load-bearing ones in that interim; `ScraperBlockedFailures` becomes
-primary once 1C lands.
+Every active registry entry now enables strict handling and returns a
+confirmed-empty signal when the platform can prove a genuine zero.
+An unconfirmed zero is still recorded in `scraper_zero_result_sessions_total`
+and raises a `blocked` failure through the strict path, so the
+`ScraperBlockedFailures` alert is load-bearing alongside the zero-result and
+nonzero-scrape alerts.

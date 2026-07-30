@@ -292,15 +292,13 @@ class MetricsRegistry {
     }
 
     // Called by BaseScraper when a scrape returned 0 jobs WITHOUT a
-    // positive confirmed-empty signal (the Plan 1A `noteZeroJobs?.()`
-    // seam). This is the metric an operator alerts on for silent blocks.
+    // positive confirmed-empty signal. This is the metric an operator alerts
+    // on for silent blocks.
     noteZeroJobs(platform) {
         this.#safe(() => this.zeroResultSessionsTotal.labels(platform).inc());
     }
 
-    // Called (in Plan 1B-pipeline) when an entire assignment had zero
-    // successful platforms. Defined here so the metric exists and is
-    // testable now; the call site lands with the orchestrator work.
+    // Called when an entire assignment has zero successful platforms.
     recordSessionAllFailed() {
         this.#safe(() => this.sessionsAllFailedTotal.inc());
     }

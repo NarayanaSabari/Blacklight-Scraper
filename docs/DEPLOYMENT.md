@@ -1,8 +1,7 @@
 # Blacklight Scraper — Production Deployment Runbook
 
 Pre-flight guide for pulling `main` into production and running it. All 6
-platforms are hardened (645 tests: 644 passing, with one known pre-existing
-failure). Read §2 (browsers) and §6
+platforms are hardened (648 tests: 648 passing). Read §2 (browsers) and §6
 (persistent state) carefully — the CloakBrowser binary download is the
 most-missed prerequisite.
 
@@ -21,13 +20,14 @@ most-missed prerequisite.
 
 LinkedIn now arms the registry's `strictEmpty`: permalinks arrive in the search
 payload, so a genuine empty result is distinguishable from a silent block.
-`SCRAPER_STRICT_EMPTY` remains a separate per-host environment flag.
+`SCRAPER_STRICT_EMPTY` remains the fallback environment flag for callers
+without a registry override.
 
 ---
 
 ## 2. Browser engine — CloakBrowser
 
-All browser-backed paths run on **CloakBrowser 0.5.2** (stealth Chromium) - one engine, fleet-wide. LinkedIn uses it for operator login, RSC template capture, and cached profile-cookie reads; its scrape requests are browserless. Glassdoor's API discovery additionally uses `node-tls-client`; its description enrichment uses CloakBrowser. TechFetch was migrated off playwright-extra so there's no longer a second active browser stack. Playwright's own Chromium is not used by any active scraper (the only remaining importer, `src/core/browser.js`, is dead code).
+All browser-backed paths run on **CloakBrowser 0.5.2** (stealth Chromium) - one engine, fleet-wide. LinkedIn uses it for operator login, RSC template capture, and cached profile-cookie reads; its scrape requests are browserless. Glassdoor's API discovery additionally uses `node-tls-client`; its description enrichment uses CloakBrowser. TechFetch was migrated off playwright-extra so there's no longer a second active browser stack. Playwright's own Chromium is not used by any active scraper.
 
 | Engine | Scrapers | How the binary is provisioned |
 |---|---|---|
@@ -57,7 +57,7 @@ node -e "import('cloakbrowser').then(async m => { const b = await m.launch({head
 ## 3. Host prerequisites
 
 ```bash
-node --version                  # must be v24.x
+node --version                  # must be v22.19.0 or newer
 npm ci                          # from lockfile — stale node_modules breaks startup
 # Browser-backed paths use CloakBrowser, which self-provisions on first launch —
 # pre-warm it per §2 (no `playwright install` needed).
@@ -113,8 +113,9 @@ Ephemeral container → volume-mount these. Otherwise: re-download the 350 MB br
 
 ## 7. Environment variables (optional; safe defaults)
 
-`PORT` (3001) · `NODE_ENV` (production) · `SCRAPER_MODE` (`daemon` = offline alerts) · `LOG_LEVEL` · `INSTANCE_ID` · `QUEUE_CHECK_INTERVAL_MS` (30000) · `PROXY_LIST` / `PROXY_LIST_FILE` · `PROXY_EXCLUDE_PLATFORMS` · `PROXY_BLOCK_COOLDOWN_MS` (600000) · `DICE_DETAIL_RENDER_WAIT_MS` (0) · `DICE_DETAIL_CONCURRENCY` (10) · `TECHFETCH_RETRY_BACKOFF_MS` (500) · `TECHFETCH_DETAIL_CONCURRENCY` (8) · `GLASSDOOR_FETCH_DESCRIPTIONS` (on) · `GLASSDOOR_DESC_CONCURRENCY` (6) · `INDEED_ALLOW_ANONYMOUS` (`1` = Indeed page-1 without a credential) · `LINKEDIN_RSC_COUNT` (10 by default, capped at 50 per request) · `LINKEDIN_RSC_COOKIE_TTL_MIN` (30 by default) · `LINKEDIN_RSC_TEMPLATE` (captured request-template path override) · `SCRAPER_DEFAULT_LOCATION` · CloakBrowser vars (§2).
-
+The complete variable reference, including LinkedIn profile and headless
+controls and proxy settings, is [`.env.example`](../.env.example).
+Host-oriented configuration is covered in [SETUP.md](SETUP.md), while
 CloakBrowser launch seats and licence-key configuration are maintained in the
 [session-seat section of the scraper runbook](scraper-runbook.md#cloakbrowser-session-seats).
 
@@ -127,7 +128,7 @@ CloakBrowser launch seats and licence-key configuration are maintained in the
 [ ] 2. npm ci
 [ ] 3. pre-warm CloakBrowser (§2 one-liner)     (browser-backed paths)
 [ ] 4. config/credentials.json → blacklight API filled in
-[ ] 5. persist the 5 paths in §6 (or volume-mount)
+[ ] 5. persist the paths in §6 (or volume-mount)
 [ ] 6. node server.js  →  curl localhost:3001/healthz  →  200 + gitSha matches deployed commit
 [ ] 7. log in to LinkedIn (headed — needs a display; on a headless host run on a
        workstation + copy the profile dir, or use VNC):

@@ -4,6 +4,9 @@
   "description": "Unified job scraper API for multiple platforms (Monster, Dice, TechFetch, LinkedIn, Glassdoor, Indeed)",
   "type": "module",
   "main": "server.js",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
     "start": "node server.js",
     "setup": "node server.js --setup",

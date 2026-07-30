@@ -10,7 +10,8 @@
 #
 # Original intent: committed so the metric↔alert contract is code-reviewable
 # and versioned (audit finding O4). These fire on the SILENT failure modes
-# Plan 1A/1B make observable: a scraper that returns 0 jobs without throwing,
+# represented by the scraper zero-result and nonzero-scrape metrics: a scraper
+# that returns 0 jobs without throwing,
 # or has not produced a job in hours, while scraper_up is still 1.
 groups:
   - name: scraper-anti-bot-durability

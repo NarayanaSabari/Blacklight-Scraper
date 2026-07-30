@@ -131,7 +131,7 @@ export async function runSetupWizard(deps = {}) {
         out('');
         out('      npm start');
         out('─────────────────────────────────────────────────────────────────────');
-        out('Setup complete. To run it as a managed service, see docs/MAC_SETUP.md or docs/WINDOWS_SETUP.md.');
+        out('Setup complete. To run it as a managed service, see docs/SETUP.md.');
         return 0;
     } catch (e) {
         if (e === CANCEL) return 1;

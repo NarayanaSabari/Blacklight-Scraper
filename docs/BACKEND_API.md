@@ -929,8 +929,6 @@ but at least one identifier is required; sending neither returns `400`.
 | `ziprecruiter` | None | No credentials needed |
 | `dice` | None | No credentials needed |
 
-> **Full Credentials API Documentation:** See [SCRAPER_CREDENTIALS_API.md](./SCRAPER_CREDENTIALS_API.md) for complete CRUD operations and admin endpoints.
-
 ---
 
 ## Important Notes
