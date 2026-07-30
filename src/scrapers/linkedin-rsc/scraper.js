@@ -18,21 +18,9 @@ import { normalizeJobData } from '../../core/normalize.js';
 import { pickSessionQuery, buildBooleanSearchQuery } from '../../core/linkedin-query.js';
 import { paginate as defaultPaginate, countPerRequest } from './client.js';
 import { getLinkedInRscSession } from './session.js';
+import { titleFromPost, locationFromPost, companyFromPost } from './post-fields.js';
 
 const log = createLogger('linkedin-rsc');
-
-const MAX_TITLE_CHARS = 200;
-
-// The post body has no separate title; LinkedIn posts do not have one. Take the
-// first meaningful line, bounded to the column width the importer expects.
-function titleFromText(text) {
-    const firstLine = String(text ?? '')
-        .split('\n')
-        .map((l) => l.trim())
-        .find((l) => l.length > 0) ?? '';
-    const candidate = firstLine || String(text ?? '').trim();
-    return candidate.slice(0, MAX_TITLE_CHARS) || 'LinkedIn Job Post';
-}
 
 // Author display names are not in this payload, only the profile handle. Present
 // it readably rather than inventing a company. LinkedIn post "company" was
@@ -55,9 +43,16 @@ function companyFromHandle(handle) {
 export function postToJob(post, location) {
     const text = post.text ?? '';
     const job = {
-        title: titleFromText(text),
-        company: companyFromHandle(post.author_handle),
-        location: location || '',
+        // A validated title or the neutral constant — never a slice of the body.
+        // See post-fields.js: raw first lines reached GlobalRole.aliases and
+        // mis-attributed roles in prod.
+        title: titleFromPost(text),
+        // Prefer a client the post actually names; otherwise the recruiter who
+        // posted it is the only party we genuinely know.
+        company: companyFromPost(text) ?? companyFromHandle(post.author_handle),
+        // The post's own location when stated, so a "Delhi Hybrid" post found by
+        // a "United States" search is not stored as United States.
+        location: locationFromPost(text, location),
         description: text,
         url: post.post_url,
         jobId: post.activity_id || post.post_url,
