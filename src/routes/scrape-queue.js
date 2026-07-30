@@ -24,9 +24,12 @@ export function registerScrapeQueueRoute(app, orchestrator) {
                     message: 'Queue run already in progress; skipped',
                 });
             }
-            if (result.error) {
-                return res.status(409).json({ success: false, error: result.error });
-            }
+            // SCR-26 (#409): a `result.error` branch used to sit here returning
+            // 409. `runOnce` never sets that key — it returns {skipped},
+            // {message}, or {batched, roles}. The `error` keys inside
+            // orchestrator.js are on the nested PER-PLATFORM result objects, not
+            // on runOnce's return value, so this was unreachable. A genuine
+            // throw is already handled by the catch below.
             if (result.message) {
                 return res.status(200).json({ success: true, message: result.message });
             }

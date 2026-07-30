@@ -230,11 +230,11 @@ Response:
 The scraper automatically:
 
 1. **Checks the Blacklight queue** every 30 seconds
-2. **Fetches the next role+location** to scrape
-3. **Scrapes all configured platforms** for that role
+2. **Fetches one or more role assignments** with allowlisted platforms
+3. **Scrapes each returned platform** for every assignment
 4. **Submits jobs to Blacklight** for matching
-5. **Completes the session** and triggers candidate matching
-6. **Repeats** for the next queue item
+5. **Completes each assignment's session** and triggers candidate matching
+6. **Repeats** for the next queue batch
 
 ### Queue Workflow
 
@@ -243,14 +243,13 @@ The scraper automatically:
 │                    AUTOMATIC WORKFLOW                        │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│  1. Check active session                                    │
-│  2. Get next role+location from queue                       │
-│  3. For each platform:                                      │
+│  1. Get role assignments from the queue                     │
+│  2. For each assignment and platform:                       │
 │     a. Get credentials (if needed)                          │
 │     b. Scrape jobs                                          │
 │     c. Submit to Blacklight                                 │
-│  4. Complete session → Trigger matching                     │
-│  5. Wait 30s → Repeat                                       │
+│  3. Complete each session → Trigger matching                │
+│  4. Wait 30s → Repeat                                       │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -539,11 +538,6 @@ detail enrichment; see the deployment-topology table at the top.
 - Wait for admin to add roles/locations
 - Or use manual `/scrape` endpoint
 
-### "Active session exists"
-- A scraping session is already in progress
-- Wait for it to complete or fail
-- Check session status in Blacklight admin panel
-
 ### "No credentials available"
 - No LinkedIn credentials in the backend pool
 - Add credentials via Blacklight admin panel
@@ -585,7 +579,7 @@ The scraper provides detailed console logs:
 - `202` - Accepted (async processing)
 - `400` - Bad Request (invalid parameters)
 - `404` - Not Found (invalid platform)
-- `409` - Conflict (active session exists)
+- `409` - Conflict (credential lease ownership conflict)
 - `500` - Internal Server Error
 
 ## 📚 API Documentation

@@ -1,26 +1,23 @@
 // Scraper Credentials Queue API client.
 //
-// Two APIs are exposed:
+// ONE API: lease-based, race-safe.
 //
-//  1. Legacy (platform-keyed) — DEPRECATED, kept only for callers
-//     outside scrapers/ that haven't migrated yet:
-//       const api = getCredentialsClient();
-//       const cred = await api.getCredential('linkedin');
-//       await api.reportSuccess('linkedin');
+//   const api = getCredentialsClient();
+//   const lease = await api.acquire('linkedin', sessionId);
+//   try { ... lease.credential ... await lease.reportSuccess('...') }
+//   catch (e) { await lease.reportFailure(e.message, cooldownMin) }
+//   finally { await lease.release() }
 //
-//  2. Lease-based (race-safe) — REQUIRED for production scrapers:
-//       const api = getCredentialsClient();
-//       const lease = await api.acquire('linkedin', sessionId);
-//       try { ... lease.credential ... await lease.reportSuccess('...') }
-//       catch (e) { await lease.reportFailure(e.message, cooldownMin) }
-//
-// All scrapers in scrapers/ (indeed, linkedin, techfetch) use the
-// lease-based API. The QueueOrchestrator runs platforms in PARALLEL
-// within an assignment AND fires multiple assignments concurrently, so
-// the legacy `reportSuccess('linkedin')` path is unsafe — its
-// latestByPlatform resolution gets overwritten by the second of any
-// pair of concurrent acquires for the same platform, causing
-// scrape-1's success report to release scrape-2's lease.
+// SCR-26 (#409): a second, platform-keyed API used to be exposed here
+// (`getCredential('linkedin')`, `getActiveCredential('linkedin')`, and a
+// `latestByPlatform` fallback that let any mutation be addressed by platform
+// name). It had zero callers and was unsafe by construction: the
+// QueueOrchestrator runs platforms in PARALLEL within an assignment AND fires
+// multiple assignments concurrently, so the second of any two concurrent
+// acquires for one platform overwrote the first — scrape-1's success report
+// would release scrape-2's lease. It has been removed rather than left
+// documented-as-unsafe, so the mistake is now impossible instead of merely
+// discouraged. Every mutation is addressed by its opaque leaseKey.
 
 import { requestWithRetry } from '../http/client.js';
 import { getConfig } from '../config/env.js';
@@ -73,10 +70,9 @@ export class CredentialsClient {
             'X-Scraper-API-Key': apiKey,
             'Content-Type': 'application/json',
         });
-        // Map<leaseKey, lease>
+        // Map<leaseKey, lease>. The ONLY lease index — see #resolveLease for why
+        // there is deliberately no per-platform one (SCR-26 / #409).
         this.leases = new Map();
-        // Legacy: per-platform pointer to the most recently issued lease.
-        this.latestByPlatform = new Map();
         this.nextNonce = 1;
     }
 
@@ -93,7 +89,6 @@ export class CredentialsClient {
         const leaseToken = data?.lease_token ?? null;
         const lease = { leaseKey, platform, id, data, sessionId, leaseToken, lost: false, released: false };
         this.leases.set(leaseKey, lease);
-        this.latestByPlatform.set(platform, leaseKey);
         return lease;
     }
 
@@ -109,21 +104,27 @@ export class CredentialsClient {
         return this.leases.has(leaseKey);
     }
 
-    #resolveLease(leaseKeyOrPlatform) {
-        if (!leaseKeyOrPlatform) return null;
-        // Direct leaseKey hit
-        if (this.leases.has(leaseKeyOrPlatform)) return this.leases.get(leaseKeyOrPlatform);
-        // Legacy platform name lookup
-        const key = this.latestByPlatform.get(leaseKeyOrPlatform);
-        return key ? this.leases.get(key) : null;
+    // Resolve a lease by its leaseKey. Lease-key ONLY, deliberately.
+    //
+    // SCR-26 (#409): this used to fall back to a `latestByPlatform` lookup so a
+    // bare platform name would resolve too. That fallback is the unsafe path
+    // this file's header warns about: the orchestrator runs platforms in
+    // parallel AND fires assignments concurrently, so the second of any two
+    // concurrent acquires for one platform overwrites the first, and
+    // scrape-1's success report would release scrape-2's lease.
+    //
+    // Its only entry points (`getCredential`, `getActiveCredential`) had zero
+    // callers, so the fallback is removed rather than left documented-but-live.
+    // A bare platform name now resolves to null and the caller gets an explicit
+    // `no_lease`, instead of silently mutating somebody else's lease.
+    #resolveLease(leaseKey) {
+        if (!leaseKey) return null;
+        return this.leases.get(leaseKey) ?? null;
     }
 
     #forgetLease(lease) {
         lease.released = true;
         this.leases.delete(lease.leaseKey);
-        if (this.latestByPlatform.get(lease.platform) === lease.leaseKey) {
-            this.latestByPlatform.delete(lease.platform);
-        }
     }
 
     // ----- remote HTTP helpers ---------------------------------------------
@@ -225,12 +226,13 @@ export class CredentialsClient {
         };
     }
 
-    // ----- legacy-compatible methods ---------------------------------------
-
-    async getCredential(platform, sessionId = null) {
-        const lease = await this.acquire(platform, sessionId);
-        return lease ? lease.credential : null;
-    }
+    // ----- lease-keyed mutation methods -------------------------------------
+    //
+    // SCR-26 (#409): `getCredential(platform)` lived here and had zero callers
+    // across src/, scrapers/ and test/. It was the entry point for the
+    // platform-keyed style this file's own header documents as unsafe under the
+    // current parallel model, so it is gone along with the fallback it relied on
+    // (see #resolveLease).
 
     async reportSuccess(leaseKeyOrPlatform, message = null, { release = true } = {}) {
         const lease = this.#resolveLease(leaseKeyOrPlatform);
@@ -389,10 +391,10 @@ export class CredentialsClient {
         }
     }
 
-    getActiveCredential(platform) {
-        const lease = this.#resolveLease(platform);
-        return lease ? lease.data : null;
-    }
+    // SCR-26 (#409): `getActiveCredential(platform)` was here. Zero callers, and
+    // it resolved by platform name — the unsafe style removed with #resolveLease's
+    // fallback. Use the object returned by `acquire()`; its `credential` getter is
+    // bound to one specific lease and cannot resolve to a sibling's.
 
     async releaseAll() {
         const keys = Array.from(this.leases.keys());

@@ -1,10 +1,10 @@
 // Queue orchestrator — the end-to-end Blacklight workflow:
 //
 //   1. Check for an active session (resume if found)
-//   2. Pull the next role off the queue (backend filters platforms by this
+//   2. Pull the next batch of assignments (backend filters platforms by this
 //      key's platform_allowlist, if set)
-//   3. For each returned platform: run scraper → format → submit jobs
-//   4. Complete the session — backend coordinates with sibling sessions
+//   3. For each assignment and returned platform: run scraper → format → submit jobs
+//   4. Complete each session — backend coordinates with sibling sessions
 //      (other scrapers handling different platforms for the same role)
 //      before finalizing role status + firing matching.
 //
@@ -271,7 +271,7 @@ export class QueueOrchestrator {
 
     /**
      * Run one assignment end-to-end: scrape every platform in parallel,
-     * then complete the session. Mirrors the old single-role flow.
+     * then complete the assignment's session.
      */
     async #runAssignment(assignment, metrics) {
         const { session_id: sessionId, role, platforms } = assignment;

@@ -34,10 +34,10 @@ X-Scraper-API-Key: your-api-key-here
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  1. GET /api/scraper/queue/next-role                                   │
-│     └── Returns: session_id, role, platforms[]                         │
+│     └── Returns: assignments[] (each has session_id, role, platforms[])│
 │        (platforms filtered by this key's platform_allowlist if set)    │
 │                                                                         │
-│  2. For each platform:                                                  │
+│  2. For each assignment and platform:                                   │
 │     a. If platform requires credentials (linkedin, glassdoor, etc.):   │
 │        GET /api/scraper-credentials/queue/{platform}/next              │
 │        └── Returns: credentials plus lease_token                       │
@@ -68,14 +68,13 @@ X-Scraper-API-Key: your-api-key-here
 
 ### 1. Get Next Role
 
-Fetch the next role from the queue to scrape.
+Fetch the next batch of work from the queue.
 
-**Important:** A scraper can only have ONE active session at a time. Complete or fail the current session before requesting a new one.
-
-The `platforms[]` returned is filtered to this API key's `platform_allowlist`
-(if set). Multiple scrapers can work the same role concurrently — each gets
-only its allowed platforms back. The role finalizes (and matching fires) only
-after all sibling sessions for that role complete.
+The response contains zero or more `assignments`. Each assignment has its own
+session and role, with `platforms[]` filtered to this API key's
+`platform_allowlist` (if set). Multiple scrapers can work the same role
+concurrently — each gets only its allowed platforms back. The role finalizes
+(and matching fires) only after all sibling sessions for that role complete.
 
 ```
 GET /api/scraper/queue/next-role
@@ -90,36 +89,28 @@ curl -X GET "https://api.qpeakhire.com/api/scraper/queue/next-role" \
 #### Success Response (200 OK)
 ```json
 {
-  "session_id": "9405a3de-904a-46dd-84fb-02464f872cb0",
-  "role": {
-    "id": 42,
-    "name": "DevOps Engineer",
-    "aliases": ["DevOps", "Site Reliability Engineer", "SRE"],
-    "category": "Engineering",
-    "candidate_count": 15
-  },
-  "platforms": [
-    { "id": 1, "name": "linkedin", "display_name": "LinkedIn" },
-    { "id": 2, "name": "indeed", "display_name": "Indeed" },
-    { "id": 3, "name": "monster", "display_name": "Monster" },
-    { "id": 4, "name": "glassdoor", "display_name": "Glassdoor" },
-    { "id": 5, "name": "techfetch", "display_name": "TechFetch" },
-    { "id": 6, "name": "dice", "display_name": "Dice" }
+  "assignments": [
+    {
+      "session_id": "9405a3de-904a-46dd-84fb-02464f872cb0",
+      "role": {
+        "id": 42,
+        "name": "DevOps Engineer",
+        "aliases": ["DevOps", "Site Reliability Engineer", "SRE"],
+        "category": "Engineering",
+        "candidate_count": 15
+      },
+      "platforms": [
+        { "id": 1, "name": "linkedin", "display_name": "LinkedIn" },
+        { "id": 2, "name": "indeed", "display_name": "Indeed" },
+        { "id": 3, "name": "monster", "display_name": "Monster" }
+      ]
+    }
   ]
 }
 ```
 
 #### Empty Queue Response (204 No Content)
 No body - queue is empty, nothing to scrape.
-
-#### Active Session Conflict (409 Conflict)
-```json
-{
-  "error": "Conflict",
-  "message": "Scraper already has an active session: 9405a3de-904a-46dd-84fb-02464f872cb0. Complete it before requesting a new role.",
-  "code": "ACTIVE_SESSION_EXISTS"
-}
-```
 
 ---
 
@@ -506,7 +497,7 @@ def heartbeat_credential(credential_id: int, lease_token: str):
 
 def scrape_jobs(default_location="United States"):
     while True:
-        # 1. Get next role (platforms filtered by this key's platform_allowlist)
+        # 1. Get the next batch (platforms filtered by this key's platform_allowlist)
         response = requests.get(
             f"{BASE_URL}/api/scraper/queue/next-role",
             headers=HEADERS
@@ -517,14 +508,13 @@ def scrape_jobs(default_location="United States"):
             time.sleep(60)
             continue
 
-        if response.status_code == 409:
-            print(f"Active session exists: {response.json()}")
-            break
-
         data = response.json()
-        session_id = data["session_id"]
-        role_name = data["role"]["name"]
-        platforms = data["platforms"]
+        # This example processes one assignment; repeat this block for every
+        # item in data["assignments"] in a production scraper.
+        assignment = data["assignments"][0]
+        session_id = assignment["session_id"]
+        role_name = assignment["role"]["name"]
+        platforms = assignment["platforms"]
         # The backend no longer drives location-specific scraping; pick a
         # sensible default for per-platform search URLs.
         location = default_location
@@ -945,7 +935,8 @@ but at least one identifier is required; sending neither returns `400`.
 
 ## Important Notes
 
-1. **One Session at a Time**: Each scraper can only have one active session. Complete or fail the current session before requesting a new one.
+1. **Assignments**: A queue poll may return multiple role assignments. Complete
+   each assignment's session independently before requesting more work.
 
 2. **Batch Processing**: Jobs are processed in batches of 20. Large submissions are automatically split.
 
@@ -974,5 +965,5 @@ but at least one identifier is required; sending neither returns `400`.
 | 400 | Bad Request (invalid input) |
 | 401 | Unauthorized (invalid API key) |
 | 404 | Not Found (session not found) |
-| 409 | Conflict (active session or lease ownership conflict) |
+| 409 | Conflict (credential lease ownership conflict) |
 | 500 | Internal Server Error |

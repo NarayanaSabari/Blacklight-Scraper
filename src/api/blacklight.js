@@ -57,9 +57,15 @@ export class BlacklightApiClient {
         }
 
         // 4xx non-retryable: surface a structured error.
-        if (response.status === 409) {
-            throw new NetworkError('Scraper already has an active session', { statusCode: 409 });
-        }
+        //
+        // SCR-26 (#409): there was a 409 special-case here claiming "Scraper
+        // already has an active session". None of this client's five endpoints
+        // can return 409 — the queue blueprint has no 409 at all, and the one
+        // credentials endpoint reached from here (queue/availability) only ever
+        // answers 200. Worse, the message described a single-active-session
+        // model that no longer holds (see #389), so the one thing the branch
+        // could do was misreport. An unexpected 409 now gets the accurate
+        // generic message below, which names the method, path and status.
         throw new NetworkError(
             `Blacklight ${method} ${path} → ${response.status} ${response.statusText}`,
             { statusCode: response.status },
