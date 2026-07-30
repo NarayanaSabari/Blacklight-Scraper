@@ -40,6 +40,143 @@ separate browser install. Pre-warm it once to get the download out of the way:
 node -e "import('cloakbrowser').then(m=>m.ensureBinary()).then(()=>console.log('ok'))"
 ```
 
+## 0. Remote access (if the host is not in front of you)
+
+Skip this if you are sitting at the machine. A residential scraper host usually
+lives somewhere else, so you need a way in that does **not** disturb the one
+thing that makes it valuable.
+
+> ### ⚠️ Never change the host's egress IP
+>
+> The whole point of a residential host is its residential IP: Indeed needs a
+> clean one, and LinkedIn's transport has no proxy support so it always exits on
+> the host's own address.
+>
+> On that machine: **no commercial VPN**, **no Tailscale exit node**, and no
+> accepted subnet routes that would carry its outbound traffic elsewhere. Plain
+> Tailscale only carries traffic *to* tailnet addresses; normal internet egress
+> stays on the home ISP, which is what you want.
+>
+> If scrapes start getting challenged right after a networking change, check
+> this first.
+
+### Why a mesh VPN rather than port forwarding
+
+A home connection is often behind **CGNAT**, where port forwarding is simply
+impossible. A mesh VPN (Tailscale, or equivalent) also avoids exposing SSH to
+the internet and avoids dynamic-DNS plumbing for a changing residential IP.
+
+Install it on the host and on your own machine, sign both into the same account,
+then confirm they can see each other:
+
+```bash
+tailscale status                       # both machines listed
+tailscale ping <host>                  # expect "pong ... via <ip>:port"
+```
+
+A `pong ... via <ip>:<port>` is a **direct** connection. `via DERP` means it is
+relaying through Tailscale's servers — still works, just slower.
+
+### Enable OpenSSH Server
+
+This is the one step that must be run **at the host** (or through whatever
+remote tool you used to install the mesh VPN). Afterwards you never need local
+access again. 🪟 PowerShell **as Administrator**:
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd
+Set-Service -Name sshd -StartupType Automatic
+
+# Land in PowerShell rather than cmd.exe
+New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell `
+  -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
+  -PropertyType String -Force
+```
+
+🐧🍎 `sshd` is already present; enable it (`systemctl enable --now ssh`, or
+System Settings → General → Sharing → Remote Login).
+
+### Key-based auth, and the Windows gotcha
+
+Generate a key on your own machine:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/scraper_host -C "me->scraper-host"
+cat ~/.ssh/scraper_host.pub
+```
+
+> 🪟 **If the Windows account is an administrator, `sshd` ignores
+> `~/.ssh/authorized_keys`.** It reads only
+> `C:\ProgramData\ssh\administrators_authorized_keys`, and it silently ignores
+> that file too unless its ACL is locked down. This is the single most common
+> reason key auth "just doesn't work".
+
+```powershell
+$akf = "C:\ProgramData\ssh\administrators_authorized_keys"
+Add-Content -Path $akf -Value "<paste your public key>"
+icacls $akf /inheritance:r
+icacls $akf /grant "Administrators:F" /grant "SYSTEM:F"
+```
+
+Then disable password auth in `C:\ProgramData\ssh\sshd_config`
+(`PasswordAuthentication no`, `PubkeyAuthentication yes`) and
+`Restart-Service sshd`. Diagnose failures with
+`Get-Content C:\ProgramData\ssh\logs\sshd.log`.
+
+Save a host entry on your own machine so it is one word thereafter:
+
+```
+Host scraper-host
+    HostName <tailnet-ip-or-name>
+    User <host-user>
+    IdentityFile ~/.ssh/scraper_host
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+```
+
+### You also need a desktop session
+
+SSH covers everything day to day — installing, running, logs, restarts. It does
+**not** cover the two one-time LinkedIn steps in §6, which open a real browser
+window: a GUI app cannot render into an SSH session.
+
+Enable remote desktop as well, and reach it **over the tailnet only** — never
+expose RDP to the internet:
+
+```powershell
+Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+  -Name fDenyTSConnections -Value 0
+Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+```
+
+### Stop the host sleeping
+
+A sleeping host silently stops scraping, and the failure looks like "no jobs"
+rather than an error.
+
+```powershell
+powercfg /change standby-timeout-ac 0     # 🪟
+powercfg /change hibernate-timeout-ac 0
+```
+
+🐧 `sudo systemctl mask sleep.target suspend.target`
+🍎 System Settings → Battery → Options → *Prevent sleeping when display is off*
+
+Also set the BIOS/UEFI to restore power state after an outage, so the host comes
+back on its own and the service (§8) restarts with it.
+
+### Verify before moving on
+
+From your own machine:
+
+```bash
+ssh scraper-host "node --version; git --version"
+```
+
+Both must satisfy the versions in Prerequisites. If `node` is missing or older
+than 22.19.0, install it now — the rest of this guide assumes it.
+
 ## 1. Clone and install
 
 ```bash
