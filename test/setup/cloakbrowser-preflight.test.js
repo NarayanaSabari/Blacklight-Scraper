@@ -270,3 +270,91 @@ test('no key anywhere DOES prompt', async () => {
     });
     assert.equal(asked, true);
 });
+
+// ---------------------------------------------- navigation verification
+//
+// The regression these guard: shipped preflight checked only that the binary
+// LAUNCHED. On the Windows host 2026-07-30 a licensed CloakBrowser launched fine
+// and then every navigation died with "Target page, context or browser has been
+// closed"; the same code without the key returned HTTP 200. The operator was
+// handed a browser that closed itself at the login page.
+
+test('verifyNavigation reports ok when a page loads', async () => {
+    const { verifyNavigation } = await import('../../src/setup/cloakbrowser-preflight.js');
+    const r = await verifyNavigation({ out: () => {}, deps: { navigationProbe: async () => ({ ok: true, status: 200 }) } });
+    assert.equal(r.status, 'ok');
+});
+
+test('verifyNavigation reports broken on the exact m1 failure', async () => {
+    const { verifyNavigation } = await import('../../src/setup/cloakbrowser-preflight.js');
+    const r = await verifyNavigation({
+        out: () => {},
+        deps: { navigationProbe: async () => { throw new Error('page.goto: Target page, context or browser has been closed'); } },
+    });
+    assert.equal(r.status, 'broken');
+    assert.match(r.detail, /has been closed/);
+});
+
+test('a key that breaks navigation is ROLLED BACK and re-verified', async () => {
+    const { cloakbrowserPreflight } = await import('../../src/setup/cloakbrowser-preflight.js');
+    let keyActive = false;
+    let rolled = false;
+    const calls = [];
+    const r = await cloakbrowserPreflight({
+        ask: fakeAsk('cb_6f3a91d2c4e57b8a0d1f2e3c4b5a6978'), env: {}, out: () => {},
+        deps: {
+            loadLicenseKeys: () => [],
+            readHomeLicenseKey: () => null,
+            isIgnored: () => true,
+            mkdirSync: () => {},
+            writeSecret: () => { keyActive = true; },
+            updateCloakBrowser: () => ({ status: 'current' }),
+            prewarmBinary: async () => ({ status: 'ready' }),
+            rollbackLicense: () => { rolled = true; keyActive = false; return true; },
+            // broken while the key is active, fine once rolled back
+            verifyNavigation: async () => {
+                calls.push(keyActive);
+                return keyActive ? { status: 'broken', detail: 'closed' } : { status: 'ok', detail: 'HTTP 200' };
+            },
+        },
+    });
+    assert.equal(rolled, true, 'must roll the key back');
+    assert.equal(r.rolledBack, true);
+    assert.equal(r.navigation.status, 'ok', 'must re-verify after rollback and report the recovered state');
+    assert.deepEqual(calls, [true, false], 'verified once with the key, once without');
+});
+
+test('a PRE-EXISTING key is never rolled back — we did not apply it', async () => {
+    const { cloakbrowserPreflight } = await import('../../src/setup/cloakbrowser-preflight.js');
+    let rolled = false;
+    const r = await cloakbrowserPreflight({
+        ask: fakeAsk(''), env: {}, out: () => {},
+        deps: {
+            loadLicenseKeys: () => ['pre-existing'],
+            updateCloakBrowser: () => ({ status: 'current' }),
+            prewarmBinary: async () => ({ status: 'ready' }),
+            rollbackLicense: () => { rolled = true; return true; },
+            verifyNavigation: async () => ({ status: 'broken', detail: 'closed' }),
+        },
+    });
+    assert.equal(rolled, false, 'only a key applied in THIS run may be rolled back');
+    assert.equal(r.navigation.status, 'broken', 'but the breakage is still reported');
+});
+
+test('working navigation never triggers a rollback', async () => {
+    const { cloakbrowserPreflight } = await import('../../src/setup/cloakbrowser-preflight.js');
+    let rolled = false;
+    const r = await cloakbrowserPreflight({
+        ask: fakeAsk('cb_6f3a91d2c4e57b8a0d1f2e3c4b5a6978'), env: {}, out: () => {},
+        deps: {
+            loadLicenseKeys: () => [], readHomeLicenseKey: () => null, isIgnored: () => true,
+            mkdirSync: () => {}, writeSecret: () => {},
+            updateCloakBrowser: () => ({ status: 'current' }),
+            prewarmBinary: async () => ({ status: 'ready' }),
+            rollbackLicense: () => { rolled = true; return true; },
+            verifyNavigation: async () => ({ status: 'ok', detail: 'HTTP 200' }),
+        },
+    });
+    assert.equal(rolled, false);
+    assert.equal(r.navigation.status, 'ok');
+});

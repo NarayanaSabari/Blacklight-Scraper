@@ -243,14 +243,98 @@ export async function prewarmBinary({ out = console.log, deps = {} } = {}) {
 }
 
 /**
+ * Can the configured browser actually LOAD A PAGE?
+ *
+ * A launch check is not enough. Measured on the Windows host 2026-07-30: with a
+ * licence key configured, CloakBrowser launched fine and then every navigation
+ * died with "Target page, context or browser has been closed"; without the key
+ * the same code on the same profile returned HTTP 200. A launch-only preflight
+ * called that healthy and handed the operator a browser that closes itself the
+ * instant it reaches the login page.
+ *
+ * Uses example.com, not linkedin.com: this must answer "is the browser usable",
+ * and pointing an unproven browser at the very site we are about to log into
+ * spends that site's goodwill on a self-test.
+ */
+export async function verifyNavigation({ out = console.log, deps = {} } = {}) {
+    const probe = deps.navigationProbe ?? (async () => {
+        const { launch } = await import('../core/browser-pool.js');
+        const browser = await launch({ headless: true });
+        try {
+            const page = await browser.newPage();
+            const resp = await page.goto('https://example.com', {
+                waitUntil: 'domcontentloaded', timeout: 30000,
+            });
+            return { ok: Boolean(resp), status: resp?.status() ?? null };
+        } finally {
+            await browser.close().catch(() => {});
+        }
+    });
+    try {
+        out('  Verifying the browser can load a page...');
+        const r = await probe();
+        if (r?.ok) {
+            out('  ✓ Navigation works.');
+            return { status: 'ok', detail: `HTTP ${r.status}` };
+        }
+        out('  ✗ Navigation returned no response.');
+        return { status: 'broken', detail: 'no response' };
+    } catch (e) {
+        const detail = e?.message ?? String(e);
+        out(`  ✗ Navigation FAILED: ${detail}`);
+        return { status: 'broken', detail };
+    }
+}
+
+/**
  * Full preflight. Licence FIRST — an update should be installed and then run
  * licensed, and the key is what unlocks the current binary in the first place.
+ *
+ * Then PROVE the result works. If a licence key was applied in this run and the
+ * browser cannot navigate afterwards, the key is rolled back: an unlicensed
+ * browser that works beats a licensed one that cannot open a page. The
+ * alternative is what shipped first — silently handing back a dead browser.
  */
 export async function cloakbrowserPreflight({ ask, env = process.env, cwd = process.cwd(), out = console.log, deps = {} } = {}) {
     out('CloakBrowser preflight');
     const license = await ensureLicenseKey({ ask, env, cwd, out, deps });
     const update = (deps.updateCloakBrowser ?? updateCloakBrowser)({ cwd, out, deps });
     const binary = await (deps.prewarmBinary ?? prewarmBinary)({ out, deps });
+    let navigation = await (deps.verifyNavigation ?? verifyNavigation)({ out, deps });
+
+    let rolledBack = false;
+    if (navigation.status === 'broken' && (license.status === 'saved' || license.status === 'saved-transient')) {
+        out('  The licence key applied in this run appears to break navigation on this host.');
+        out('  Rolling it back — a working unlicensed browser beats a licensed one that cannot navigate.');
+        const rollback = deps.rollbackLicense ?? defaultRollbackLicense;
+        rolledBack = rollback({ cwd, env, out });
+        if (rolledBack) {
+            navigation = await (deps.verifyNavigation ?? verifyNavigation)({ out, deps });
+            if (navigation.status === 'ok') {
+                out(`  ✓ Recovered without the licence key. It is parked at ${KEYS_FILE}${DISABLED_SUFFIX}`);
+            } else {
+                out('  ⚠️ Still cannot navigate without the key — the problem is elsewhere.');
+            }
+        }
+    }
+    if (navigation.status === 'broken') {
+        out('  ⚠️ The browser cannot load a page. The login will open a window that closes itself.');
+    }
     out('');
-    return { license, update, binary };
+    return { license, update, binary, navigation, rolledBack };
+}
+
+export const DISABLED_SUFFIX = '.disabled-breaks-navigation';
+
+/** Park the key we just wrote, and unset it for this process. */
+function defaultRollbackLicense({ cwd = process.cwd(), env = process.env, out = console.log } = {}) {
+    try {
+        const target = path.join(cwd, KEYS_FILE);
+        if (fs.existsSync(target)) fs.renameSync(target, target + DISABLED_SUFFIX);
+        delete env.CLOAKBROWSER_LICENSE_KEYS;
+        return true;
+    } catch (e) {
+        out(`  ⚠️ Could not roll back the licence key (${e?.code ?? e?.message}).`);
+        return false;
+    }
 }
