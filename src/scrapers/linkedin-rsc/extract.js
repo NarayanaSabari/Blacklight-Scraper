@@ -163,19 +163,38 @@ export function extractPosts(body) {
     // second walk and a second copy of every row string.
     const rowText = rawRowText(raw);
 
-    // One card per permalink: the duplicate render is dropped BEFORE reference
-    // counting, otherwise every commentary row looks like a shared component
-    // (both copies reference it) and gets skipped.
-    const cardByUrl = new Map();
-    for (const [id, text] of rowText) {
-        if (!CARD_RE.test(text)) continue;
-        const url = (text.match(PERMALINK_RE) || [])[0];
-        if (url && !cardByUrl.has(url)) cardByUrl.set(url, id);
-    }
-
     const refsOf = (id) => [...new Set(
         [...(rowText.get(id) ?? '').matchAll(REF_G)].map((m) => m[1]),
     )];
+
+    // One card per permalink: the duplicate render is dropped BEFORE reference
+    // counting, otherwise every commentary row looks like a shared component
+    // (both copies reference it) and gets skipped.
+    //
+    // The permalink is NOT always inside the card row. LinkedIn renders the same
+    // search in two shapes, and both occur in captured fixtures:
+    //
+    //   inline — the card row carries the permalink itself
+    //   shell  — the card row is a ~3KB skeleton that REFERENCES a large content
+    //            row holding the permalink
+    //
+    // Measured on the Windows host 2026-07-31: all 10 cards in a live payload were
+    // the shell shape (card row 3017 bytes -> referenced row ~381KB with the
+    // permalink), so an inline-only lookup found 0 permalinks, built an empty
+    // cardByUrl and returned 0 posts from a payload that plainly contained 12 of
+    // them. Look inline first, then one level into the card's own references.
+    const cardByUrl = new Map();
+    for (const [id, text] of rowText) {
+        if (!CARD_RE.test(text)) continue;
+        let url = (text.match(PERMALINK_RE) || [])[0];
+        if (!url) {
+            for (const ref of refsOf(id)) {
+                const found = (rowText.get(ref) ?? '').match(PERMALINK_RE);
+                if (found) { url = found[0]; break; }
+            }
+        }
+        if (url && !cardByUrl.has(url)) cardByUrl.set(url, id);
+    }
 
     // Rows referenced by more than one card are shared layout components; taking
     // their text would leak one post's content into another.

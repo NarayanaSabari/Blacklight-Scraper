@@ -199,3 +199,33 @@ test('isConfirmedEmpty: false when LinkedIn reports HasNoresults=false', () => {
     // its VALUE would wrongly call it a confirmed empty.
     assert.equal(isConfirmedEmpty(readFixture('linkedin-rsc-group-post.txt')), false);
 });
+
+// Regression: LinkedIn renders search results in TWO card shapes and only one
+// was handled. Measured on the Windows host 2026-07-31 against a live payload:
+// all 10 cards were the "shell" shape — a ~3KB skeleton row that REFERENCES a
+// ~381KB content row holding the permalink. The inline-only lookup found 0
+// permalinks, so cardByUrl was empty and extractPosts returned 0 posts from a
+// 7.4MB payload that contained 12 of them. That surfaced as
+// "0 jobs with no confirmed-empty signal - suspected block", i.e. it looked like
+// LinkedIn was blocking us when the request had in fact returned HTTP 200 with
+// the data present.
+test('extracts a SHELL card whose permalink lives in a referenced row', () => {
+    const body = readFixture('linkedin-rsc-shell-card.txt');
+    const posts = extractPosts(body);
+    assert.equal(posts.length, 1, 'shell-shaped card must not be dropped');
+    assert.match(posts[0].post_url, /linkedin\.com\/posts\//);
+    // Text is deliberately NOT asserted here. The fixture is trimmed to the card
+    // row plus the one row carrying the permalink, so the rows that hold the post
+    // body are absent by construction. This fixture proves permalink RESOLUTION
+    // through a reference; text collection is covered by the full-payload tests.
+});
+
+test('the shell card row itself carries no permalink (guards the fixture)', () => {
+    const body = readFixture('linkedin-rsc-shell-card.txt');
+    const cardLine = body.split('\n').find((l) => /componentkey":"expanded[^"]*FeedType_FLAGSHIP_SEARCH/.test(l));
+    assert.ok(cardLine, 'fixture must contain a card row');
+    assert.ok(
+        !/linkedin\.com\/posts\//.test(cardLine),
+        'fixture would not exercise the reference path if the card had an inline permalink',
+    );
+});
