@@ -526,6 +526,7 @@ a zero.
 
 ## Related
 
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — symptom-first diagnosis for a host that is already running (blocks that are not blocks, dead sessions, seat exhaustion, dedup)
 - [DEPLOYMENT.md](DEPLOYMENT.md) — per-platform behaviour, observability, prod topology
 - [scraper-runbook.md](scraper-runbook.md) — performance knobs, CloakBrowser seats
 - [BACKEND_API.md](BACKEND_API.md) — the backend API this scraper talks to

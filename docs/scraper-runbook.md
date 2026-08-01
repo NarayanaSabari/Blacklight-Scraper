@@ -159,3 +159,8 @@ with a one-session limit, so extra concurrency means extra keys (or a paid plan)
 6. Verify: hit `/healthz` and run one scrape per platform.
 
 The anti-bot research that motivated these knobs is in the repository's git history.
+
+When a running host misbehaves, start from [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+It is organised by symptom and covers the failures that look like something they are not:
+a parser gap reported as a block, a dead session reported as a confirmed-empty result, and
+licence-seat exhaustion reported as a broken browser.

@@ -164,3 +164,6 @@ CloakBrowser launch seats and licence-key configuration are maintained in the
 | `GET /metrics` | Prometheus — `scraper_url_quality_total`, block/cooldown counters, per-platform success |
 
 Watch `scraper_url_quality_total{quality="empty"|"profile_in"}` and the `BlockedError` counters - a rise means a parser drifted or an IP got flagged.
+
+For diagnosing a live host rather than deploying one, see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md).
