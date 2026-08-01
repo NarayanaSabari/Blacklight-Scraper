@@ -223,19 +223,36 @@
     
     "recruiter": {
       "type": "object",
-      "description": "Recruiter information (if applicable)",
+      "description": "Recruiter or post-author information (if applicable)",
       "properties": {
         "name": {
-          "type": "string",
-          "description": "Recruiter name (Dice)"
+          "type": ["string", "null"],
+          "description": "Recruiter or post-author name"
+        },
+        "title": {
+          "type": ["string", "null"],
+          "description": "Recruiter title"
         },
         "company": {
-          "type": "string",
+          "type": ["string", "null"],
           "description": "Recruiting company"
         },
-        "contact": {
-          "type": "string",
-          "description": "Recruiter contact info"
+        "profileUrl": {
+          "type": ["string", "null"],
+          "format": "uri",
+          "description": "Recruiter or post-author profile URL"
+        },
+        "emails": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {"type": "string", "maxLength": 254},
+          "description": "Extracted recruiter email addresses"
+        },
+        "phones": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {"type": "string", "maxLength": 254},
+          "description": "Extracted recruiter phone numbers"
         }
       }
     },

@@ -78,6 +78,28 @@ function slugifyEnum(value) {
     return String(value).toLowerCase().replace(/[\s-]/g, '_');
 }
 
+// Post bodies are attacker-controlled public text: cap and sanitise recruiter
+// contacts here, at the wire boundary, so a post stuffed with addresses can't
+// become a wall of contacts downstream.
+const MAX_CONTACTS = 5;
+const MAX_CONTACT_LENGTH = 254;
+
+function sanitizeContactList(values, { lowercase = false } = {}) {
+    const seen = new Set();
+    const out = [];
+    for (const raw of values ?? []) {
+        if (typeof raw !== 'string') continue;
+        let value = raw.trim().slice(0, MAX_CONTACT_LENGTH);
+        if (!value) continue;
+        if (lowercase) value = value.toLowerCase();
+        if (seen.has(value)) continue;
+        seen.add(value);
+        out.push(value);
+        if (out.length >= MAX_CONTACTS) break;
+    }
+    return out;
+}
+
 export function formatJobForBlacklight(job, platform) {
     // Accept both nested (normalized) and flat scraper output.
     const jobData = job.job ?? job;
@@ -128,6 +150,20 @@ export function formatJobForBlacklight(job, platform) {
         typeof location === 'string' && location.toLowerCase().includes('remote');
     const isRemote = locationData.remote ?? job.is_remote ?? job.isRemote ?? locationIsRemoteString ?? false;
     if (isRemote === true) formatted.is_remote = true;
+
+    const recruiterData = job.recruiter ?? null;
+    if (recruiterData) {
+        const emails = sanitizeContactList(recruiterData.emails, { lowercase: true });
+        const phones = sanitizeContactList(recruiterData.phones);
+        if (emails.length || phones.length) {
+            formatted.recruiter = {
+                name: recruiterData.name ?? null,
+                profile_url: recruiterData.profileUrl ?? null,
+                emails,
+                phones,
+            };
+        }
+    }
 
     return formatted;
 }

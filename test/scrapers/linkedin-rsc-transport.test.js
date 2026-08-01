@@ -1,6 +1,6 @@
 // The LinkedIn RSC scraper as the orchestrator sees it: same signature and
-// return contract as the DOM scraper, so BaseScraper and formatJobForBlacklight
-// need no changes.
+// return contract as the DOM scraper. The formatter carries recruiter contacts
+// through to the backend payload.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -57,10 +57,27 @@ test('postToJob: the wire record carries the permalink, body and posted date', (
     assert.match(wire.posted_date, /^2026-07-28/);
 });
 
-test('postToJob: recruiter contact details are preserved', () => {
+test('postToJob: recruiter contact details are preserved, emails and phones separate', () => {
     // The DOM scraper discards these entirely; they are the point of the rebuild.
     const job = postToJob(POST, 'United States');
-    assert.deepEqual(job.recruiter.contact, ['naren@caritatech.com']);
+    assert.deepEqual(job.recruiter.emails, ['naren@caritatech.com']);
+    assert.deepEqual(job.recruiter.phones, []);
+});
+
+test('postToJob → formatJobForBlacklight: recruiter emails/phones reach the wire payload', () => {
+    const wire = formatJobForBlacklight(postToJob(POST, 'United States'), 'linkedin');
+    assert.deepEqual(wire.recruiter, {
+        name: 'B Naren',
+        profile_url: null,
+        emails: ['naren@caritatech.com'],
+        phones: [],
+    });
+});
+
+test('postToJob → formatJobForBlacklight: no recruiter key when a post has no contacts', () => {
+    const noContact = { ...POST, contact_emails: [], contact_phones: [] };
+    const wire = formatJobForBlacklight(postToJob(noContact, 'United States'), 'linkedin');
+    assert.equal('recruiter' in wire, false);
 });
 
 test('postToJob: title is derived from the body and stays within the column bound', () => {

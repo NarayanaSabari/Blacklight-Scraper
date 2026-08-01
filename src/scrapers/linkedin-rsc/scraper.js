@@ -1,7 +1,8 @@
 // LinkedIn scraper, RSC transport.
 //
 // Same signature and return contract as the former LinkedIn scraper, so
-// BaseScraper, the orchestrator and formatJobForBlacklight need no changes.
+// BaseScraper and the orchestrator need no changes. The formatter carries the
+// captured recruiter contacts through to the backend wire payload.
 //
 // What differs from the DOM path:
 //   • no scrolling, no per-post "Copy link" clipboard interaction — permalinks
@@ -63,12 +64,14 @@ export function postToJob(post, location) {
         hashtags: post.hashtags,
     };
     if (post.posted_at) job.postedDate = post.posted_at;
-    const contact = [...(post.contact_emails ?? []), ...(post.contact_phones ?? [])];
-    if (contact.length) {
+    const emails = post.contact_emails ?? [];
+    const phones = post.contact_phones ?? [];
+    if (emails.length || phones.length) {
         job.recruiter = {
             name: companyFromHandle(post.author_handle),
             profileUrl: post.author_profile ?? null,
-            contact,
+            emails,
+            phones,
         };
     }
     return normalizeJobData(job, 'LinkedIn');

@@ -208,7 +208,8 @@ export function normalizeJobData(job, platform) {
                 title: job.recruiter.title ?? null,
                 company: job.recruiter.company ?? null,
                 profileUrl: job.recruiter.profileUrl ?? null,
-                contact: job.recruiter.contact ?? null,
+                emails: job.recruiter.emails ?? [],
+                phones: job.recruiter.phones ?? [],
             }
             : null,
         social: (job.postId ?? job.activityUrn)

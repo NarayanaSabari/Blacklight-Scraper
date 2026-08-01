@@ -191,7 +191,13 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper/que
         "job_type": "full_time",
         "experience_level": "senior",
         "posted_date": "2026-01-10",
-        "is_remote": false
+        "is_remote": false,
+        "recruiter": {
+          "name": "Jane Doe",
+          "profile_url": "https://www.linkedin.com/in/jane-doe",
+          "emails": ["jane@example.com"],
+          "phones": ["+1 555 0100"]
+        }
       },
       {
         "platform_job_id": "3847291057",
@@ -224,6 +230,13 @@ curl -X POST "https://blacklight-backend-kko63bb3aa-el.a.run.app/api/scraper/que
 | `experience_level` | string | No | entry, mid, senior, executive |
 | `posted_date` | string | No | Date posted (YYYY-MM-DD) |
 | `is_remote` | boolean | No | Whether the job is remote |
+
+LinkedIn jobs may include an optional `recruiter` object when contacts are
+extracted from the post body. Its `emails` and `phones` arrays are kept
+separate, trimmed, deduplicated, and capped at five entries each; email values
+are lowercased. Existing rows are not backfilled, so this field is forward-only.
+The portal displays these contacts on the job detail page and uses the first
+email for the existing compose flow; the field is not searchable or exportable.
 
 #### Success Response (202 Accepted)
 ```json

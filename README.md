@@ -433,6 +433,10 @@ Jobs are scraped and normalized to this format before submission:
 
 See `schemas/master-schema.json` for complete schema details.
 
+The optional LinkedIn recruiter contact field in the queue payload is documented
+in [the backend API reference](docs/BACKEND_API.md#job-object-schema). It is
+forward-only for newly scraped posts and is not used for job search or export.
+
 ## 🔐 Credential Management
 
 All per-platform credentials are managed through the central dashboard
