@@ -354,6 +354,21 @@ export class LicensePool {
             waiting: this._waiters.length,
         };
     }
+
+    // Read-only detail for the control panel. `leasedKeys` reports the key
+    // string for each busy seat ('implicit' for the no-key fallback seat) —
+    // never the key material itself beyond what's already in config, and
+    // this process only ever holds the keys it was configured with.
+    snapshot() {
+        const leasedSeats = this._seats.filter((s) => s.busy);
+        return {
+            total: this._seats.length,
+            leased: leasedSeats.length,
+            free: this._seats.length - leasedSeats.length,
+            waiting: this._waiters.length,
+            leasedKeys: leasedSeats.map((s) => (s.key === null ? 'implicit' : s.key)),
+        };
+    }
 }
 
 let _singleton = null;

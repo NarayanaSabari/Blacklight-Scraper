@@ -60,6 +60,21 @@ test('no keys configured still yields ONE seat carrying a null key', async () =>
     assert.deepEqual(pool.stats(), { seats: 1, inUse: 1, waiting: 0 });
 });
 
+test('snapshot: read-only detail for the control panel — total/leased/free/leasedKeys', async () => {
+    const pool = new LicensePool(['k1', 'k2'], { locking: false });
+    assert.deepEqual(pool.snapshot(), { total: 2, leased: 0, free: 2, waiting: 0, leasedKeys: [] });
+    const a = await pool.acquire();
+    assert.deepEqual(pool.snapshot(), { total: 2, leased: 1, free: 1, waiting: 0, leasedKeys: [a.key] });
+    a.release();
+    assert.deepEqual(pool.snapshot(), { total: 2, leased: 0, free: 2, waiting: 0, leasedKeys: [] });
+});
+
+test('snapshot: the no-key implicit seat reports as "implicit", not null', async () => {
+    const pool = new LicensePool([], { locking: false });
+    await pool.acquire();
+    assert.deepEqual(pool.snapshot().leasedKeys, ['implicit']);
+});
+
 test('acquire hands out each key once, then queues until a seat frees', async () => {
     const pool = new LicensePool(['k1', 'k2'], { locking: false });
     const a = await pool.acquire();

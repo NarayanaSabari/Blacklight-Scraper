@@ -33,6 +33,14 @@ import { registerHealthRoute } from './src/routes/health.js';
 import { registerScrapeRoute } from './src/routes/scrape.js';
 import { registerScrapeQueueRoute } from './src/routes/scrape-queue.js';
 import { registerMetricsRoute } from './src/routes/metrics.js';
+import { registerPanelRoutes } from './src/panel/router.js';
+import { LinkedInLoginController } from './src/panel/linkedin-login-controller.js';
+import { getLicensePool } from './src/core/license-pool.js';
+import { getProxyPool } from './src/core/proxy-pool.js';
+import { cooldownSnapshot } from './src/core/platform-cooldowns.js';
+import { spoolSnapshot } from './src/core/submit-spool.js';
+import { getPlatformOverrides } from './src/panel/overrides.js';
+import * as recentSubmissions from './src/panel/recent.js';
 
 const log = createLogger('server');
 
@@ -123,6 +131,27 @@ async function main() {
     registerScrapeRoute(app);
     registerScrapeQueueRoute(app, orchestrator);
 
+    // requestRestart is filled in below, once `shutdown` exists — the panel
+    // route needs to be registered here (per the route-registration block
+    // above) but must reuse the SAME graceful shutdown path SIGINT/SIGTERM
+    // use, which isn't defined until after `server` exists. A mutable box
+    // avoids exporting `shutdown` as a global.
+    let shutdownFn = null;
+    const loginController = new LinkedInLoginController({ orchestrator, licensePool: getLicensePool() });
+    registerPanelRoutes(app, {
+        orchestrator,
+        bootInfo,
+        getLinkedInSession: getLinkedInRscSession,
+        licensePool: getLicensePool(),
+        proxyPool: getProxyPool(),
+        cooldownSnapshot,
+        spoolSnapshot,
+        overrides: getPlatformOverrides(),
+        recent: recentSubmissions,
+        loginController,
+        requestRestart: () => shutdownFn?.('panel-restart'),
+    });
+
     const server = app.listen(config.port, () => {
         log.info('Server listening', { port: config.port, ...bootInfo });
         if (orchestrator) orchestrator.startAutoChecker();
@@ -171,6 +200,12 @@ async function main() {
             ['loki', telemetry.lokiTransport.stop({ finalFlush: true })],
             ['linkedin-session', getLinkedInRscSession().shutdown()],
             ['credentials', getCredentialsClient().releaseAll()],
+            // Bulletproof seat release: if a panel-driven LinkedIn login was
+            // left open (browser waiting on the operator) when this process
+            // is asked to exit, cancel() closes it — browser-pool.js's
+            // close() wrapper releases the CloakBrowser seat as part of
+            // that, so a shutdown mid-login can never strand it.
+            ['panel-linkedin-login', loginController.cancel()],
         ];
         for (const [label, promise] of steps) {
             try { await withTimeout(label, promise); }
@@ -182,6 +217,7 @@ async function main() {
             process.exit(exitCodeFor(shutdownReason));
         });
     };
+    shutdownFn = shutdown;
 
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));

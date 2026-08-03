@@ -153,6 +153,24 @@ export class ProxyPool {
         const cooled = [...this._cooledUntil.values()].filter((u) => u > this._now()).length;
         return { total: this.size, cooled, healthy: this.size - cooled };
     }
+
+    // Read-only detail for the control panel. There's no exclusive "lease"
+    // state on a proxy the way there is on a license seat — acquire() just
+    // round-robins — so `leased` here means "currently the last-assigned IP
+    // for some platform", a best-effort signal, not an exclusive hold.
+    snapshot() {
+        const now = this._now();
+        const cooling = [];
+        for (const p of this._proxies) {
+            const until = this._cooledUntil.get(p.id);
+            if (until && until > now) cooling.push({ id: p.id, until: new Date(until).toISOString() });
+        }
+        return {
+            total: this._proxies.length,
+            leased: this._lastByPlatform.size,
+            cooling,
+        };
+    }
 }
 
 let _singleton = null;

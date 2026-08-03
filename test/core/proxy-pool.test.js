@@ -80,3 +80,18 @@ test('all cooled → reuses soonest-recovering rather than returning null', () =
     const got = pool.acquire('c');
     assert.ok(got && got.server, 'still returns a proxy when all cooled');
 });
+
+test('snapshot: read-only detail for the control panel — total/leased/cooling', () => {
+    let t = 0;
+    const pool = new ProxyPool(P(2), { cooldownMs: 1000, now: () => t });
+    assert.deepEqual(pool.snapshot(), { total: 2, leased: 0, cooling: [] });
+    pool.acquire('dice');
+    pool.reportBlocked('dice');
+    const snap = pool.snapshot();
+    assert.equal(snap.total, 2);
+    assert.equal(snap.leased, 1);
+    assert.equal(snap.cooling.length, 1);
+    assert.equal(snap.cooling[0].id, 'ip0');
+    t += 1500; // cooldown expired
+    assert.deepEqual(pool.snapshot().cooling, []);
+});

@@ -34,3 +34,30 @@ export function platformsOnCooldown(now = new Date(), modules = MODULES) {
     }
     return cooled;
 }
+
+// Read-only per-platform detail, for the control panel: which platforms are
+// cooled down right now and until when. Same failure-isolation as
+// platformsOnCooldown — a read error resolves to "not cooled" rather than
+// throwing, since this is a display accessor, not the claim gate.
+export function cooldownSnapshot(now = new Date(), modules = MODULES) {
+    const out = {};
+    for (const [platform, mod] of Object.entries(modules)) {
+        try {
+            const marker = mod.readCooldownMarker({
+                readFile: mod.defaultReadFile(),
+                now,
+                path: mod.cooldownPath(),
+            });
+            const onCooldown = mod.isOnCooldown(marker, now);
+            out[platform] = {
+                onCooldown,
+                until: onCooldown && marker?.blockedUntil instanceof Date
+                    ? marker.blockedUntil.toISOString()
+                    : null,
+            };
+        } catch {
+            out[platform] = { onCooldown: false, until: null };
+        }
+    }
+    return out;
+}

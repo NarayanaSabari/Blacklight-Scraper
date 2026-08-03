@@ -273,3 +273,73 @@ test('SCR-10: cooldown filter still applies on the happy path (pre-flight succee
     assert.deepEqual(requestedPlatforms, ['indeed']);
     assert.ok(!m.calls.queueCheck.includes('preflight_failed'), 'happy path should not record a preflight_failed check');
 });
+
+test('platformOverrides: a locally-paused platform is excluded from the claim, same as a cooldown', async () => {
+    let requestedPlatforms;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => ({ indeed: 1, glassdoor: 1 }),
+        getNextRole: async ({ platforms }) => { requestedPlatforms = platforms; return { assignments: [] }; },
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: fakeMetrics(),
+        platformOverrides: { pausedList: () => ['glassdoor'] },
+    });
+    await o.runOnce();
+    assert.deepEqual(requestedPlatforms, ['indeed']);
+});
+
+test('snapshot: reports poll state — not running before startAutoChecker, mutex reflects an in-flight claim', async () => {
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1000, startupDelayMs: 1 },
+        client: fakeClient(),
+        metrics: fakeMetrics(),
+    });
+    assert.equal(o.snapshot().running, false);
+    assert.equal(o.snapshot().mutexLocked, false);
+    await o.runOnce();
+    assert.equal(o.snapshot().lastPollOutcome, 'empty');
+    assert.equal(typeof o.snapshot().lastPollAt, 'string');
+});
+
+test('snapshot: an assignment in flight shows up as an active session, then clears on completion', async () => {
+    let releaseScraper;
+    const gate = new Promise((resolve) => { releaseScraper = resolve; });
+    let claimed = false;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => ({ indeed: 1 }),
+        getNextRole: async () => {
+            if (claimed) return { assignments: [] }; // only claim once — avoid an infinite re-poll loop
+            claimed = true;
+            return {
+                assignments: [{
+                    session_id: 'sess-SNAP',
+                    role: { name: 'Backend Engineer', search_queries: null },
+                    platforms: [{ id: 1, name: 'indeed' }],
+                }],
+            };
+        },
+    });
+    const resolver = () => ({
+        executeWithMeta: async () => { await gate; return { jobs: [], emptyConfirmed: true }; },
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: fakeMetrics(),
+        scraperResolver: resolver,
+    });
+    await o.runOnce();
+    await new Promise((r) => setImmediate(r)); // let #runAssignment register the session
+
+    const mid = o.snapshot();
+    assert.equal(mid.activeSessions.length, 1);
+    assert.equal(mid.activeSessions[0].sessionId, 'sess-SNAP');
+    assert.equal(mid.activeSessions[0].platforms.indeed, 'pending');
+
+    releaseScraper();
+    await new Promise((r) => setTimeout(r, 20)); // let the assignment finish + clean up
+
+    assert.deepEqual(o.snapshot().activeSessions, []);
+});

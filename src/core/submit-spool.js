@@ -12,7 +12,7 @@
 // .gitignore entry. Override the location with SPOOL_DIR for tests or
 // alternate deployments.
 
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir, readdir, stat, writeFile } from 'fs/promises';
 import path from 'path';
 import { createLogger } from '../logger/index.js';
 
@@ -83,4 +83,35 @@ export async function spoolUndeliverableSubmission(payload) {
         });
         return null;
     }
+}
+
+/**
+ * Read-only summary for the control panel: how many undelivered submissions
+ * are sitting in the spool and the oldest one's timestamp. Never throws — an
+ * absent spool dir (the common case) reads as `{ count: 0, oldest: null }`.
+ *
+ * @returns {Promise<{count: number, oldest: string|null}>}
+ */
+export async function spoolSnapshot() {
+    const dir = spoolDir();
+    let entries;
+    try {
+        entries = await readdir(dir);
+    } catch {
+        return { count: 0, oldest: null };
+    }
+    const files = entries.filter((name) => name.endsWith('.json'));
+    if (files.length === 0) return { count: 0, oldest: null };
+
+    let oldestMs = null;
+    for (const name of files) {
+        try {
+            const info = await stat(path.join(dir, name));
+            if (oldestMs === null || info.mtimeMs < oldestMs) oldestMs = info.mtimeMs;
+        } catch { /* a file that vanished mid-scan just doesn't count toward oldest */ }
+    }
+    return {
+        count: files.length,
+        oldest: oldestMs === null ? null : new Date(oldestMs).toISOString(),
+    };
 }

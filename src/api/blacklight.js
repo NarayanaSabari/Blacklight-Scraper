@@ -6,6 +6,7 @@ import { requestWithRetry } from '../http/client.js';
 import { NetworkError } from '../core/errors.js';
 import { getMetrics } from '../metrics/registry.js';
 import { spoolUndeliverableSubmission } from '../core/submit-spool.js';
+import { record as recordSubmission } from '../panel/recent.js';
 
 // Logical circuit-breaker label for all Blacklight queue traffic (SCR-15).
 // Kept separate from 'credentials' so a credentials-API outage can't open
@@ -144,14 +145,35 @@ export class BlacklightApiClient {
         // open circuit (opened by, say, a credentials-API outage) would
         // silently discard completed work instead of merely delaying it.
         try {
-            return await this.#request('POST', '/api/scraper/queue/jobs', body, { bypassCircuit: true });
+            const response = await this.#request('POST', '/api/scraper/queue/jobs', body, { bypassCircuit: true });
+            this.#recordSubmissionForPanel(sessionId, platform, jobs, status, meta);
+            return response;
         } catch (error) {
             await spoolUndeliverableSubmission({
                 sessionId, platform, jobs, status, errorMessage,
                 deliveryError: error.message,
             });
+            this.#recordSubmissionForPanel(sessionId, platform, jobs, 'failed', meta, error.message);
             throw error;
         }
+    }
+
+    // Panel-only: feed the recent-submissions ring buffer. Best-effort and
+    // isolated from the real submit path — a bug here must never surface as
+    // a submitJobs() failure.
+    #recordSubmissionForPanel(sessionId, platform, jobs, status, meta, deliveryError) {
+        try {
+            let outcome = 'accepted';
+            if (status === 'failed') outcome = 'failed';
+            else if (jobs.length === 0 && meta?.emptyConfirmed === true) outcome = 'empty_confirmed';
+            recordSubmission({
+                platform,
+                sessionId,
+                jobsSent: Array.isArray(jobs) ? jobs.length : 0,
+                outcome,
+                error: deliveryError ?? null,
+            });
+        } catch { /* the panel ring buffer must never break a real submission */ }
     }
 
     async completeSession(sessionId) {

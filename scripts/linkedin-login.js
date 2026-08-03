@@ -23,9 +23,9 @@
 //
 // The profile dir defaults to ~/.blacklight-linkedin-profile; override with
 // LINKEDIN_PROFILE_DIR (must match what the scraper uses).
-import { launchPersistentContext } from '../src/core/browser-pool.js';
-import { linkedInProfileDir } from '../src/core/linkedin-profile.js';
-import { launchPersistentProfile } from '../src/core/linkedin-browser.js';
+import {
+    resolveLoginProfileDir, openLoginBrowser, captureSession, closeLoginBrowser,
+} from '../src/core/linkedin-login-flow.js';
 import { saveLinkedinCredential } from '../src/setup/linkedin-credential.js';
 import { defaultAsk } from '../src/setup/io.js';
 import { cloakbrowserPreflight } from '../src/setup/cloakbrowser-preflight.js';
@@ -56,31 +56,27 @@ async function main() {
 
         const { profileKey, proxy } = await promptConfig(ask);
 
-        let context;
+        // resolveLoginProfileDir is the SAME resolver the scraper itself uses
+        // (profileDirFor) — this print is exactly where the login will land.
+        const userDataDir = resolveLoginProfileDir({ profileKey });
         if (profileKey) {
             // Per-account path: pinned fingerprint + per-account profile dir + proxy.
-            // launchPersistentProfile reads LINKEDIN_HEADLESS; when unset (the
-            // normal operator case) it launches HEADED — exactly what we want.
-            console.log(`Opening CloakBrowser persistent profile for account: ${profileKey}`);
+            // openLoginBrowser reads LINKEDIN_HEADLESS; when unset (the normal
+            // operator case) it launches HEADED — exactly what we want.
+            console.log(`Opening CloakBrowser persistent profile for account: ${profileKey} (${userDataDir})`);
             if (proxy) console.log(`  Routing through proxy: ${proxy}`);
-            context = await launchPersistentProfile({ profileKey, proxy });
         } else {
             // Legacy path: single local profile, byte-identical to the pre-rotation
             // manual-login D1b model.
-            const userDataDir = linkedInProfileDir();
             console.log(`Opening CloakBrowser persistent profile: ${userDataDir}`);
-            context = await launchPersistentContext({
-                userDataDir,
-                headless: false,
-                humanize: true,
-                viewport: { width: 1366, height: 900 },
-                locale: 'en-US',
-                timezoneId: 'America/New_York',
-            });
         }
+        const { context, page } = await openLoginBrowser({ profileKey, proxy });
 
-        const page = context.pages()[0] || await context.newPage();
-        await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' }).catch(() => {});
+        // A navigation failure here used to be swallowed silently, leaving the
+        // operator staring at a blank browser with no idea why. Surface it —
+        // the browser is still usable, the operator can navigate manually.
+        await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' })
+            .catch((err) => console.warn(`Could not navigate to the LinkedIn login page: ${err.message}`));
 
         console.log('\nLog in to LinkedIn in the opened browser window.');
         console.log('When you reach your feed (logged in), return here and press Enter to save + close.\n');
@@ -90,13 +86,11 @@ async function main() {
         // can verify the login and register the local `linkedin` credential the
         // scraper's per-scrape lease needs. Without it, scrapes fail with
         // "No LinkedIn credential available from API" despite a valid profile.
-        let cookies = [];
-        try {
-            cookies = await context.cookies();
-        } catch (err) {
-            console.warn(`Could not read cookies from the profile: ${err.message}`);
+        const { cookies, error: captureError } = await captureSession({ context });
+        if (captureError) {
+            console.warn(`Could not read cookies from the profile: ${captureError}`);
         }
-        await context.close();
+        await closeLoginBrowser({ context });
         console.log('Profile saved. The scraper will reuse this logged-in session.');
 
         if (profileKey) {

@@ -20,6 +20,7 @@ import { getMetrics } from '../metrics/registry.js';
 import { platformsOnCooldown } from '../core/platform-cooldowns.js';
 import { TimeoutError } from '../core/errors.js';
 import { PLATFORM_NAMES } from '../scrapers/registry.js';
+import { getPlatformOverrides } from '../panel/overrides.js';
 
 const log = createLogger('orchestrator');
 
@@ -27,6 +28,7 @@ export class QueueOrchestrator {
     constructor({
         blacklightConfig, queueConfig, defaultLocation,
         client = null, metrics = null, scraperResolver = null, cooldownCheck = null,
+        platformOverrides = null,
     }) {
         if (!client && !blacklightConfig) {
             throw new Error('QueueOrchestrator requires blacklightConfig');
@@ -44,6 +46,13 @@ export class QueueOrchestrator {
         // SCR-18 (#401): at most ONE follow-up poll may be pending at a time.
         // See #schedulePoll.
         this._pollScheduled = false;
+        // Panel-only bookkeeping (read via snapshot()). Never consulted by the
+        // workflow itself, so getting it wrong can't change scraping behavior.
+        this._lastPollAt = null;
+        this._lastPollOutcome = null;
+        this._autoCheckIntervalMs = queueConfig?.checkIntervalMs ?? null;
+        // sessionId -> { role, startedAt, platforms: { name: 'pending'|'success'|'failed' } }
+        this._activeSessions = new Map();
         // Injection seams (default to the production singletons). Behavior-
         // neutral: server.js passes none of these, so construction is
         // identical to before. Tests inject fakes to exercise the workflow
@@ -51,11 +60,21 @@ export class QueueOrchestrator {
         this._metrics = metrics;
         this._resolveScraper = scraperResolver ?? getScraper;
         this._cooldownCheck = cooldownCheck ?? platformsOnCooldown;
+        // Local pause/resume from the control panel. Injected the same way as
+        // the other seams — tests supply a fake, production lazily resolves
+        // the singleton so importing this module never touches the filesystem.
+        this._platformOverrides = platformOverrides;
     }
 
     // Resolve the metrics sink: injected fake in tests, global registry in prod.
     #metrics() {
         return this._metrics ?? getMetrics();
+    }
+
+    // Resolve the local platform overrides: injected fake in tests, global
+    // singleton in prod (see src/panel/overrides.js).
+    #overrides() {
+        return this._platformOverrides ?? getPlatformOverrides();
     }
 
     // ----- public API -------------------------------------------------------
@@ -109,23 +128,30 @@ export class QueueOrchestrator {
     }
 
     async runOnce() {
+        this._lastPollAt = Date.now();
         if (!this.mutex.tryAcquire()) {
             log.info('Queue run skipped — claim already in flight');
             this.#metrics().recordQueueCheck('skipped_busy');
+            this._lastPollOutcome = 'skipped_busy';
             return { skipped: true };
         }
         let queueResult;
         try {
             queueResult = await this.#claim();
+        } catch (error) {
+            this._lastPollOutcome = 'error';
+            throw error;
         } finally {
             this.mutex.release();
         }
 
         const assignments = queueResult?.assignments || [];
         if (assignments.length === 0) {
+            this._lastPollOutcome = 'empty';
             return { message: 'Queue is empty for idle platforms' };
         }
 
+        this._lastPollOutcome = `batched:${assignments.length}`;
         // Fire each assignment in the background. The mutex is already
         // released so the next poll (30s tick or manual trigger) can
         // immediately claim work for any platform that finishes early.
@@ -157,6 +183,30 @@ export class QueueOrchestrator {
             this.autoInterval = null;
             log.info('Auto queue checker stopped');
         }
+    }
+
+    // Read-only detail for the control panel. Pure read, no side effects —
+    // safe to poll on every /panel/api/status request.
+    snapshot() {
+        const running = !!this.autoInterval;
+        let secondsUntilNextTick = null;
+        if (running && this._autoCheckIntervalMs && this._lastPollAt) {
+            const elapsed = Date.now() - this._lastPollAt;
+            secondsUntilNextTick = Math.max(0, Math.round((this._autoCheckIntervalMs - elapsed) / 1000));
+        }
+        return {
+            running,
+            mutexLocked: this.mutex.isLocked,
+            lastPollAt: this._lastPollAt ? new Date(this._lastPollAt).toISOString() : null,
+            lastPollOutcome: this._lastPollOutcome,
+            secondsUntilNextTick,
+            activeSessions: [...this._activeSessions.entries()].map(([sessionId, s]) => ({
+                sessionId,
+                role: s.role,
+                startedAt: new Date(s.startedAt).toISOString(),
+                platforms: { ...s.platforms },
+            })),
+        };
     }
 
     // ----- internals --------------------------------------------------------
@@ -235,6 +285,21 @@ export class QueueOrchestrator {
             if (usablePlatforms.length === 0) {
                 log.info('All usable platforms are on local cooldown — skipping claim');
                 metrics.recordQueueCheck('all_cooldown');
+                return { assignments: [] };
+            }
+        }
+
+        // Exclude platforms the operator locally paused via the control
+        // panel (src/panel/overrides.js). Host-local, not a backend concept
+        // — a paused platform still shows up in the allowlist, it's just
+        // never claimed by THIS host until resumed.
+        const paused = this.#overrides().pausedList().filter((p) => usablePlatforms.includes(p));
+        if (paused.length > 0) {
+            log.info('Platforms locally paused — excluded from claim', { paused });
+            usablePlatforms = usablePlatforms.filter((p) => !paused.includes(p));
+            if (usablePlatforms.length === 0) {
+                log.info('All usable platforms are locally paused — skipping claim');
+                metrics.recordQueueCheck('all_paused');
                 return { assignments: [] };
             }
         }
@@ -335,6 +400,16 @@ export class QueueOrchestrator {
             },
         };
 
+        // Panel-only bookkeeping (read via snapshot()) — tracks this
+        // in-flight session so the control panel can show "what's running
+        // right now" without touching the workflow itself. Removed in the
+        // `finally` below regardless of outcome.
+        this._activeSessions.set(sessionId, {
+            role: role.name,
+            startedAt: Date.now(),
+            platforms: Object.fromEntries(platforms.map((p) => [p.name.toLowerCase(), 'pending'])),
+        });
+
         // Run platforms IN PARALLEL within an assignment. Most scrapers are
         // self-contained (own browser context + credential lease per scrape).
         // EXCEPTION: LinkedIn shares a cached cookie jar and credential lease
@@ -357,6 +432,7 @@ export class QueueOrchestrator {
             if (!scraper) {
                 log.warn('Unknown platform', { platformName });
                 await this.#safeSubmit(sessionId, platformName, [], 'failed', 'Platform not supported');
+                this.#markPlatform(sessionId, platformName, 'failed');
                 triggerNextPoll();
                 return { platformName, result: { success: false, error: 'Platform not supported' } };
             }
@@ -402,6 +478,7 @@ export class QueueOrchestrator {
                     });
                 }
                 metrics.recordJobsSubmitted(platformName, 'success', formatted.length);
+                this.#markPlatform(sessionId, platformName, 'success');
                 triggerNextPoll();
 
                 return {
@@ -429,56 +506,71 @@ export class QueueOrchestrator {
                     await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message);
                     metrics.recordJobsSubmitted(platformName, 'failed', 0);
                 }
+                this.#markPlatform(sessionId, platformName, 'failed');
                 triggerNextPoll();
                 return { platformName, result: { success: false, error: error.message } };
             }
         });
 
-        const settled = await Promise.allSettled(tasks);
-        for (const entry of settled) {
-            if (entry.status === 'fulfilled') {
-                const { platformName, result } = entry.value;
-                results.platforms[platformName] = result;
-                if (result.success) results.summary.successful += 1;
-                else results.summary.failed += 1;
-            } else {
-                log.error('Platform task threw unexpectedly', { err: entry.reason?.message });
-                results.summary.failed += 1;
-            }
-        }
-
-        // C3 (spec): an assignment where every platform failed must NOT be
-        // silently treated as a normal completion. We still call
-        // completeSession (the backend coordinates sibling sessions for the
-        // same role and must receive it), but we flag it loudly + on a
-        // dedicated metric so a dashboard/alert can distinguish "role done,
-        // 0 jobs because all platforms broke" from "role done normally".
-        if (results.summary.total_platforms > 0 && results.summary.successful === 0) {
-            log.error('All platforms failed for assignment — completing session anyway (backend coordination)', {
-                sessionId,
-                role: role.name,
-                totalPlatforms: results.summary.total_platforms,
-                scraper_alert: 'session_all_failed',
-            });
-            metrics.recordSessionAllFailed();
-        }
-
         try {
-            const completion = await this.client.completeSession(sessionId);
-            results.completion = completion;
-            log.info('Session completed', {
-                sessionId,
-                role: role.name,
-                durationSec: completion.duration_seconds,
-                imported: completion.jobs?.total_imported,
-                found: completion.jobs?.total_found,
-            });
-        } catch (error) {
-            log.error('Session completion failed', { sessionId, err: error.message });
-            results.completion_error = error.message;
-        }
+            const settled = await Promise.allSettled(tasks);
+            for (const entry of settled) {
+                if (entry.status === 'fulfilled') {
+                    const { platformName, result } = entry.value;
+                    results.platforms[platformName] = result;
+                    if (result.success) results.summary.successful += 1;
+                    else results.summary.failed += 1;
+                } else {
+                    log.error('Platform task threw unexpectedly', { err: entry.reason?.message });
+                    results.summary.failed += 1;
+                }
+            }
 
-        return results;
+            // C3 (spec): an assignment where every platform failed must NOT be
+            // silently treated as a normal completion. We still call
+            // completeSession (the backend coordinates sibling sessions for the
+            // same role and must receive it), but we flag it loudly + on a
+            // dedicated metric so a dashboard/alert can distinguish "role done,
+            // 0 jobs because all platforms broke" from "role done normally".
+            if (results.summary.total_platforms > 0 && results.summary.successful === 0) {
+                log.error('All platforms failed for assignment — completing session anyway (backend coordination)', {
+                    sessionId,
+                    role: role.name,
+                    totalPlatforms: results.summary.total_platforms,
+                    scraper_alert: 'session_all_failed',
+                });
+                metrics.recordSessionAllFailed();
+            }
+
+            try {
+                const completion = await this.client.completeSession(sessionId);
+                results.completion = completion;
+                log.info('Session completed', {
+                    sessionId,
+                    role: role.name,
+                    durationSec: completion.duration_seconds,
+                    imported: completion.jobs?.total_imported,
+                    found: completion.jobs?.total_found,
+                });
+            } catch (error) {
+                log.error('Session completion failed', { sessionId, err: error.message });
+                results.completion_error = error.message;
+            }
+
+            return results;
+        } finally {
+            // Panel bookkeeping cleanup — the session is no longer in flight
+            // regardless of how the block above finished.
+            this._activeSessions.delete(sessionId);
+        }
+    }
+
+    // Panel-only: record a platform's terminal state on its tracked session.
+    // A no-op if the session isn't tracked (shouldn't happen — set at the top
+    // of #runAssignment — but this must never throw into the scrape path).
+    #markPlatform(sessionId, platformName, state) {
+        const session = this._activeSessions.get(sessionId);
+        if (session) session.platforms[platformName] = state;
     }
 
     async #safeSubmit(sessionId, platform, jobs, status, errorMessage) {

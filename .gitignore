@@ -9,6 +9,7 @@ config/linkedin-rsc-template.json
 config/*.local.json
 config/proxies.txt
 config/cloakbrowser-keys.txt
+config/platform-overrides.json
 .env
 .env.*
 !.env.example

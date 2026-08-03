@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { platformsOnCooldown } from '../../src/core/platform-cooldowns.js';
+import { platformsOnCooldown, cooldownSnapshot } from '../../src/core/platform-cooldowns.js';
 
 const NOW = new Date('2026-06-14T12:00:00.000Z');
 
@@ -36,4 +36,18 @@ test('platformsOnCooldown: a throwing module is isolated, never breaks the resul
 
 test('platformsOnCooldown: default (real) modules return an array without throwing', () => {
     assert.ok(Array.isArray(platformsOnCooldown(NOW)));
+});
+
+test('cooldownSnapshot: reports onCooldown + until per platform, isolating a throwing module', () => {
+    const boom = {
+        cooldownPath: () => { throw new Error('boom'); },
+        defaultReadFile: () => () => '',
+        readCooldownMarker: () => ({}),
+        isOnCooldown: () => false,
+    };
+    const mods = { monster: fakeModule(true), indeed: fakeModule(false), glassdoor: boom };
+    const snap = cooldownSnapshot(NOW, mods);
+    assert.deepEqual(snap.monster, { onCooldown: true, until: '2026-06-14T13:00:00.000Z' });
+    assert.deepEqual(snap.indeed, { onCooldown: false, until: null });
+    assert.deepEqual(snap.glassdoor, { onCooldown: false, until: null });
 });
