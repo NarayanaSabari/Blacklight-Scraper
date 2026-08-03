@@ -92,17 +92,28 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         template = null,
         paginateImpl = defaultPaginate,
         searchQueries = null,
+        candidateQuery = null,
         maxPosts = 100,
         count = countPerRequest(),
         datePosted = process.env.LINKEDIN_DATE_POSTED || 'past-24h',
         rng = Math.random,
     } = options;
 
+    // A recruiter-authored query is used EXACTLY as written — no random pick.
+    // Randomising across variants is right for a role (it broadens recall and
+    // varies the request pattern), but a human asked for this specific boolean
+    // and would have no way to tell why it only ran some of the time.
+    //
     // One variant per session, chosen at random so repeated cycles cover them all.
     const variants = Array.isArray(searchQueries) && searchQueries.length > 0 ? searchQueries : null;
-    const keywords = pickSessionQuery(variants, rng) ?? buildBooleanSearchQuery(jobTitle);
+    const keywords = candidateQuery
+        || pickSessionQuery(variants, rng)
+        || buildBooleanSearchQuery(jobTitle);
 
-    log.info('Starting RSC scrape', { jobTitle, keywords, datePosted, count, maxPosts });
+    log.info('Starting RSC scrape', {
+        jobTitle, keywords, datePosted, count, maxPosts,
+        candidateScoped: Boolean(candidateQuery),
+    });
 
     return session.withCookies(sessionId, async (cookies, lease) => {
         const requestTemplate = template ?? await session.template();

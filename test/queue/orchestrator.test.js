@@ -408,3 +408,74 @@ test('sweep counters are attributed to the platform NAME, not "[object object]"'
     assert.ok(!('[object object]' in snap), `junk platform key present: ${Object.keys(snap)}`);
     assert.ok('indeed' in snap, `expected indeed, got ${Object.keys(snap)}`);
 });
+
+// --- candidate boolean queries ----------------------------------------------
+
+test('runAssignment forwards a candidate query to the scraper', async () => {
+    // The backend has already flagged this session to bypass the role-relevance
+    // filter, so if the query fails to reach the scraper the session imports an
+    // UNFILTERED role sweep — worse than importing nothing.
+    const seen = [];
+    let served = false;
+    const client = fakeClient({
+        checkCredentialAvailability: async () => ({ linkedin: 1 }),
+        getNextRole: async () => {
+            if (served) return { assignments: [] };
+            served = true;
+            return {
+                assignments: [{
+                    session_id: 'sess-CQ',
+                    role: { name: 'Senior Java Developer', search_queries: ['role variant'] },
+                    candidate_query: {
+                        id: 12,
+                        query: '("Java" OR "Kotlin") AND ("AWS" OR "Azure") NOT junior',
+                        candidate_id: 34,
+                    },
+                    platforms: [{ name: 'linkedin' }],
+                }],
+            };
+        },
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client,
+        metrics: fakeMetrics(),
+        // LinkedIn carries a real cooldown in the default check; stub it so this
+        // test measures assignment plumbing rather than cooldown state.
+        cooldownCheck: () => [],
+        scraperResolver: () => ({
+            executeWithMeta: async (_role, _loc, _sid, options) => {
+                seen.push(options);
+                return { jobs: [], emptyConfirmed: true };
+            },
+        }),
+    });
+
+    await o.runOnce();
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].candidateQuery, '("Java" OR "Kotlin") AND ("AWS" OR "Azure") NOT junior');
+    // The role's own variants still ride along untouched — the scraper decides
+    // precedence, the orchestrator does not silently drop one path.
+    assert.deepEqual(seen[0].searchQueries, ['role variant']);
+});
+
+test('runAssignment passes candidateQuery: null for an ordinary role sweep', async () => {
+    const seen = [];
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: assignmentClient(),
+        metrics: fakeMetrics(),
+        scraperResolver: () => ({
+            executeWithMeta: async (_role, _loc, _sid, options) => {
+                seen.push(options);
+                return { jobs: [], emptyConfirmed: true };
+            },
+        }),
+    });
+
+    await o.runOnce();
+
+    assert.ok(seen.length >= 1);
+    assert.equal(seen[0].candidateQuery, null);
+});

@@ -174,3 +174,90 @@ test('scrapeLinkedInRsc: reports scrape liveness against the held lease', async 
     });
     assert.match(String(reported), /1/);
 });
+
+// --- candidate boolean queries ----------------------------------------------
+
+const CANDIDATE_QUERY = '("Java" OR "Kotlin") AND ("AWS" OR "Azure") NOT junior';
+
+test('scrapeLinkedInRsc: a candidate query is sent verbatim', async () => {
+    // A recruiter typed this exact boolean. Any rewriting on our side makes the
+    // results unexplainable to the person tuning it.
+    let used = null;
+    await scrapeLinkedInRsc('Senior Java Developer', 'United States', 'sess-1', {
+        session: fakeSession(),
+        template: { url: 'https://x', headers: {}, postData: '{}' },
+        candidateQuery: CANDIDATE_QUERY,
+        paginateImpl: async ({ keywords }) => {
+            used = keywords;
+            return { posts: [], emptyConfirmed: true, pages: [] };
+        },
+    });
+    assert.equal(used, CANDIDATE_QUERY);
+});
+
+test('scrapeLinkedInRsc: a candidate query beats the role variant pick', async () => {
+    // Randomising across variants is right for a role and wrong for a
+    // hand-written query: it would run only some of the time, with no way for
+    // the recruiter to tell why.
+    const seen = [];
+    for (let i = 0; i < 20; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await scrapeLinkedInRsc('Senior Java Developer', 'United States', 'sess-1', {
+            session: fakeSession(),
+            template: { url: 'https://x', headers: {}, postData: '{}' },
+            searchQueries: ['variant one', 'variant two', 'variant three'],
+            candidateQuery: CANDIDATE_QUERY,
+            paginateImpl: async ({ keywords }) => {
+                seen.push(keywords);
+                return { posts: [], emptyConfirmed: true, pages: [] };
+            },
+        });
+    }
+    assert.deepEqual([...new Set(seen)], [CANDIDATE_QUERY]);
+});
+
+test('scrapeLinkedInRsc: still ONE query per session when candidate-scoped', async () => {
+    // The anti-bot constraint does not relax just because the query is bespoke.
+    const seen = [];
+    await scrapeLinkedInRsc('Senior Java Developer', 'United States', 'sess-1', {
+        session: fakeSession(),
+        template: { url: 'https://x', headers: {}, postData: '{}' },
+        candidateQuery: CANDIDATE_QUERY,
+        paginateImpl: async ({ keywords }) => {
+            seen.push(keywords);
+            return { posts: [], emptyConfirmed: true, pages: [] };
+        },
+    });
+    assert.equal(seen.length, 1);
+});
+
+test('scrapeLinkedInRsc: an empty candidate query falls back, never searches ""', async () => {
+    // A blank string is falsy on purpose — `??` would have passed it straight
+    // through and searched LinkedIn for nothing.
+    let used = null;
+    await scrapeLinkedInRsc('Data Engineer', 'United States', null, {
+        session: fakeSession(),
+        template: { url: 'https://x', headers: {}, postData: '{}' },
+        candidateQuery: '',
+        searchQueries: ['variant one'],
+        paginateImpl: async ({ keywords }) => {
+            used = keywords;
+            return { posts: [], emptyConfirmed: true, pages: [] };
+        },
+    });
+    assert.equal(used, 'variant one');
+});
+
+test('scrapeLinkedInRsc: role path is untouched when no candidate query is given', async () => {
+    let used = null;
+    await scrapeLinkedInRsc('Data Engineer', 'United States', null, {
+        session: fakeSession(),
+        template: { url: 'https://x', headers: {}, postData: '{}' },
+        candidateQuery: null,
+        paginateImpl: async ({ keywords }) => {
+            used = keywords;
+            return { posts: [], emptyConfirmed: true, pages: [] };
+        },
+    });
+    assert.equal(used, '"Data Engineer" AND (c2c OR W2 OR 1099)');
+});

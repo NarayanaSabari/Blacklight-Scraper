@@ -429,6 +429,12 @@ export class QueueOrchestrator {
         return {
             session_id: session.session_id,
             role: { name: session.role_name, search_queries: session.search_queries ?? null },
+            // Carried through so a resumed candidate-query session re-runs the
+            // recruiter's boolean rather than silently degrading to a role sweep
+            // — the backend has already flagged that session to bypass the
+            // relevance filter, so a role-shaped scrape under it would import
+            // unfiltered results.
+            candidate_query: session.candidate_query ?? null,
             platforms,
         };
     }
@@ -498,9 +504,15 @@ export class QueueOrchestrator {
                 // Pass AI-generated LinkedIn search queries (if any)
                 // through to the scraper. Only LinkedIn looks at it
                 // today; others ignore the extra option.
+                //
+                // `candidateQuery` is a recruiter-authored boolean for ONE
+                // candidate and, when present, is the exact string to search —
+                // it wins over the role's random variant pick. LinkedIn-only,
+                // because it is the only platform that takes a free-text query.
                 const { jobs, emptyConfirmed } = await scraper.executeWithMeta(
                     role.name, location, sessionId, {
                         searchQueries: role.search_queries || null,
+                        candidateQuery: assignment.candidate_query?.query || null,
                     },
                 );
                 const formatted = jobs.map((job) => formatJobForBlacklight(job, platformName));
