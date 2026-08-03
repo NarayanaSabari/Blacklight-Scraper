@@ -21,6 +21,7 @@ import { platformsOnCooldown } from '../core/platform-cooldowns.js';
 import { TimeoutError } from '../core/errors.js';
 import { PLATFORM_NAMES } from '../scrapers/registry.js';
 import { getPlatformOverrides } from '../panel/overrides.js';
+import { SweepSchedule } from './sweep-schedule.js';
 
 const log = createLogger('orchestrator');
 
@@ -84,7 +85,11 @@ export class QueueOrchestrator {
     #schedule() {
         if (!this._sweepSchedule) {
             this._sweepSchedule = new SweepSchedule({
-                intervalMinutes: (platform) => this.#overrides().intervalMinutes(platform),
+                // Optional chaining on purpose: an injected overrides object
+                // (tests, older callers) may predate intervalMinutes. Missing
+                // it must mean "no cadence configured", not a crash in the
+                // claim path.
+                intervalMinutes: (platform) => this.#overrides().intervalMinutes?.(platform) ?? null,
             });
         }
         return this._sweepSchedule;
@@ -322,6 +327,26 @@ export class QueueOrchestrator {
             }
         }
 
+        // Exclude platforms whose next SWEEP isn't due yet (see
+        // ./sweep-schedule.js). A platform with no configured cadence is always
+        // claimable, so this is inert for everything an operator hasn't
+        // deliberately slowed. Indeed was re-scraping every role every ~5 min
+        // for a 0.29% import rate; an hourly sweep drains the same queue in
+        // ~1/12th of the sessions.
+        const schedule = this.#schedule();
+        const notDue = usablePlatforms.filter((p) => !schedule.isClaimable(p));
+        if (notDue.length > 0) {
+            log.info('Platforms not due for a sweep — excluded from claim', { notDue });
+            usablePlatforms = usablePlatforms.filter((p) => !notDue.includes(p));
+            if (usablePlatforms.length === 0) {
+                log.info('No platform is due for a sweep — skipping claim');
+                metrics.recordQueueCheck('not_due');
+                return { assignments: [] };
+            }
+        }
+        // Open a sweep for any scheduled platform we're about to claim.
+        for (const platform of usablePlatforms) schedule.begin(platform);
+
         let queueResult;
         try {
             queueResult = await this.client.getNextRole({ platforms: usablePlatforms });
@@ -344,6 +369,9 @@ export class QueueOrchestrator {
         if (assignments.length === 0) {
             log.info('Queue empty');
             metrics.recordQueueCheck('empty');
+            // Nothing left for these platforms this pass — the sweep has
+            // drained the queue, so close it and start the interval clock.
+            for (const platform of usablePlatforms) schedule.end(platform);
             return queueResult;
         }
         metrics.recordQueueCheck('job_found');
@@ -353,6 +381,11 @@ export class QueueOrchestrator {
             roles: assignments.map((a) => a.role.name),
             totalPlatforms: assignments.reduce((sum, a) => sum + a.platforms.length, 0),
         });
+        for (const assignment of assignments) {
+            for (const platform of assignment.platforms) {
+                schedule.record(platform, { roles: 1, sessions: 1 });
+            }
+        }
         return queueResult;
     }
 

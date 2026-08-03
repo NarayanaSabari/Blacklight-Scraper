@@ -33,6 +33,11 @@ function makeOrchestrator(counter) {
         metrics: fakeMetrics(),
         scraperResolver: () => ({ executeWithMeta: async () => ({ jobs: [], emptyConfirmed: true }) }),
         cooldownCheck: () => [],
+        // This suite measures poll COUNT, not cadence. Without an explicit
+        // overrides stub it would pick up the real singleton — where indeed
+        // defaults to a 60-minute sweep — and the second poll would be gated
+        // out, which has nothing to do with what these tests assert.
+        platformOverrides: { pausedList: () => [], intervalMinutes: () => null },
     });
 }
 

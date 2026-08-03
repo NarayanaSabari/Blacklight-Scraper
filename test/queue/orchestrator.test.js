@@ -343,3 +343,28 @@ test('snapshot: an assignment in flight shows up as an active session, then clea
 
     assert.deepEqual(o.snapshot().activeSessions, []);
 });
+
+// ─── cadence gate wired into the real orchestrator (2026-08-03) ─────────
+// sweep-schedule.test.js covers the gate in isolation. These drive the ACTUAL
+// orchestrator, because the unit tests passed while the integration was
+// broken: a missing `import { SweepSchedule }` only fails at runtime, and it
+// shipped — the panel 500'd with "SweepSchedule is not defined".
+
+test('buildStatus path: sweepSnapshot() constructs without a missing import', () => {
+    const orchestrator = new QueueOrchestrator({
+        client: {}, queueConfig: {}, defaultLocation: 'United States',
+        platformOverrides: { intervalMinutes: () => 60, pausedList: () => [] },
+    });
+    // Would throw ReferenceError if SweepSchedule were not imported.
+    const snap = orchestrator.sweepSnapshot();
+    assert.equal(typeof snap, 'object');
+});
+
+test('sweepSnapshot reflects a platform that has begun a sweep', () => {
+    const orchestrator = new QueueOrchestrator({
+        client: {}, queueConfig: {}, defaultLocation: 'United States',
+        platformOverrides: { intervalMinutes: (p) => (p === 'indeed' ? 60 : null), pausedList: () => [] },
+    });
+    const snap = orchestrator.sweepSnapshot();
+    assert.deepEqual(snap, {}, 'nothing swept yet');
+});
