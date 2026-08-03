@@ -141,9 +141,25 @@ export function formatJobForBlacklight(job, platform) {
     const experienceLevel = experienceData.level ?? job.experience_level ?? job.experienceLevel ?? null;
     if (experienceLevel && experienceLevel !== 'N/A') formatted.experience_level = String(experienceLevel).toLowerCase();
 
+    // Keep the exact instant when the scraper found one.
+    //
+    // This used to be `postedDate.split('T')[0]`, which threw away the time on
+    // every platform. For LinkedIn that was the whole signal: extract.js decodes
+    // an EXACT post time from the activity id (the snowflake's top bits are epoch
+    // ms), and truncating it to YYYY-MM-DD collapsed it to midnight UTC. The
+    // importer then skips its date-only "time enrichment" for LinkedIn precisely
+    // because LinkedIn is supposed to carry a real time — so nothing put one
+    // back, and all 2,420 LinkedIn rows in prod sat on exactly one timestamp per
+    // day. That is the "every LinkedIn job shows the same time" report.
+    //
+    // Date-only input still passes through unchanged (the other platforms only
+    // ever report a date), so this widens what survives without inventing
+    // precision that was never there.
     const postedDate = jobData.postedDate ?? job.posted_date ?? job.postedDate ?? null;
     if (postedDate && /^\d{4}-\d{2}-\d{2}/.test(postedDate)) {
-        formatted.posted_date = postedDate.split('T')[0];
+        // ScrapedJobPayload.posted_date caps at 32 chars; an ISO-8601 instant with
+        // milliseconds is 24 ("2026-08-03T08:01:07.956Z"), so this fits with room.
+        formatted.posted_date = String(postedDate).slice(0, 32);
     }
 
     const locationIsRemoteString =
