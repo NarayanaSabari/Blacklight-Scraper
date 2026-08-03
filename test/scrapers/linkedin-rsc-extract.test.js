@@ -82,6 +82,23 @@ test('extractPosts: derives the author handle and hashtags from the permalink sl
     assert.deepEqual(naren.hashtags, ['dataengineer', 'dataengineer', 'data']);
 });
 
+test('extractPosts: derives the author profile URL from the handle', () => {
+    // The field was plumbed all the way to the portal's "Posted by" block but
+    // nothing ever set it, so every prod row had profile_url = null.
+    const posts = extractPosts(readFixture('linkedin-rsc-search.txt'));
+    const naren = posts.find((p) => p.author_handle === 'b-naren');
+    assert.equal(naren.author_profile, 'https://www.linkedin.com/in/b-naren');
+});
+
+test('extractPosts: a post with no handle gets a null profile, never a guess', () => {
+    // Group permalinks (urn:li:groupPost:...) carry no author handle.
+    const posts = extractPosts(readFixture('linkedin-rsc-search.txt'));
+    for (const post of posts) {
+        if (post.author_handle) continue;
+        assert.equal(post.author_profile, null);
+    }
+});
+
 test('extractPosts: excludes LinkedIn UI copy from the body', () => {
     // The comment-composer toast rides along in every card subtree and was
     // appended to all 108 bodies in an earlier revision.

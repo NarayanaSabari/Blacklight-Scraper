@@ -267,6 +267,12 @@ export function extractPosts(body) {
             source,
             group_id: groupId,
             author_handle: handle,
+            // The handle in a /posts/ permalink IS the poster's public profile
+            // slug, so their profile URL is derivable rather than absent. This
+            // field was already plumbed all the way to the portal's "Posted by"
+            // block but nothing ever set it, so every prod row had
+            // profile_url = null. Group permalinks carry no handle, hence null.
+            author_profile: handle ? `https://www.linkedin.com/in/${handle}` : null,
             hashtags,
             text,
             text_length: text.length,
