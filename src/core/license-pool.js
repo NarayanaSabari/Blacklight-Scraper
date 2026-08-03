@@ -37,6 +37,33 @@ const DEFAULT_INCOMPLETE_LOCK_GRACE_MS = 5_000;
 const MAX_CLEANUP_RETRY_MS = 5_000;
 const MAX_CLEANUP_ATTEMPTS = 6;
 
+// ─── Seat-leak backstop (2026-08-03 incident) ───────────────────────────────
+// Both seats sat leased for ~26 hours while `waiting` climbed to 576, which
+// starved every browser platform (dice/techfetch/linkedin/glassdoor/monster).
+// Indeed kept working only because it uses the HTTP API and never takes a seat.
+//
+// The leak is NOT a missing release path — dice/techfetch close their browser
+// in a `finally`. It is that the orchestrator ABANDONS a scrape after its own
+// ~10 min timeout while the underlying promise keeps running: nothing cancels
+// it, so the `finally` is never reached and the seat is held forever. A
+// `browser.close()` that HANGS does the same thing (the try/catch around it
+// catches errors, not hangs).
+//
+// So the backstop cannot live in the callers. A seat held longer than any
+// healthy scrape (measured: dice 32-81s, techfetch ~108s) is reclaimed here.
+const DEFAULT_LEASE_TTL_MS = 5 * 60_000;      // 5 min ≫ slowest healthy scrape
+const DEFAULT_SWEEP_INTERVAL_MS = 30_000;
+// Starvation signal: the deadlock's exact shape was "every seat busy AND
+// callers queued", sustained. Nothing alerted on it for a day.
+const DEFAULT_STARVATION_MS = 10 * 60_000;
+
+function positiveIntFromEnv(env, name, fallback) {
+    const raw = env?.[name];
+    if (raw === undefined || raw === null || raw === '') return fallback;
+    const value = Number.parseInt(String(raw), 10);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 export function lockDirectory(env = process.env) {
     const configured = env?.CLOAKBROWSER_LICENSE_LOCK_DIR;
     return configured && String(configured).trim()
@@ -122,7 +149,26 @@ export class LicensePool {
             cleanupTimer: null,
             cleanupAttempt: 0,
             cleanupWarned: false,
+            // Fencing token. Incremented on every reclaim so a late release
+            // from a timed-out holder cannot free the seat its successor now
+            // owns — without this the TTL backstop would cause double-frees,
+            // which is worse than the leak it fixes.
+            epoch: 0,
+            leasedAt: null,
+            leaseLabel: null,
         }));
+        this._now = options.now ?? (() => Date.now());
+        this._leaseTtlMs = options.leaseTtlMs
+            ?? positiveIntFromEnv(this._env, 'CLOAKBROWSER_LEASE_TTL_MS', DEFAULT_LEASE_TTL_MS);
+        this._sweepIntervalMs = options.sweepIntervalMs
+            ?? positiveIntFromEnv(this._env, 'CLOAKBROWSER_LEASE_SWEEP_MS', DEFAULT_SWEEP_INTERVAL_MS);
+        this._starvationMs = options.starvationMs
+            ?? positiveIntFromEnv(this._env, 'CLOAKBROWSER_STARVATION_MS', DEFAULT_STARVATION_MS);
+        this._starvingSince = null;
+        this._starvationWarned = false;
+        this._reclaimed = 0;
+        this._sweepTimer = null;
+        if (options.autoSweep !== false) this._startSweep();
         this._waiters = [];
         this._locking = options.locking ?? true;
         this._lockDir = lockDir;
@@ -137,10 +183,10 @@ export class LicensePool {
 
     get size() { return this._seats.length; }
 
-    acquire() {
+    acquire(label = null) {
         if (this._lockError) return Promise.reject(this._lockError);
         return new Promise((resolve, reject) => {
-            this._waiters.push({ resolve, reject });
+            this._waiters.push({ resolve, reject, label });
             this._drain();
         });
     }
@@ -289,7 +335,7 @@ export class LicensePool {
                     continue;
                 }
                 const waiter = this._waiters.shift();
-                waiter.resolve(this._lease(seat));
+                waiter.resolve(this._lease(seat, waiter.label));
             }
             if (this._waiters.length && this._seats.some((seat) => !seat.busy)) this._scheduleRetry();
         } finally {
@@ -297,16 +343,105 @@ export class LicensePool {
         }
     }
 
-    _lease(seat) {
+    _lease(seat, label = null) {
         let released = false;
+        const epoch = seat.epoch;      // fencing token, see seat.epoch
+        const now = this._now;
+        seat.leasedAt = now();
+        seat.leaseLabel = label;
         return {
             key: seat.key,
+            get age() { return seat.epoch === epoch && seat.leasedAt !== null ? now() - seat.leasedAt : 0; },
             release: () => {
                 if (released) return;   // idempotent: a double release must not free a seat twice
                 released = true;
+                // The seat may have been force-reclaimed and re-leased while
+                // this holder was hung. Releasing then would free somebody
+                // else's seat.
+                if (seat.epoch !== epoch) {
+                    log.warn('Late release from a reclaimed CloakBrowser seat — ignored', {
+                        key: seat.key ? `${String(seat.key).slice(0, 12)}…` : null,
+                        leaseEpoch: epoch,
+                        seatEpoch: seat.epoch,
+                    });
+                    return;
+                }
                 this._releaseSeat(seat);
             },
         };
+    }
+
+    /**
+     * Force-reclaim any seat leased longer than the TTL, and emit a starvation
+     * alert when every seat is busy with callers queued for too long.
+     *
+     * Deliberately does NOT try to kill the browser that leaked the seat — we
+     * cannot know it is safe to, and CloakBrowser's limit is server-side
+     * anyway. Freeing the local seat lets queued work proceed; a genuinely
+     * orphaned remote session ages out on its own.
+     */
+    sweep() {
+        const now = this._now();
+        for (const seat of this._seats) {
+            if (!seat.busy || seat.leasedAt === null) continue;
+            const heldMs = now - seat.leasedAt;
+            if (heldMs < this._leaseTtlMs) continue;
+            log.error('CloakBrowser seat exceeded lease TTL — force-reclaiming', {
+                key: seat.key ? `${String(seat.key).slice(0, 12)}…` : null,
+                heldMs,
+                ttlMs: this._leaseTtlMs,
+                label: seat.leaseLabel,
+                scraper_alert: 'cloakbrowser_seat_reclaimed',
+            });
+            seat.epoch += 1;           // invalidate the hung holder's lease
+            seat.leasedAt = null;
+            seat.leaseLabel = null;
+            this._reclaimed += 1;
+            this._releaseSeat(seat);
+        }
+        this._checkStarvation(now);
+        return this._reclaimed;
+    }
+
+    _checkStarvation(now = this._now()) {
+        const { seats, inUse, waiting } = this.stats();
+        const starving = waiting > 0 && inUse >= seats;
+        if (!starving) {
+            if (this._starvationWarned) {
+                log.info('CloakBrowser seat starvation cleared', this.stats());
+            }
+            this._starvingSince = null;
+            this._starvationWarned = false;
+            return false;
+        }
+        if (this._starvingSince === null) this._starvingSince = now;
+        const forMs = now - this._starvingSince;
+        if (forMs >= this._starvationMs && !this._starvationWarned) {
+            this._starvationWarned = true;
+            // This is the exact signature of the 2026-08-03 outage: free == 0
+            // with a climbing queue, sustained. Nothing watched for it.
+            log.error('CloakBrowser seats starved — every seat busy with callers queued', {
+                seats, inUse, waiting, forMs,
+                scraper_alert: 'cloakbrowser_seats_starved',
+            });
+        }
+        return this._starvationWarned;
+    }
+
+    _startSweep() {
+        if (this._sweepTimer) return;
+        const timer = setInterval(() => {
+            try { this.sweep(); }
+            catch (error) { log.warn('CloakBrowser seat sweep failed', { err: error?.message }); }
+        }, this._sweepIntervalMs);
+        timer.unref?.();
+        this._sweepTimer = timer;
+    }
+
+    stopSweep() {
+        if (!this._sweepTimer) return;
+        clearInterval(this._sweepTimer);
+        this._sweepTimer = null;
     }
 
     _releaseSeat(seat) {
@@ -344,14 +479,27 @@ export class LicensePool {
 
     _free(seat) {
         seat.busy = false;
+        seat.leasedAt = null;
+        seat.leaseLabel = null;
         this._drain();
     }
 
     stats() {
+        const now = this._now();
+        const held = this._seats
+            .filter((s) => s.busy && s.leasedAt !== null)
+            .map((s) => now - s.leasedAt);
+        const inUse = this._seats.filter((s) => s.busy).length;
         return {
             seats: this._seats.length,
-            inUse: this._seats.filter((s) => s.busy).length,
+            inUse,
+            free: this._seats.length - inUse,
             waiting: this._waiters.length,
+            // Surfaced on /panel so the deadlock signature is visible without
+            // reading logs: a climbing oldestLeaseMs with free === 0 is a leak.
+            oldestLeaseMs: held.length ? Math.max(...held) : 0,
+            reclaimed: this._reclaimed,
+            starved: this._starvationWarned,
         };
     }
 

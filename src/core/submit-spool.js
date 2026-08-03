@@ -20,8 +20,63 @@ const log = createLogger('submit-spool');
 
 const DEFAULT_SPOOL_DIR = path.join('results', 'spool');
 
+// A file older than this is backlog, not evidence that delivery is failing NOW.
+const DEFAULT_ACTIVE_WINDOW_MS = 15 * 60_000;
+
 function spoolDir() {
     return process.env.SPOOL_DIR || DEFAULT_SPOOL_DIR;
+}
+
+/**
+ * Describe the spool so an alert can tell "delivery is failing right now" from
+ * "there is an old backlog nobody has drained".
+ *
+ * The panel reported "backend delivery is failing" purely because the
+ * directory was non-empty, so on 2026-08-03 it warned continuously while
+ * Indeed submissions were being accepted — the alert and reality disagreed
+ * for 34 hours and the real problem (nothing drains the spool) stayed hidden.
+ *
+ * @param {object} [opts]
+ * @param {number} [opts.activeWindowMs] treat files newer than this as live failures
+ * @param {number} [opts.now] injectable clock for tests
+ * @returns {Promise<{count:number, recent:number, oldest:string|null,
+ *   newest:string|null, deliveryFailingNow:boolean, backlog:boolean}>}
+ */
+export async function spoolStats(opts = {}) {
+    const dir = spoolDir();
+    const activeWindowMs = opts.activeWindowMs ?? DEFAULT_ACTIVE_WINDOW_MS;
+    const now = opts.now ?? Date.now();
+
+    let names;
+    try {
+        names = (await readdir(dir)).filter((n) => n.endsWith('.json'));
+    } catch {
+        // No spool directory at all is the healthy steady state.
+        return { count: 0, recent: 0, oldest: null, newest: null, deliveryFailingNow: false, backlog: false };
+    }
+
+    let recent = 0;
+    let oldestMs = null;
+    let newestMs = null;
+    for (const name of names) {
+        let mtimeMs;
+        try { ({ mtimeMs } = await stat(path.join(dir, name))); }
+        catch { continue; }
+        if (now - mtimeMs <= activeWindowMs) recent += 1;
+        if (oldestMs === null || mtimeMs < oldestMs) oldestMs = mtimeMs;
+        if (newestMs === null || mtimeMs > newestMs) newestMs = mtimeMs;
+    }
+
+    return {
+        count: names.length,
+        recent,
+        oldest: oldestMs === null ? null : new Date(oldestMs).toISOString(),
+        newest: newestMs === null ? null : new Date(newestMs).toISOString(),
+        // Only true when something failed inside the active window.
+        deliveryFailingNow: recent > 0,
+        // Undrained work sitting on disk — a different problem, different fix.
+        backlog: names.length > recent,
+    };
 }
 
 function safeSegment(value) {
@@ -84,34 +139,8 @@ export async function spoolUndeliverableSubmission(payload) {
         return null;
     }
 }
-
-/**
- * Read-only summary for the control panel: how many undelivered submissions
- * are sitting in the spool and the oldest one's timestamp. Never throws — an
- * absent spool dir (the common case) reads as `{ count: 0, oldest: null }`.
- *
- * @returns {Promise<{count: number, oldest: string|null}>}
- */
-export async function spoolSnapshot() {
-    const dir = spoolDir();
-    let entries;
-    try {
-        entries = await readdir(dir);
-    } catch {
-        return { count: 0, oldest: null };
-    }
-    const files = entries.filter((name) => name.endsWith('.json'));
-    if (files.length === 0) return { count: 0, oldest: null };
-
-    let oldestMs = null;
-    for (const name of files) {
-        try {
-            const info = await stat(path.join(dir, name));
-            if (oldestMs === null || info.mtimeMs < oldestMs) oldestMs = info.mtimeMs;
-        } catch { /* a file that vanished mid-scan just doesn't count toward oldest */ }
-    }
-    return {
-        count: files.length,
-        oldest: oldestMs === null ? null : new Date(oldestMs).toISOString(),
-    };
-}
+// NOTE: `spoolSnapshot()` used to live here and returned only
+// `{ count, oldest }`. It has been folded into `spoolStats()` above, which is
+// a strict superset. Keeping two functions scanning the same directory was
+// how the panel ended up alerting on "count > 0" — a condition that is true
+// for a stale backlog nobody has drained, not just for a live outage.

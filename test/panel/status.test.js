@@ -21,7 +21,7 @@ function baseDeps(overrides = {}) {
         licensePool: { snapshot: () => ({ total: 2, leased: 1, free: 1, waiting: 0, leasedKeys: ['k1'] }) },
         proxyPool: { snapshot: () => ({ total: 3, leased: 1, cooling: [] }) },
         cooldownSnapshot: () => ({}),
-        spoolSnapshot: async () => ({ count: 0, oldest: null }),
+        spoolStats: async () => ({ count: 0, recent: 0, oldest: null, newest: null, deliveryFailingNow: false, backlog: false }),
         overrides: { pausedList: () => [] },
         recent: { list: () => [] },
         now: () => new Date('2026-08-01T00:10:00.000Z'),
@@ -53,11 +53,52 @@ test('buildStatus: zero free license seats → warn alert', async () => {
     assert.ok(status.alerts.some((a) => a.level === 'warn' && /CloakBrowser seats/.test(a.message)));
 });
 
-test('buildStatus: non-empty spool → warn alert with count', async () => {
+// A non-empty spool is NOT by itself evidence that delivery is broken. Alerting
+// on count alone is what made the panel warn "backend delivery is failing" for
+// 34 hours (2026-08-01 → 08-03) while Indeed submissions were being accepted.
+test('buildStatus: stale spool backlog → warn about replay, NOT "delivery is failing"', async () => {
     const status = await buildStatus(baseDeps({
-        spoolSnapshot: async () => ({ count: 3, oldest: '2026-07-31T00:00:00.000Z' }),
+        spoolStats: async () => ({
+            count: 3554, recent: 0,
+            oldest: '2026-08-01T22:40:25.965Z', newest: '2026-08-03T08:50:47.687Z',
+            deliveryFailingNow: false, backlog: true,
+        }),
     }));
-    assert.ok(status.alerts.some((a) => a.level === 'warn' && /3 submission/.test(a.message)));
+    assert.ok(
+        status.alerts.some((a) => a.level === 'warn' && /awaiting replay/.test(a.message)),
+        'operator is told there is undrained work',
+    );
+    assert.ok(
+        !status.alerts.some((a) => /delivery is failing NOW/.test(a.message)),
+        'must NOT claim a live outage when nothing recent failed',
+    );
+});
+
+test('buildStatus: a recent delivery failure → error alert', async () => {
+    const status = await buildStatus(baseDeps({
+        spoolStats: async () => ({
+            count: 5, recent: 5,
+            oldest: '2026-08-03T09:00:00.000Z', newest: '2026-08-03T09:05:00.000Z',
+            deliveryFailingNow: true, backlog: false,
+        }),
+    }));
+    assert.ok(status.alerts.some((a) => a.level === 'error' && /failing NOW/.test(a.message)));
+});
+
+// free === 0 is normal when both seats are doing real work; the deadlock
+// signature was zero free seats WITH callers queued.
+test('buildStatus: all seats busy but nothing queued → no seat alert', async () => {
+    const status = await buildStatus(baseDeps({
+        licensePool: { snapshot: () => ({ total: 2, leased: 2, free: 0, waiting: 0, leasedKeys: ['a', 'b'] }) },
+    }));
+    assert.ok(!status.alerts.some((a) => /CloakBrowser seats/.test(a.message)));
+});
+
+test('buildStatus: all seats busy AND launches queued → seat-leak warning', async () => {
+    const status = await buildStatus(baseDeps({
+        licensePool: { snapshot: () => ({ total: 2, leased: 2, free: 0, waiting: 576, leasedKeys: ['a', 'b'] }) },
+    }));
+    assert.ok(status.alerts.some((a) => a.level === 'warn' && /576 launch\(es\) queued/.test(a.message)));
 });
 
 test('buildStatus: auto-checker not running → error alert (only when a queue is configured)', async () => {

@@ -18,14 +18,32 @@ let _launcher = cloakbrowser;
 export function __setLauncherForTest(launcher) { _launcher = launcher ?? cloakbrowser; }
 
 // Release the seat when the browser/context closes — whatever else happens.
-// Wrapping close() keeps every existing call site unchanged; they already close
-// what they open, so the seat follows the object's own lifetime.
+//
+// Wrapping close() alone is NOT enough (2026-08-03 outage). Two paths reach a
+// dead browser without close() ever completing:
+//   1. the browser dies on its own — CloakBrowser kills the session ("Target
+//      page, context or browser has been closed"), so nobody calls close();
+//   2. close() itself HANGS — callers wrap it in try/catch, which catches
+//      errors but not hangs, so the `finally` never runs.
+// Both leak the seat permanently. Binding to the object's own lifecycle event
+// covers (1); the pool's lease TTL is the backstop that covers (2) and any
+// caller that is abandoned mid-scrape.
 function releaseOnClose(target, lease) {
     if (!target || typeof target.close !== 'function') {
         // Nothing to hang the release on; free the seat now rather than leak it.
         lease.release();
         return target;
     }
+
+    // Playwright Browser emits 'disconnected'; BrowserContext emits 'close'.
+    // Whichever this object supports, a death that bypasses close() still
+    // frees the seat. release() is idempotent so double-firing is harmless.
+    if (typeof target.on === 'function') {
+        for (const event of ['disconnected', 'close']) {
+            try { target.on(event, () => lease.release()); } catch { /* not an emitter */ }
+        }
+    }
+
     const close = target.close.bind(target);
     target.close = async (...args) => {
         try {
@@ -43,7 +61,7 @@ async function withSeat(name, run) {
     if (before.inUse >= before.seats) {
         log.info(`${name}: all CloakBrowser seats busy, waiting`, before);
     }
-    const lease = await pool.acquire();
+    const lease = await pool.acquire(name);
     let target;
     try {
         target = await run(lease.key);

@@ -3,9 +3,15 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spoolSnapshot } from '../../src/core/submit-spool.js';
+import { spoolStats } from '../../src/core/submit-spool.js';
 
+// spoolSnapshot() was folded into spoolStats(), which returns a superset.
+// These cases still pin the count/oldest contract the control panel reads;
+// the failing-now vs backlog split is covered in submit-spool-stats.test.js.
 let dir;
+
+// spoolStats returns more fields; these tests assert the panel-facing subset.
+const pick = ({ count, oldest }) => ({ count, oldest });
 
 test.beforeEach(async () => {
     dir = await mkdtemp(path.join(os.tmpdir(), 'blacklight-spool-'));
@@ -17,22 +23,22 @@ test.afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
 });
 
-test('spoolSnapshot: no spool directory yet → count 0, oldest null', async () => {
+test('spoolStats: no spool directory yet → count 0, oldest null', async () => {
     process.env.SPOOL_DIR = path.join(dir, 'does-not-exist');
-    assert.deepEqual(await spoolSnapshot(), { count: 0, oldest: null });
+    assert.deepEqual(pick(await spoolStats()), { count: 0, oldest: null });
 });
 
-test('spoolSnapshot: empty spool directory → count 0, oldest null', async () => {
-    assert.deepEqual(await spoolSnapshot(), { count: 0, oldest: null });
+test('spoolStats: empty spool directory → count 0, oldest null', async () => {
+    assert.deepEqual(pick(await spoolStats()), { count: 0, oldest: null });
 });
 
-test('spoolSnapshot: counts .json files and reports the oldest mtime', async () => {
+test('spoolStats: counts .json files and reports the oldest mtime', async () => {
     await writeFile(path.join(dir, 'a.json'), '{}');
     await new Promise((r) => setTimeout(r, 5));
     await writeFile(path.join(dir, 'b.json'), '{}');
     await writeFile(path.join(dir, 'ignore.txt'), 'not json');
 
-    const snap = await spoolSnapshot();
+    const snap = await spoolStats();
     assert.equal(snap.count, 2);
     assert.equal(typeof snap.oldest, 'string');
     // a.json was written first, so its mtime is the oldest.

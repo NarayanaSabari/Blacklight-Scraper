@@ -7,7 +7,7 @@
 //
 // All dependencies are injected (buildStatus(deps)) rather than imported as
 // singletons, so it's unit-testable without a live process, a real
-// CloakBrowser pool, or disk I/O beyond what deps.spoolSnapshot chooses to do.
+// CloakBrowser pool, or disk I/O beyond what deps.spoolStats chooses to do.
 
 import { existsSync } from 'node:fs';
 import { PLATFORM_NAMES } from '../scrapers/registry.js';
@@ -33,7 +33,8 @@ function pickLatestSession(activeSessions) {
  * @param {{snapshot: () => object}} deps.licensePool
  * @param {{snapshot: () => object}} deps.proxyPool
  * @param {(now?: Date) => object} deps.cooldownSnapshot
- * @param {() => Promise<{count: number, oldest: string|null}>} deps.spoolSnapshot
+ * @param {() => Promise<{count:number, recent:number, oldest:string|null,
+ *   newest:string|null, deliveryFailingNow:boolean, backlog:boolean}>} deps.spoolStats
  * @param {import('./overrides.js').PlatformOverrides} deps.overrides
  * @param {{list: () => Array}} deps.recent
  * @param {import('./linkedin-login-controller.js').LinkedInLoginController} [deps.loginController]
@@ -48,7 +49,7 @@ export async function buildStatus(deps) {
         licensePool,
         proxyPool,
         cooldownSnapshot,
-        spoolSnapshot,
+        spoolStats,
         overrides,
         recent,
         loginController,
@@ -107,7 +108,9 @@ export async function buildStatus(deps) {
         login,
     };
 
-    const spool = spoolSnapshot ? await spoolSnapshot() : { count: 0, oldest: null };
+    const spool = spoolStats
+        ? await spoolStats()
+        : { count: 0, recent: 0, oldest: null, newest: null, deliveryFailingNow: false, backlog: false };
 
     const recentSubmissions = recent ? recent.list() : [];
     const pausedPlatforms = overrides ? overrides.pausedList() : [];
@@ -116,11 +119,31 @@ export async function buildStatus(deps) {
     if (linkedin.needsRelogin) {
         alerts.push({ level: 'error', message: 'LinkedIn needs re-login — profile exists but the session is not alive.' });
     }
-    if (spool.count > 0) {
-        alerts.push({ level: 'warn', message: `${spool.count} submission(s) spooled locally — backend delivery is failing.` });
+    // Two DIFFERENT conditions, deliberately not merged into "spool is non-empty".
+    // That single test is why the panel warned "backend delivery is failing" for
+    // 34 hours (2026-08-01 → 08-03) while Indeed submissions were being accepted:
+    // the spool had a stale backlog and nothing drains it. An always-on alarm is
+    // an ignored alarm, and it hid the real problem.
+    if (spool.deliveryFailingNow) {
+        alerts.push({
+            level: 'error',
+            message: `${spool.recent} submission(s) failed to deliver in the last 15 min — backend delivery is failing NOW.`,
+        });
     }
-    if (licenses.total > 0 && licenses.free === 0) {
-        alerts.push({ level: 'warn', message: 'No free CloakBrowser seats — new launches will queue.' });
+    if (spool.backlog) {
+        alerts.push({
+            level: 'warn',
+            message: `${spool.count} spooled submission(s) awaiting replay (oldest ${spool.oldest}) — run drain_scraper_spool.py.`,
+        });
+    }
+    // `free === 0` alone is NORMAL — it just means every seat is doing real work.
+    // The 2026-08-03 deadlock signature was zero free seats WITH callers queued,
+    // sustained, so requiring `waiting > 0` is what makes this alert mean something.
+    if (licenses.total > 0 && licenses.free === 0 && licenses.waiting > 0) {
+        alerts.push({
+            level: 'warn',
+            message: `No free CloakBrowser seats and ${licenses.waiting} launch(es) queued — seats may be leaking.`,
+        });
     }
     if (poll.enabled && !poll.running) {
         alerts.push({ level: 'error', message: 'Auto queue checker is not running — this host is not polling for work.' });

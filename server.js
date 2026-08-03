@@ -38,7 +38,7 @@ import { LinkedInLoginController } from './src/panel/linkedin-login-controller.j
 import { getLicensePool } from './src/core/license-pool.js';
 import { getProxyPool } from './src/core/proxy-pool.js';
 import { cooldownSnapshot } from './src/core/platform-cooldowns.js';
-import { spoolSnapshot } from './src/core/submit-spool.js';
+import { spoolStats } from './src/core/submit-spool.js';
 import { getPlatformOverrides } from './src/panel/overrides.js';
 import * as recentSubmissions from './src/panel/recent.js';
 
@@ -145,7 +145,7 @@ async function main() {
         licensePool: getLicensePool(),
         proxyPool: getProxyPool(),
         cooldownSnapshot,
-        spoolSnapshot,
+        spoolStats,
         overrides: getPlatformOverrides(),
         recent: recentSubmissions,
         loginController,

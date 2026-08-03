@@ -6,6 +6,14 @@ import { LicensePool, loadLicenseKeys, lockDirectory, parseKeyLine } from '../..
 import { __setLauncherForTest, launch, launchPersistentContext } from '../../src/core/browser-pool.js';
 import { __resetLicensePoolForTest } from '../../src/core/license-pool.js';
 
+// stats() carries extra diagnostics (free / oldestLeaseMs / reclaimed /
+// starved) for the panel. These tests care about seat accounting only, so
+// compare that subset rather than the whole object.
+const seatCounts = (pool) => {
+    const { seats, inUse, waiting } = pool.stats();
+    return { seats, inUse, waiting };
+};
+
 const browserLockDir = path.join(process.cwd(), '.test-license-pool-locks');
 nodeFs.rmSync(browserLockDir, { recursive: true, force: true });
 process.env.CLOAKBROWSER_LICENSE_LOCK_DIR = browserLockDir;
@@ -57,7 +65,7 @@ test('no keys configured still yields ONE seat carrying a null key', async () =>
     assert.equal(pool.size, 1);
     const lease = await pool.acquire();
     assert.equal(lease.key, null);
-    assert.deepEqual(pool.stats(), { seats: 1, inUse: 1, waiting: 0 });
+    assert.deepEqual(seatCounts(pool), { seats: 1, inUse: 1, waiting: 0 });
 });
 
 test('snapshot: read-only detail for the control panel — total/leased/free/leasedKeys', async () => {
@@ -80,7 +88,7 @@ test('acquire hands out each key once, then queues until a seat frees', async ()
     const a = await pool.acquire();
     const b = await pool.acquire();
     assert.deepEqual([a.key, b.key].sort(), ['k1', 'k2']);
-    assert.deepEqual(pool.stats(), { seats: 2, inUse: 2, waiting: 0 });
+    assert.deepEqual(seatCounts(pool), { seats: 2, inUse: 2, waiting: 0 });
 
     let third = null;
     const pending = pool.acquire().then((l) => { third = l; });
@@ -91,7 +99,7 @@ test('acquire hands out each key once, then queues until a seat frees', async ()
     a.release();
     await pending;
     assert.equal(third.key, a.key, 'the freed seat is handed to the waiter');
-    assert.deepEqual(pool.stats(), { seats: 2, inUse: 2, waiting: 0 });
+    assert.deepEqual(seatCounts(pool), { seats: 2, inUse: 2, waiting: 0 });
 });
 
 test('release is idempotent — a double release cannot free a seat twice', async () => {
@@ -99,7 +107,7 @@ test('release is idempotent — a double release cannot free a seat twice', asyn
     const lease = await pool.acquire();
     lease.release();
     lease.release();
-    assert.deepEqual(pool.stats(), { seats: 1, inUse: 0, waiting: 0 });
+    assert.deepEqual(seatCounts(pool), { seats: 1, inUse: 0, waiting: 0 });
     // The seat is genuinely reusable, exactly once.
     const again = await pool.acquire();
     assert.equal(again.key, 'k1');

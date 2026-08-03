@@ -44,7 +44,7 @@ function sendLoginError(res, error, fallbackLogMessage) {
  * @param {{snapshot: () => object}} deps.licensePool
  * @param {{snapshot: () => object}} deps.proxyPool
  * @param {(now?: Date) => object} deps.cooldownSnapshot
- * @param {() => Promise<object>} deps.spoolSnapshot
+ * @param {() => Promise<object>} deps.spoolStats
  * @param {import('./overrides.js').PlatformOverrides} deps.overrides
  * @param {{list: () => Array}} deps.recent
  * @param {() => Promise<void>} deps.requestRestart - the SAME graceful shutdown server.js wires to SIGINT/SIGTERM
@@ -58,7 +58,7 @@ export function registerPanelRoutes(app, deps) {
         licensePool: deps.licensePool,
         proxyPool: deps.proxyPool,
         cooldownSnapshot: deps.cooldownSnapshot,
-        spoolSnapshot: deps.spoolSnapshot,
+        spoolStats: deps.spoolStats,
         overrides: deps.overrides,
         recent: deps.recent,
         loginController: deps.loginController,
