@@ -28,7 +28,7 @@ export class QueueOrchestrator {
     constructor({
         blacklightConfig, queueConfig, defaultLocation,
         client = null, metrics = null, scraperResolver = null, cooldownCheck = null,
-        platformOverrides = null,
+        platformOverrides = null, sweepSchedule = null,
     }) {
         if (!client && !blacklightConfig) {
             throw new Error('QueueOrchestrator requires blacklightConfig');
@@ -46,6 +46,7 @@ export class QueueOrchestrator {
         // SCR-18 (#401): at most ONE follow-up poll may be pending at a time.
         // See #schedulePoll.
         this._pollScheduled = false;
+        this._sweepSchedule = sweepSchedule;
         // Panel-only bookkeeping (read via snapshot()). Never consulted by the
         // workflow itself, so getting it wrong can't change scraping behavior.
         this._lastPollAt = null;
@@ -75,6 +76,23 @@ export class QueueOrchestrator {
     // singleton in prod (see src/panel/overrides.js).
     #overrides() {
         return this._platformOverrides ?? getPlatformOverrides();
+    }
+
+    // Cadence gate. Intervals are read through the overrides object on every
+    // call, so changing one in the control panel takes effect on the next
+    // cycle — no restart, no deploy.
+    #schedule() {
+        if (!this._sweepSchedule) {
+            this._sweepSchedule = new SweepSchedule({
+                intervalMinutes: (platform) => this.#overrides().intervalMinutes(platform),
+            });
+        }
+        return this._sweepSchedule;
+    }
+
+    /** Read-only cadence view for the control panel. */
+    sweepSnapshot() {
+        return this.#schedule().snapshot();
     }
 
     // ----- public API -------------------------------------------------------

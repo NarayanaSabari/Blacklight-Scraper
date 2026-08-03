@@ -123,6 +123,27 @@ export function registerPanelRoutes(app, deps) {
         }
     });
 
+    // Sweep cadence: how often a platform may start a fresh pass over the
+    // queue. Body: { minutes: number } — 0/null clears it back to "every
+    // cycle". Lives here so retuning Indeed's hourly sweep needs no deploy.
+    app.post('/panel/api/platform/:name/interval', panelAccessGuard, (req, res) => {
+        try {
+            const raw = req.body?.minutes;
+            if (raw !== null && raw !== undefined && raw !== 0 && !Number.isFinite(Number(raw))) {
+                return sendJson(res, 400, { success: false, error: 'minutes must be a number, 0, or null' });
+            }
+            const intervals = deps.overrides.setInterval(req.params.name, raw);
+            log.info('Sweep interval changed', { platform: req.params.name, minutes: raw });
+            return sendJson(res, 200, { success: true, intervals });
+        } catch (error) {
+            if (error instanceof UnknownPlatformError) {
+                return sendJson(res, 404, { success: false, error: error.message });
+            }
+            log.error('Failed to set sweep interval', { platform: req.params.name, err: error.message });
+            return sendJson(res, 500, { success: false, error: error.message });
+        }
+    });
+
     app.post('/panel/api/restart', panelAccessGuard, (req, res) => {
         const force = req.body?.force === true;
         const sessions = activeSessions(deps.orchestrator);

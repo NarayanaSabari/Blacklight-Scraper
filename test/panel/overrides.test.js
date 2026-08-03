@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { PlatformOverrides, UnknownPlatformError } from '../../src/panel/overrides.js';
 
 const KNOWN = ['dice', 'indeed', 'glassdoor'];
+const FILE = 'config/platform-overrides.json';
 
 function fakeFs(initialFiles = {}) {
     const files = new Map(Object.entries(initialFiles));
@@ -75,4 +76,87 @@ test('filterAllowed drops paused platforms from a candidate list', () => {
     const overrides = new PlatformOverrides({ filePath: 'config/platform-overrides.json', fs: fakeFs(), knownPlatforms: KNOWN });
     overrides.pause('indeed');
     assert.deepEqual(overrides.filterAllowed(['dice', 'indeed', 'glassdoor']), ['dice', 'glassdoor']);
+});
+
+// ─── per-platform sweep cadence (2026-08-03) ────────────────────────────
+// Indeed was re-scraping every role every ~5 min for a 0.29% import rate.
+// The interval lives here so an operator can retune it from the panel
+// without a code deploy.
+
+test('intervalMinutes: platforms without a built-in default claim every cycle', () => {
+    const o = new PlatformOverrides({ filePath: FILE, fs: fakeFs(), knownPlatforms: KNOWN, env: {} });
+    assert.equal(o.intervalMinutes('dice'), null);
+    assert.equal(o.intervalMinutes('glassdoor'), null);
+});
+
+test('indeed ships with a 60-minute default sweep', () => {
+    const o = new PlatformOverrides({ filePath: FILE, fs: fakeFs(), knownPlatforms: KNOWN, env: {} });
+    assert.equal(o.intervalMinutes('indeed'), 60);
+});
+
+test('env overrides the built-in default; the file overrides env', () => {
+    const fsImpl = fakeFs();
+    const env = { SCRAPE_INTERVAL_INDEED_MINUTES: '30' };
+    const a = new PlatformOverrides({ filePath: FILE, fs: fsImpl, knownPlatforms: KNOWN, env });
+    assert.equal(a.intervalMinutes('indeed'), 30, 'env beats the default');
+
+    a.setInterval('indeed', 90);
+    const b = new PlatformOverrides({ filePath: FILE, fs: fsImpl, knownPlatforms: KNOWN, env });
+    assert.equal(b.intervalMinutes('indeed'), 90, 'an explicit panel value beats env');
+});
+
+test('turning the cadence OFF is not silently re-defaulted', () => {
+    const fsImpl = fakeFs();
+    const a = new PlatformOverrides({ filePath: FILE, fs: fsImpl, knownPlatforms: KNOWN, env: {} });
+    a.setInterval('indeed', 0);
+    assert.equal(a.intervalMinutes('indeed'), null);
+
+    const b = new PlatformOverrides({ filePath: FILE, fs: fsImpl, knownPlatforms: KNOWN, env: {} });
+    assert.equal(b.intervalMinutes('indeed'), null, 'stays off across a restart');
+});
+
+test('setInterval persists and round-trips through the file', () => {
+    const fsImpl = fakeFs();
+    const file = FILE;
+    const a = new PlatformOverrides({ filePath: file, fs: fsImpl, knownPlatforms: KNOWN });
+    a.setInterval('indeed', 60);
+    assert.equal(a.intervalMinutes('indeed'), 60);
+
+    const b = new PlatformOverrides({ filePath: file, fs: fsImpl, knownPlatforms: KNOWN });
+    assert.equal(b.intervalMinutes('indeed'), 60, 'survives a restart');
+});
+
+test('setInterval(0 or null) clears the cadence', () => {
+    const o = new PlatformOverrides({ filePath: FILE, fs: fakeFs(), knownPlatforms: KNOWN, env: {} });
+    o.setInterval('indeed', 60);
+    o.setInterval('indeed', 0);
+    assert.equal(o.intervalMinutes('indeed'), null);
+});
+
+test('setInterval rejects an unknown platform', () => {
+    const o = new PlatformOverrides({ filePath: FILE, fs: fakeFs(), knownPlatforms: KNOWN });
+    assert.throws(() => o.setInterval('nope', 60), UnknownPlatformError);
+});
+
+test('pause and interval coexist in one file', () => {
+    const fsImpl = fakeFs();
+    const file = FILE;
+    const a = new PlatformOverrides({ filePath: file, fs: fsImpl, knownPlatforms: KNOWN });
+    a.pause('glassdoor');
+    a.setInterval('indeed', 60);
+
+    const b = new PlatformOverrides({ filePath: file, fs: fsImpl, knownPlatforms: KNOWN });
+    assert.deepEqual(b.pausedList(), ['glassdoor']);
+    assert.equal(b.intervalMinutes('indeed'), 60);
+});
+
+test('a garbage interval in the file is ignored, not fatal', () => {
+    const fsImpl = fakeFs();
+    const file = FILE;
+    fsImpl.writeFileSync(file, JSON.stringify({
+        paused: [], intervals: { indeed: 'soon', dice: -5, nope: 60 },
+    }));
+    const o = new PlatformOverrides({ filePath: file, fs: fsImpl, knownPlatforms: KNOWN, env: {} });
+    assert.equal(o.intervalMinutes('indeed'), 60, 'garbage ignored → falls back to the default');
+    assert.equal(o.intervalMinutes('dice'), null);
 });

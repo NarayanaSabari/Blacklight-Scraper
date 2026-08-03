@@ -108,6 +108,10 @@ export async function buildStatus(deps) {
         login,
     };
 
+    // Per-platform sweep cadence + the last sweep's counters, so the -83%
+    // sessions / flat imports prediction is checkable from the panel too.
+    const sweeps = orchestrator?.sweepSnapshot ? orchestrator.sweepSnapshot() : {};
+
     const spool = spoolStats
         ? await spoolStats()
         : { count: 0, recent: 0, oldest: null, newest: null, deliveryFailingNow: false, backlog: false };
@@ -176,6 +180,7 @@ export async function buildStatus(deps) {
         cooldowns,
         linkedin,
         spool,
+        sweeps,
         recentSubmissions,
         pausedPlatforms,
         alerts,
