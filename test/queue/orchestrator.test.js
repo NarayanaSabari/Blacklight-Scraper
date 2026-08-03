@@ -368,3 +368,43 @@ test('sweepSnapshot reflects a platform that has begun a sweep', () => {
     const snap = orchestrator.sweepSnapshot();
     assert.deepEqual(snap, {}, 'nothing swept yet');
 });
+
+test('sweep counters are attributed to the platform NAME, not "[object object]"', async () => {
+    // The claim response returns platforms as {id, name, display_name} objects
+    // while the gate works in strings. Recording the object stringified it to
+    // one junk key, so every sweep summary read roles: 0 / sessions: 0 — which
+    // is precisely the number the cadence change was supposed to be judged on.
+    // Observed live on m1 2026-08-03: the panel listed an "[object object]"
+    // platform alongside the real six.
+    const m = fakeMetrics();
+    let claimed = false;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => ({ indeed: 1 }),
+        getNextRole: async () => {
+            if (claimed) return { assignments: [] };   // claim once — else re-polls forever
+            claimed = true;
+            return {
+                assignments: [{
+                    session_id: 'sess-1',
+                    role: { name: 'Backend Engineer', search_queries: ['backend engineer'] },
+                    platforms: [{ id: 1, name: 'indeed', display_name: 'Indeed' }],
+                }],
+            };
+        },
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: m,
+        platformOverrides: { intervalMinutes: (p) => (p === 'indeed' ? 60 : null), pausedList: () => [] },
+        scraperResolver: () => ({
+            executeWithMeta: async () => ({ jobs: [], emptyConfirmed: true }),
+        }),
+    });
+
+    await o.runOnce().catch(() => {});
+
+    const snap = o.sweepSnapshot();
+    assert.ok(!('[object object]' in snap), `junk platform key present: ${Object.keys(snap)}`);
+    assert.ok('indeed' in snap, `expected indeed, got ${Object.keys(snap)}`);
+});

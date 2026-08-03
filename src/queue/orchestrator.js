@@ -383,7 +383,13 @@ export class QueueOrchestrator {
         });
         for (const assignment of assignments) {
             for (const platform of assignment.platforms) {
-                schedule.record(platform, { roles: 1, sessions: 1 });
+                // The claim response returns platforms as OBJECTS
+                // ({id, name, display_name}) while the gating path above works in
+                // plain strings. Passing the object straight through stringified
+                // it to "[object object]", so every sweep's roles/sessions landed
+                // in one junk bucket and the per-platform summary that makes the
+                // cadence change measurable always read 0. Observed live on m1.
+                schedule.record(platform?.name ?? platform, { roles: 1, sessions: 1 });
             }
         }
         return queueResult;
