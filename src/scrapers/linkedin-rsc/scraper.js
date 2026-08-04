@@ -23,6 +23,33 @@ import { titleFromPost, locationFromPost, companyFromPost } from './post-fields.
 
 const log = createLogger('linkedin-rsc');
 
+// A candidate query runs to EXHAUSTION — no post ceiling. A recruiter asked for
+// this specific search, and stopping at 100 threw away most of it: measured on
+// two live recruiter queries, exhaustion is ~250-350 posts, so the old cap was
+// discarding roughly 3.4x the results. Pagination already terminates on its own
+// when a page adds nothing new, so "no cap" is bounded by LinkedIn, not by us.
+//
+// Role sweeps deliberately KEEP the 100 cap. They run ~135 roles/hour and
+// lifting it there multiplies steady-state load for a different purpose.
+const CANDIDATE_MAX_POSTS = Number.MAX_SAFE_INTEGER;
+
+// Page guard, not a result limit. At the modest page size this is ~20k posts —
+// far beyond any observed query — and exists only so a pathological response
+// loop cannot page forever.
+const CANDIDATE_MAX_PAGES = 2000;
+
+// ⚠️ COUPLED TO THE BACKEND. RolePlatformQueueService.INFLIGHT_GRACE_SECONDS is
+// 600s: after that the backend treats this session as an orphaned claim and
+// lets another scraper claim the same platform, which would double-scrape. A
+// long scrape does not move the session's updated_at (nothing is submitted
+// until the end), so the scrape MUST finish well inside that window.
+//
+// 420s leaves ~3 minutes of margin. Measured cost at the default page size is
+// ~3 minutes for a ~340-post query, so this should never trip; if it does, the
+// alert below fires and the result is knowingly incomplete. Raising the backend
+// grace window without raising this is safe; the reverse is not.
+const CANDIDATE_TIME_BUDGET_MS = 420_000;
+
 // Author display names are not in this payload, only the profile handle. Present
 // it readably rather than inventing a company. LinkedIn post "company" was
 // always weak — the importer's LinkedIn dedup keys on title + body, not company.
@@ -110,22 +137,48 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         || pickSessionQuery(variants, rng)
         || buildBooleanSearchQuery(jobTitle);
 
+    // Candidate-scoped runs lift the post cap entirely and add a wall-clock
+    // safety valve instead. `count` is deliberately NOT raised: DEFAULT_COUNT is
+    // low because a large page size is the most obvious automation tell in this
+    // approach, and the account is worth more than the saved requests.
+    const scoped = Boolean(candidateQuery);
+    const effectiveMaxPosts = scoped ? CANDIDATE_MAX_POSTS : maxPosts;
+    const effectiveMaxPages = scoped ? CANDIDATE_MAX_PAGES : undefined;
+    const timeBudgetMs = scoped ? CANDIDATE_TIME_BUDGET_MS : 0;
+
     log.info('Starting RSC scrape', {
-        jobTitle, keywords, datePosted, count, maxPosts,
-        candidateScoped: Boolean(candidateQuery),
+        jobTitle, keywords, datePosted, count,
+        maxPosts: scoped ? 'uncapped' : maxPosts,
+        candidateScoped: scoped,
     });
 
     return session.withCookies(sessionId, async (cookies, lease) => {
         const requestTemplate = template ?? await session.template();
 
-        const { posts, emptyConfirmed, pages } = await paginateImpl({
+        const { posts, emptyConfirmed, pages, budgetExhausted } = await paginateImpl({
             template: requestTemplate,
             cookies,
             keywords,
             datePosted,
-            maxPosts,
+            maxPosts: effectiveMaxPosts,
             count,
+            ...(effectiveMaxPages ? { maxPages: effectiveMaxPages } : {}),
+            timeBudgetMs,
         });
+
+        if (budgetExhausted) {
+            // Should never fire: measured exhaustion is ~3 minutes against a
+            // 7-minute budget. If it does, the result is incomplete AND the
+            // scrape is approaching the backend's 600s orphan window, which
+            // would let a second scraper claim the same platform.
+            log.error('Candidate query hit its time budget — result is incomplete', {
+                keywords,
+                posts: posts.length,
+                requests: pages?.length ?? 0,
+                budgetMs: CANDIDATE_TIME_BUDGET_MS,
+                scraper_alert: 'candidate_query_time_budget',
+            });
+        }
 
         const jobs = posts.map((post) => postToJob(post, location));
 
@@ -135,6 +188,8 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             withEmail: posts.filter((p) => (p.contact_emails ?? []).length > 0).length,
             requests: pages?.length ?? 0,
             emptyConfirmed,
+            candidateScoped: scoped,
+            budgetExhausted,
         });
 
         // Per-role liveness against the held lease, as the DOM path does.

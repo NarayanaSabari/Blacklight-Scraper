@@ -261,3 +261,79 @@ test('scrapeLinkedInRsc: role path is untouched when no candidate query is given
     });
     assert.equal(used, '"Data Engineer" AND (c2c OR W2 OR 1099)');
 });
+
+// --- candidate queries run to exhaustion ------------------------------------
+
+function countingPaginate(pagesOfPosts) {
+    // Serves one page per call, then goes empty — mirrors LinkedIn's real
+    // behaviour where an exhausted result set stops adding new posts.
+    const calls = [];
+    let i = 0;
+    return {
+        calls,
+        impl: async (args) => {
+            calls.push(args);
+            const posts = pagesOfPosts[i] ?? [];
+            i += 1;
+            return { posts, emptyConfirmed: false, pages: [{ page: i }] };
+        },
+    };
+}
+
+test('scrapeLinkedInRsc: a candidate query lifts the post cap', async () => {
+    // 100 was discarding ~3.4x the available results on real recruiter queries.
+    const { calls, impl } = countingPaginate([[POST]]);
+    await scrapeLinkedInRsc('Data Engineer', 'United States', 'sess-1', {
+        session: fakeSession(),
+        template: { url: 'https://x', headers: {}, postData: '{}' },
+        candidateQuery: '"Data Engineer" AND (c2c OR W2)',
+        paginateImpl: impl,
+    });
+    assert.equal(calls[0].maxPosts, Number.MAX_SAFE_INTEGER);
+});
+
+test('scrapeLinkedInRsc: a ROLE sweep keeps the 100 cap', async () => {
+    // Role sweeps run ~135/hour; lifting the cap there multiplies steady-state
+    // load for a different purpose and is deliberately not part of this change.
+    const { calls, impl } = countingPaginate([[POST]]);
+    await scrapeLinkedInRsc('Data Engineer', 'United States', 'sess-1', {
+        session: fakeSession(),
+        template: { url: 'https://x', headers: {}, postData: '{}' },
+        paginateImpl: impl,
+    });
+    assert.equal(calls[0].maxPosts, 100);
+    assert.equal(calls[0].timeBudgetMs, 0, 'role sweeps get no time budget');
+});
+
+test('scrapeLinkedInRsc: candidate queries do NOT raise the page size', async () => {
+    // DEFAULT_COUNT is small on purpose — a large page size is the most obvious
+    // automation tell in this transport, and the LinkedIn account is worth more
+    // than the saved requests. Lifting the post cap must not smuggle that in.
+    const { calls, impl } = countingPaginate([[POST]]);
+    await scrapeLinkedInRsc('Data Engineer', 'United States', 'sess-1', {
+        session: fakeSession(),
+        template: { url: 'https://x', headers: {}, postData: '{}' },
+        candidateQuery: '"Data Engineer"',
+        count: 10,
+        paginateImpl: impl,
+    });
+    assert.equal(calls[0].count, 10);
+    assert.ok(calls[0].count <= 10, 'page size must stay modest for anti-detection');
+});
+
+test('scrapeLinkedInRsc: candidate queries carry a wall-clock safety valve', async () => {
+    const { calls, impl } = countingPaginate([[POST]]);
+    await scrapeLinkedInRsc('Data Engineer', 'United States', 'sess-1', {
+        session: fakeSession(),
+        template: { url: 'https://x', headers: {}, postData: '{}' },
+        candidateQuery: '"Data Engineer"',
+        paginateImpl: impl,
+    });
+    // Must stay comfortably under the backend's 600s orphan window, or a long
+    // scrape lets a second scraper claim the same platform and double-scrape.
+    assert.ok(calls[0].timeBudgetMs > 0);
+    assert.ok(
+        calls[0].timeBudgetMs < 600_000,
+        `budget ${calls[0].timeBudgetMs}ms must stay under INFLIGHT_GRACE_SECONDS (600s)`,
+    );
+});

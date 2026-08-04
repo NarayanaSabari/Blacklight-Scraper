@@ -177,16 +177,30 @@ export async function paginate({
     maxPosts = 100,
     count = DEFAULT_COUNT,
     maxPages = 10,
+    // Wall-clock ceiling in ms; 0 disables it. This is a SAFETY VALVE, not a
+    // result limit — see the note on CANDIDATE_TIME_BUDGET_MS in scraper.js.
+    timeBudgetMs = 0,
     fetchImpl = fetch,
     delay = defaultDelay,
     rng = Math.random,
+    now = () => Date.now(),
 }) {
     const posts = [];
     const seen = new Set();
     const pages = [];
     let sawNoResultsSignal = false;
+    let budgetExhausted = false;
+    // NOT `startedAt` — the loop body declares its own `startedAt` for per-page
+    // latency, and shadowing it puts this reference in the temporal dead zone.
+    const runStartedAt = now();
 
     for (let page = 0; page < maxPages && posts.length < maxPosts; page++) {
+        // Checked BEFORE the request, not after: tripping the budget must stop
+        // us issuing more work, and a partial result is still worth returning.
+        if (timeBudgetMs > 0 && now() - runStartedAt >= timeBudgetMs) {
+            budgetExhausted = true;
+            break;
+        }
         if (page > 0) await delay(nextPause(rng));
 
         const startedAt = Date.now();
@@ -229,5 +243,9 @@ export async function paginate({
         // unconfirmed so it surfaces as a failure rather than a clean zero.
         emptyConfirmed: posts.length === 0 && sawNoResultsSignal,
         pages,
+        // True when we stopped on the clock rather than because LinkedIn ran
+        // out. The caller alerts on this: it should never happen in practice,
+        // and if it does the result is silently incomplete.
+        budgetExhausted,
     };
 }

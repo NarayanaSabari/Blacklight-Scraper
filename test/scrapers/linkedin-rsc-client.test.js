@@ -264,3 +264,44 @@ test('paginate: an empty page with NO no-results signal is not a confirmed empty
     assert.equal(posts.length, 0);
     assert.equal(emptyConfirmed, false);
 });
+
+// --- time budget ------------------------------------------------------------
+
+test('paginate: stops on the time budget and says so', async () => {
+    // Each page yields a NEW post so `added === 0` never fires — the only thing
+    // that can stop this walk is the clock.
+    let clock = 0;
+    let calls = 0;
+    const fetchImpl = async () => {
+        calls += 1;
+        return okResponse(
+            fakePage(`74879146565530255${10 + calls}`, `h${calls}`, `Hiring engineer number ${calls} now`),
+        );
+    };
+    const { posts, budgetExhausted } = await paginate({
+        template: TEMPLATE, cookies: COOKIES, keywords: 'x',
+        maxPosts: Number.MAX_SAFE_INTEGER,   // no post ceiling
+        count: 1,
+        maxPages: 500,
+        timeBudgetMs: 1000,
+        now: () => clock,
+        delay: async () => { clock += 400; },  // each page "costs" 400ms
+        fetchImpl,
+    });
+
+    assert.equal(budgetExhausted, true, 'must report that it stopped on the clock');
+    assert.ok(calls < 500, `stopped after ${calls} pages, not the 500-page guard`);
+    assert.ok(posts.length > 0, 'a partial result is still returned');
+});
+
+test('paginate: no budget by default, and budgetExhausted stays false', async () => {
+    const body = JSON.stringify({ posts: [] });
+    const { budgetExhausted } = await paginate({
+        template: TEMPLATE,
+        cookies: COOKIES,
+        keywords: 'x',
+        maxPages: 1,
+        fetchImpl: async () => ({ ok: true, status: 200, text: async () => body }),
+    });
+    assert.equal(budgetExhausted, false);
+});
