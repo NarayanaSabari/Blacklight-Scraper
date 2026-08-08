@@ -15,18 +15,39 @@ import { PLATFORM_NAMES } from '../scrapers/registry.js';
 
 const log = createLogger('panel:overrides');
 
-// Built-in sweep cadences, in minutes. Only Indeed is slowed by default:
-// measured 2026-08-03 it re-scraped every role every ~5.1 min for a 0.29%
-// import rate (344 scraped records per import, vs Dice's 4), because 69.4% of
-// what came back was `duplicate_platform_id`. Import volume tracks how fast
-// Indeed publishes, not how often we ask. Every other platform keeps its
-// historical every-cycle behaviour.
+// Built-in sweep cadences, in minutes. Indeed was slowed first: measured
+// 2026-08-03 it re-scraped every role every ~5.1 min for a 0.29% import rate
+// (344 scraped records per import, vs Dice's 4), because 69.4% of what came
+// back was `duplicate_platform_id`. Import volume tracks how fast a board
+// publishes, not how often we ask.
+//
+// Dice and TechFetch have since fallen into exactly the same hole. Measured
+// over 2026-08-05→08 on prod `session_platform_status`:
+//
+//   platform    runs    found     imported   yield
+//   dice        4,654   153,951   3,438      2.2%
+//   techfetch   2,424    93,460     930      1.0%
+//   indeed      1,444    53,274   14,715    27.6%   ← already on a cadence
+//
+// Dice was at 24.9% when the Indeed cadence was written; it is at 2.2% now.
+// An hour between sweeps is the cadence that fixed Indeed, and hourly is well
+// inside how fast either board publishes, so the same number is used here
+// rather than inventing a second one. The cost of being wrong is bounded and
+// visible: a lower import count per day, adjustable from the control panel
+// with no restart.
+//
+// LinkedIn is deliberately left on every-cycle - it serves candidate boolean
+// queries whose whole value is freshness, and it is seat-limited anyway.
 //
 // Precedence: an explicit value in platform-overrides.json (set from the
 // control panel) > env SCRAPE_INTERVAL_<PLATFORM>_MINUTES > this default.
 // A stored 0 means "the operator deliberately turned the cadence OFF" and is
 // NOT re-defaulted.
-export const DEFAULT_SWEEP_INTERVAL_MINUTES = Object.freeze({ indeed: 60 });
+export const DEFAULT_SWEEP_INTERVAL_MINUTES = Object.freeze({
+    indeed: 60,
+    dice: 60,
+    techfetch: 60,
+});
 
 function envInterval(platform, env = process.env) {
     const raw = env?.[`SCRAPE_INTERVAL_${platform.toUpperCase()}_MINUTES`];

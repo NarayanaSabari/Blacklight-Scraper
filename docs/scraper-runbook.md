@@ -149,6 +149,21 @@ with a one-session limit, so extra concurrency means extra keys (or a paid plan)
   active registry entries already enable strict handling and return confirmed-empty
   signals where the platform can prove a genuine zero.
 - `PROXY_BLOCK_COOLDOWN_MS` — per-IP cooldown after a block (default 600000).
+- `SCRAPE_INTERVAL_<PLATFORM>_MINUTES` - minutes between sweeps for one platform.
+  `indeed`, `dice` and `techfetch` default to 60; everything else claims on every
+  cycle. Precedence is panel override > this env var > the built-in default, and a
+  panel value of 0 means "deliberately off" and is never re-defaulted.
+- `DICE_CRAWLER_MEMORY_MB` - the memory budget crawlee's AutoscaledPool measures
+  against for Dice's detail fetches. Defaults to 75% of host RAM. crawlee's own
+  default is 25%, which on a host that also runs every platform's Chromium reads
+  as a permanent overload and throttles Dice toward concurrency 1 while the OS
+  still has GBs free.
+- `LOG_ROTATE_MAX_MB` / `LOG_ROTATE_KEEP` / `LOG_ROTATE_INTERVAL_MS` / `LOG_DIR` -
+  in-process copytruncate rotation of `logs/stdout.log` and `logs/stderr.log`
+  (defaults 100 MB, 3 archives, every 5 min, `logs`). `LOG_ROTATE_MAX_MB=0`
+  disables it. The files belong to the supervisor shell's `>>` redirection, so
+  rotation copies aside and truncates rather than renaming - a rename would leave
+  the shell writing into a file nobody can find.
 
 ## Deploy checklist
 1. `git pull` (Windows: restart after pull).

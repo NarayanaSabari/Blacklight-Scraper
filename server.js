@@ -19,6 +19,7 @@ import express from 'express';
 import { getConfig, reloadConfig } from './src/config/env.js';
 import { ensureApiKey } from './src/setup/ensure-api-key.js';
 import { createLogger, attachLokiSink, attachMetricsSink } from './src/logger/index.js';
+import { startLogRotation } from './src/logger/rotate.js';
 import { initializeCredentialsClient, getCredentialsClient } from './src/api/credentials.js';
 import { getLinkedInRscSession } from './src/scrapers/linkedin-rsc/session.js';
 import { QueueOrchestrator } from './src/queue/orchestrator.js';
@@ -121,6 +122,9 @@ async function main() {
         strict: bootInfo.strict,
     });
     initializeCredentialsClient();
+    // Housekeeping, not telemetry: the log files belong to the supervisor
+    // shell's redirection, so nothing else in the stack can bound their size.
+    const stopLogRotation = startLogRotation();
     const orchestrator = buildOrchestrator(config);
 
     const app = express();
@@ -194,6 +198,7 @@ async function main() {
         log.info('Shutdown initiated', { signal, budgetMs: SHUTDOWN_BUDGET_MS, reason: shutdownReason, ...bootInfo });
         orchestrator?.stopAutoChecker();
         telemetry.heartbeat.stop();
+        stopLogRotation?.();
 
         const steps = [
             ['pusher', telemetry.pusher.stop({ finalPush: true })],

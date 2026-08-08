@@ -7,8 +7,9 @@
 // fingerprint surface). humanize:false because there's nothing to fool
 // and the behavioral overhead would slow the 5-page-then-100-detail
 // scrape pattern down meaningfully.
+import os from 'node:os';
 import { launch } from '../src/core/browser-pool.js';
-import { CheerioCrawler, RequestQueue } from 'crawlee';
+import { CheerioCrawler, RequestQueue, Configuration } from 'crawlee';
 import * as cheerio from 'cheerio';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
@@ -201,6 +202,39 @@ const CONFIG = {
     DETAIL_CONTEXTS: 5,
     DETAIL_DOM_CHANGED_THRESHOLD: 0.30,  // > 30% bad rows = batch DOM changed
 };
+
+// ─── crawlee's memory budget ──────────────────────────────────────────────
+//
+// crawlee's AutoscaledPool halves its own concurrency whenever the Snapshotter
+// reports "memory overloaded", and the budget it measures against defaults to
+// availableMemoryRatio 0.25 - a quarter of system RAM. That default is written
+// for a container running one crawler and nothing else. This daemon is the
+// opposite: a single node process that also owns every platform's Playwright
+// Chromium, and the Snapshotter measures the WHOLE process, children included.
+//
+// Measured on the m1 host (16 GB, 2026-08-08): 13,893 warnings in 88h reading
+//   `Memory is critically overloaded. Using 4887 MB of 4040 MB (121%)`
+// while the OS still had 7.5 GB free. LinkedIn's and TechFetch's browsers were
+// being charged to Dice's quota, so Dice's pool sat throttled near concurrency
+// 1 and DICE_DETAIL_CONCURRENCY=10 never actually applied.
+//
+// So give crawlee a budget that reflects the HOST rather than a quarter of it.
+// The pool should back off when the machine is genuinely near capacity, which
+// is what the mechanism is for, and not before. Dice is the only crawlee
+// consumer in this codebase, so setting the global config is scoped in
+// practice - and it must be the global config rather than a per-crawler
+// `Configuration`, because RequestQueue.open() below resolves its storage
+// client from the global one and a split config would hand the crawler a queue
+// it does not own.
+const DEFAULT_CRAWLEE_MEMORY_RATIO = 0.75;
+
+export function crawleeMemoryMb(env = process.env, totalBytes = os.totalmem()) {
+    const explicit = Number(env.DICE_CRAWLER_MEMORY_MB);
+    if (Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
+    return Math.floor((totalBytes / (1024 * 1024)) * DEFAULT_CRAWLEE_MEMORY_RATIO);
+}
+
+Configuration.getGlobalConfig().set('memoryMbytes', crawleeMemoryMb());
 
 export function buildSearchUrl(jobTitle, location, pageNum) {
     const q = encodeURIComponent(jobTitle);

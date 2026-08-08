@@ -85,13 +85,32 @@ test('filterAllowed drops paused platforms from a candidate list', () => {
 
 test('intervalMinutes: platforms without a built-in default claim every cycle', () => {
     const o = new PlatformOverrides({ filePath: FILE, fs: fakeFs(), knownPlatforms: KNOWN, env: {} });
-    assert.equal(o.intervalMinutes('dice'), null);
     assert.equal(o.intervalMinutes('glassdoor'), null);
 });
 
-test('indeed ships with a 60-minute default sweep', () => {
-    const o = new PlatformOverrides({ filePath: FILE, fs: fakeFs(), knownPlatforms: KNOWN, env: {} });
+test('the high-volume, low-yield boards ship with a 60-minute default sweep', () => {
+    // dice and techfetch joined indeed on 2026-08-08: measured over the prior
+    // 3 days they imported 2.2% and 1.0% of what they scraped, against
+    // indeed's 27.6% on an hourly cadence.
+    const o = new PlatformOverrides({
+        filePath: FILE,
+        fs: fakeFs(),
+        knownPlatforms: [...KNOWN, 'techfetch'],
+        env: {},
+    });
     assert.equal(o.intervalMinutes('indeed'), 60);
+    assert.equal(o.intervalMinutes('dice'), 60);
+    assert.equal(o.intervalMinutes('techfetch'), 60);
+});
+
+test('linkedin stays on every-cycle: candidate boolean queries trade on freshness', () => {
+    const o = new PlatformOverrides({
+        filePath: FILE,
+        fs: fakeFs(),
+        knownPlatforms: [...KNOWN, 'linkedin'],
+        env: {},
+    });
+    assert.equal(o.intervalMinutes('linkedin'), null);
 });
 
 test('env overrides the built-in default; the file overrides env', () => {
@@ -158,5 +177,6 @@ test('a garbage interval in the file is ignored, not fatal', () => {
     }));
     const o = new PlatformOverrides({ filePath: file, fs: fsImpl, knownPlatforms: KNOWN, env: {} });
     assert.equal(o.intervalMinutes('indeed'), 60, 'garbage ignored → falls back to the default');
-    assert.equal(o.intervalMinutes('dice'), null);
+    assert.equal(o.intervalMinutes('dice'), 60, 'a negative value is garbage, not a deliberate 0');
+    assert.equal(o.intervalMinutes('glassdoor'), null, 'no default → still every cycle');
 });
