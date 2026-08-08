@@ -7,10 +7,9 @@
 // fingerprint surface). humanize:false because there's nothing to fool
 // and the behavioral overhead would slow the 5-page-then-100-detail
 // scrape pattern down meaningfully.
-import os from 'node:os';
 import { launch } from '../src/core/browser-pool.js';
-import { CheerioCrawler, RequestQueue, Configuration } from 'crawlee';
 import * as cheerio from 'cheerio';
+import { Semaphore } from '../src/core/semaphore.js';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
@@ -203,38 +202,50 @@ const CONFIG = {
     DETAIL_DOM_CHANGED_THRESHOLD: 0.30,  // > 30% bad rows = batch DOM changed
 };
 
-// ─── crawlee's memory budget ──────────────────────────────────────────────
-//
-// crawlee's AutoscaledPool halves its own concurrency whenever the Snapshotter
-// reports "memory overloaded", and the budget it measures against defaults to
-// availableMemoryRatio 0.25 - a quarter of system RAM. That default is written
-// for a container running one crawler and nothing else. This daemon is the
-// opposite: a single node process that also owns every platform's Playwright
-// Chromium, and the Snapshotter measures the WHOLE process, children included.
-//
-// Measured on the m1 host (16 GB, 2026-08-08): 13,893 warnings in 88h reading
-//   `Memory is critically overloaded. Using 4887 MB of 4040 MB (121%)`
-// while the OS still had 7.5 GB free. LinkedIn's and TechFetch's browsers were
-// being charged to Dice's quota, so Dice's pool sat throttled near concurrency
-// 1 and DICE_DETAIL_CONCURRENCY=10 never actually applied.
-//
-// So give crawlee a budget that reflects the HOST rather than a quarter of it.
-// The pool should back off when the machine is genuinely near capacity, which
-// is what the mechanism is for, and not before. Dice is the only crawlee
-// consumer in this codebase, so setting the global config is scoped in
-// practice - and it must be the global config rather than a per-crawler
-// `Configuration`, because RequestQueue.open() below resolves its storage
-// client from the global one and a split config would hand the crawler a queue
-// it does not own.
-const DEFAULT_CRAWLEE_MEMORY_RATIO = 0.75;
+// Wall-clock ceiling for one detail job, replacing CheerioCrawler's
+// requestHandlerTimeoutSecs. The navigation has its own 30s timeout but
+// page.content() and the parse below have none, so without this one wedged
+// page holds a concurrency slot forever.
+const DETAIL_JOB_TIMEOUT_MS = 180_000;
 
-export function crawleeMemoryMb(env = process.env, totalBytes = os.totalmem()) {
-    const explicit = Number(env.DICE_CRAWLER_MEMORY_MB);
-    if (Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
-    return Math.floor((totalBytes / (1024 * 1024)) * DEFAULT_CRAWLEE_MEMORY_RATIO);
+/**
+ * Run `worker` over every item with at most `limit` in flight.
+ *
+ * Rejections are contained per item: one bad detail page must not abort the
+ * other 39. The worker is expected to do its own error accounting, so this
+ * returns nothing.
+ */
+export async function mapWithConcurrency(items, limit, worker) {
+    const sem = new Semaphore(limit);
+    await Promise.all(items.map(async (item, index) => {
+        const release = await sem.acquire();
+        try {
+            await worker(item, index);
+        } finally {
+            release();
+        }
+    }));
 }
 
-Configuration.getGlobalConfig().set('memoryMbytes', crawleeMemoryMb());
+/** Reject after `ms`, so a wedged page cannot hold its slot indefinitely. */
+export function withDeadline(promise, ms, label) {
+    let timer;
+    const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Distinct URLs, order preserved.
+ *
+ * CheerioCrawler's RequestQueue used to provide this. Dropping it without
+ * replacing it would let a search page that lists the same job twice be
+ * fetched, parsed and collected twice.
+ */
+export function dedupeUrls(urls) {
+    return [...new Set(urls)];
+}
 
 export function buildSearchUrl(jobTitle, location, pageNum) {
     const q = encodeURIComponent(jobTitle);
@@ -253,7 +264,6 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
     const contextsToCleanup = [];
     const collectedJobs = [];
     let collectedAnything = false;
-    let detailQueue = null;
 
     try {
         // ─── Stage 1: search-page URL collection ──────────────────────────
@@ -351,92 +361,119 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
         let domChangedCount = 0;
         let processedCount = 0;
 
-        // Fresh per-run queue. crawlee's DEFAULT RequestQueue is process-
-        // persistent and dedups by URL, so across the daemon's many Dice
-        // sessions repeat job URLs were silently skipped — the detail handler
-        // never ran (processedCount stayed 0) and a 20-anchor page yielded
-        // 0 jobs ("confirmed empty"). An ephemeral per-session queue (dropped
-        // in finally) gives every run a clean slate.
-        detailQueue = await RequestQueue.open(
-            `dice-detail-${sessionId ?? Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        );
+        // ─── Why this is a plain semaphore and not CheerioCrawler ─────────
+        //
+        // This stage used to run through crawlee's CheerioCrawler, which was a
+        // straight doubling of Dice's traffic and time. CheerioCrawler ALWAYS
+        // performs its own HTTP GET of the request URL before invoking the
+        // handler, and this handler ignored that response entirely and
+        // re-fetched the same URL through Playwright, because the JSON-LD is
+        // only reliably present on the browser-rendered page. Every Dice detail
+        // page was pulled twice, once for nothing.
+        //
+        // Crawlee was providing four things; all four are cheaper here:
+        //   - concurrency        -> Semaphore, the house primitive
+        //   - a per-job timeout  -> withDeadline (crawlee's 180s, preserved)
+        //   - URL dedup          -> dedupeUrls
+        //   - retries            -> dropped deliberately, see below
+        //
+        // Dropping retries is not a regression. `maxRequestRetries: 2` only
+        // ever fired when the HANDLER threw, and the handler caught its own
+        // navigation failures and returned normally, so nav failures - the one
+        // genuinely transient class here - were never retried in the first
+        // place. What could reach crawlee's retry was a parse or normalize
+        // throw, which is deterministic and produces the identical failure on
+        // attempts two and three. Retrying it burned a slot to reach the same
+        // answer.
+        //
+        // It also retires the process-persistent RequestQueue whose cross-run
+        // URL dedup silently skipped repeat jobs (handler never ran,
+        // processedCount stayed 0, a 20-anchor page reported "confirmed
+        // empty"). The ephemeral per-session queue was the workaround for
+        // that; with no queue at all the failure mode is gone, not worked
+        // around.
+        const detailUrls = dedupeUrls(jobsToProcess);
 
-        const crawler = new CheerioCrawler({
-            requestQueue: detailQueue,
-            maxConcurrency: CONFIG.DETAIL_CONCURRENCY,
-            maxRequestRetries: 2,
-            requestHandlerTimeoutSecs: 180,
-            async requestHandler({ request }) {
-                processedCount++;
-                logProgress('Dice', `Detail ${processedCount}/${jobsToProcess.length}: ${request.url}`);
-                const jobPage = await getCtx().newPage();
-                let pageHtml = '';
-                try {
-                    await jobPage.goto(request.url, { waitUntil: 'domcontentloaded', timeout: CONFIG.DETAIL_NAV_TIMEOUT_MS });
-                    if (CONFIG.DETAIL_RENDER_WAIT_MS > 0) await jobPage.waitForTimeout(CONFIG.DETAIL_RENDER_WAIT_MS);
-                    pageHtml = await jobPage.content();
-                } catch (e) {
-                    logProgress('Dice', `Detail nav failed: ${request.url} — ${e.message}`);
-                    try { await jobPage.close(); } catch {}
-                    return;
-                } finally {
-                    try { await jobPage.close(); } catch {}
-                }
+        await mapWithConcurrency(detailUrls, CONFIG.DETAIL_CONCURRENCY, async (url) => {
+            processedCount++;
+            logProgress('Dice', `Detail ${processedCount}/${detailUrls.length}: ${url}`);
 
-                const $job = cheerio.load(pageHtml);
-                const scriptBody = $job('script[id="jobDetailStructuredData"]').html();
-                const { data: jsonLd, error: parseErr } = parseStructuredData(scriptBody ?? '');
-                if (parseErr) {
-                    logProgress('Dice', `Detail dropped (${parseErr}): ${request.url}`);
-                    domChangedCount++;
-                    return;
-                }
-                if (jsonLd['@type'] !== 'JobPosting') {
-                    logProgress('Dice', `Detail dropped (@type=${jsonLd['@type']}): ${request.url}`);
-                    domChangedCount++;
-                    return;
-                }
-                const row = extractJobFromStructuredData(jsonLd, request.url);
-                if (row.__domChanged) {
-                    logProgress('Dice', `Detail dropped (${row.reason}): ${request.url}`);
-                    domChangedCount++;
-                    return;
-                }
-                // Skills + workplace type still pulled via Cheerio.
-                const skills = extractSkills($job);
-                const workplaceType = extractWorkplaceType($job);
+            let pageHtml = '';
+            try {
+                pageHtml = await withDeadline(
+                    (async () => {
+                        const jobPage = await getCtx().newPage();
+                        try {
+                            await jobPage.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.DETAIL_NAV_TIMEOUT_MS });
+                            if (CONFIG.DETAIL_RENDER_WAIT_MS > 0) await jobPage.waitForTimeout(CONFIG.DETAIL_RENDER_WAIT_MS);
+                            return await jobPage.content();
+                        } finally {
+                            try { await jobPage.close(); } catch {}
+                        }
+                    })(),
+                    DETAIL_JOB_TIMEOUT_MS,
+                    `Dice detail ${url}`,
+                );
+            } catch (e) {
+                // The same disposition crawlee's handler chose: give up on this
+                // page and do NOT count it as DOM-changed. A network failure is
+                // not evidence that Dice's markup moved, and letting it inflate
+                // domChangedCount would trip the batch gate on a bad network.
+                logProgress('Dice', `Detail nav failed: ${url} - ${e.message}`);
+                return;
+            }
 
-                const normalized = normalizeJobData({
-                    id: row.jobId,
-                    title: row.title,
-                    company: row.company,
-                    companyProfileUrl: row.companyProfileUrl,
-                    companyLogoUrl: row.companyLogoUrl,
-                    location: row.locationFormatted,
-                    city: row.city,
-                    state: row.state,
-                    country: row.country,
-                    isRemote: row.isRemote,
-                    workplaceType,
-                    salary: row.salaryFormatted,
-                    salary_min: row.salaryMin,
-                    salary_max: row.salaryMax,
-                    salary_currency: row.salaryCurrency,
-                    salary_period: row.salaryPeriod,
-                    postedDate: row.postedDate,
-                    validThrough: row.validThrough,
-                    description: stripHtmlTags(row.description),
-                    employmentType: row.employmentType,
-                    skills,
-                    url: row.url,
-                }, 'Dice');
-                collectedJobs.push(normalized);
-                collectedAnything = true;
-                logProgress('Dice', `✅ ${row.title} at ${row.company} (total ${collectedJobs.length})`);
-            },
+            const $job = cheerio.load(pageHtml);
+            const scriptBody = $job('script[id="jobDetailStructuredData"]').html();
+            const { data: jsonLd, error: parseErr } = parseStructuredData(scriptBody ?? '');
+            if (parseErr) {
+                logProgress('Dice', `Detail dropped (${parseErr}): ${url}`);
+                domChangedCount++;
+                return;
+            }
+            if (jsonLd['@type'] !== 'JobPosting') {
+                logProgress('Dice', `Detail dropped (@type=${jsonLd['@type']}): ${url}`);
+                domChangedCount++;
+                return;
+            }
+            const row = extractJobFromStructuredData(jsonLd, url);
+            if (row.__domChanged) {
+                logProgress('Dice', `Detail dropped (${row.reason}): ${url}`);
+                domChangedCount++;
+                return;
+            }
+            // Skills + workplace type still pulled via Cheerio.
+            const skills = extractSkills($job);
+            const workplaceType = extractWorkplaceType($job);
+
+            const normalized = normalizeJobData({
+                id: row.jobId,
+                title: row.title,
+                company: row.company,
+                companyProfileUrl: row.companyProfileUrl,
+                companyLogoUrl: row.companyLogoUrl,
+                location: row.locationFormatted,
+                city: row.city,
+                state: row.state,
+                country: row.country,
+                isRemote: row.isRemote,
+                workplaceType,
+                salary: row.salaryFormatted,
+                salary_min: row.salaryMin,
+                salary_max: row.salaryMax,
+                salary_currency: row.salaryCurrency,
+                salary_period: row.salaryPeriod,
+                postedDate: row.postedDate,
+                validThrough: row.validThrough,
+                description: stripHtmlTags(row.description),
+                employmentType: row.employmentType,
+                skills,
+                url: row.url,
+            }, 'Dice');
+            collectedJobs.push(normalized);
+            collectedAnything = true;
+            logProgress('Dice', `✅ ${row.title} at ${row.company} (total ${collectedJobs.length})`);
         });
-
-        await crawler.run(jobsToProcess.map((url) => ({ url })));
 
         // Batch-level DOM-changed gate.
         if (processedCount > 0) {
@@ -456,11 +493,6 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
         if (collectedJobs.length === 0) return { jobs: [], emptyConfirmed: true };
         return collectedJobs;
     } finally {
-        // Drop the ephemeral detail queue so it can't accumulate on disk or
-        // dedup a future run.
-        if (detailQueue) {
-            try { await detailQueue.drop(); } catch (err) { log.warn(`Failed to drop detail queue: ${err.message}`); }
-        }
         for (const ctx of contextsToCleanup) {
             try { await ctx.close(); } catch (err) {
                 log.warn(`Failed to close context: ${err.message}`);

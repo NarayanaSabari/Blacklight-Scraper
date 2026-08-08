@@ -153,11 +153,12 @@ with a one-session limit, so extra concurrency means extra keys (or a paid plan)
   `indeed`, `dice` and `techfetch` default to 60; everything else claims on every
   cycle. Precedence is panel override > this env var > the built-in default, and a
   panel value of 0 means "deliberately off" and is never re-defaulted.
-- `DICE_CRAWLER_MEMORY_MB` - the memory budget crawlee's AutoscaledPool measures
-  against for Dice's detail fetches. Defaults to 75% of host RAM. crawlee's own
-  default is 25%, which on a host that also runs every platform's Chromium reads
-  as a permanent overload and throttles Dice toward concurrency 1 while the OS
-  still has GBs free.
+- `DICE_DETAIL_CONCURRENCY` - detail pages fetched in parallel (default 10).
+  This is now enforced by a plain semaphore. It previously ran through crawlee,
+  whose AutoscaledPool measured the whole process (every platform's Chromium
+  included) against a default budget of 25% of RAM, read that as a permanent
+  overload, and throttled Dice toward concurrency 1 while the OS still had GBs
+  free. crawlee is no longer a dependency.
 - `LOG_ROTATE_MAX_MB` / `LOG_ROTATE_KEEP` / `LOG_ROTATE_INTERVAL_MS` / `LOG_DIR` -
   in-process copytruncate rotation of `logs/stdout.log` and `logs/stderr.log`
   (defaults 100 MB, 3 archives, every 5 min, `logs`). `LOG_ROTATE_MAX_MB=0`

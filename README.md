@@ -33,7 +33,7 @@ on the key's allowlist. Adding a new host = registering a new key.
   launches are seat-pooled, so excess browser launches wait when the
   configured licence keys are saturated.
 - **Multi-platform** - Monster (CloakBrowser + appsapi JSON behind
-  DataDome), Dice (CloakBrowser + Crawlee + Cheerio), TechFetch (CloakBrowser + login),
+  DataDome), Dice (CloakBrowser + Cheerio), TechFetch (CloakBrowser + login),
   LinkedIn (browserless RSC API with a persistent profile for auth), Glassdoor
   (`/graph` API plus CloakBrowser detail enrichment, with an opt-in browser
   fallback), Indeed (mobile API with an opt-in browser fallback)
@@ -73,8 +73,7 @@ npm ci
 
 This will install all required packages including:
 - Express.js (Web server)
-- Crawlee (Web scraping framework)
-- Playwright (browser automation used by Crawlee)
+- Playwright (browser automation)
 - Cheerio (HTML parsing)
 - JSDOM (DOM manipulation)
 
@@ -305,7 +304,7 @@ Job-Scraper/
 │
 ├── scrapers/                 # Platform-specific scraping logic
 │   ├── monster.js            # Monster Jobs (HTTP API)
-│   ├── dice.js               # Dice Jobs (CloakBrowser + Crawlee)
+│   ├── dice.js               # Dice Jobs (CloakBrowser + Cheerio)
 │   ├── techfetch.js          # TechFetch (requires login)
 │   ├── glassdoor.js          # Glassdoor browser fallback + detail extraction
 │   ├── glassdoor-api.js      # Glassdoor /graph discovery + detail enrichment
