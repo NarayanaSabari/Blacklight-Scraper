@@ -218,25 +218,39 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             budgetExhausted,
         });
 
-        // Per-role liveness against the held lease, as the DOM path does.
-        await lease?.reportSuccess?.(`RSC scrape: ${posts.length} posts`);
-
         // Shadow-ban canary. Posts — or known ground reached (`upToDate`,
         // LinkedIn positively served posts we already hold) — prove account
         // health. A zero-yield scrape feeds the credential's streak; at the
         // threshold, one extra request on a query that always has results
         // settles whether the account is banned or the queries were thin.
-        // Runs here, while the lease and cookie jar are still held.
+        //
+        // MUST run BEFORE reportSuccess: reportSuccess releases the lease, and
+        // the canary's ban report needs the lease alive to land. Observed in
+        // production 2026-08-17: the canary fired twice (11:20, 11:54), and
+        // both ban reports were dropped with "No active credential to report
+        // failure for" because the lease had already been released. The
+        // credential stayed `available` and kept being leased for four more
+        // hours of zero-yield sessions.
+        let canaryVerdict = null;
         if (jobs.length > 0 || upToDate) {
             canaryTracker.recordHealthy(lease);
         } else if (canaryTracker.recordEmpty(lease)) {
-            await runCanaryImpl({
+            canaryVerdict = await runCanaryImpl({
                 tracker: canaryTracker,
                 lease,
                 template: requestTemplate,
                 cookies,
                 paginateImpl,
             });
+        }
+
+        // Per-role liveness against the held lease, as the DOM path does.
+        // Skipped after a confirmed shadow-ban: the canary already reported
+        // the credential failed with a cooldown, and that report released the
+        // lease — a success ping here would land on the dead lease and, worse,
+        // contradict the verdict.
+        if (canaryVerdict !== 'shadow_banned') {
+            await lease?.reportSuccess?.(`RSC scrape: ${posts.length} posts`);
         }
 
         return { jobs, emptyConfirmed, upToDate: Boolean(upToDate) };

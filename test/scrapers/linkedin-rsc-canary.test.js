@@ -188,3 +188,43 @@ test('an up-to-date scrape (known ground) also counts as healthy', async () => {
     });
     assert.equal(tracker.streak(LEASE_A), 0);
 });
+
+test('the canary runs while the lease is still reportable (before reportSuccess)', async () => {
+    // reportSuccess releases the lease. Production 2026-08-17: the canary
+    // fired twice and both ban reports were dropped on a dead lease ("No
+    // active credential to report failure for"), leaving the banned account
+    // available for four more hours. The probe must run first.
+    const order = [];
+    const lease = {
+        credential: { profile_key: 'acct-a', name: 'A' },
+        reportSuccess: async () => order.push('success'),
+        reportFailure: async () => order.push('failure'),
+    };
+    const tracker = new CanaryTracker({ threshold: 1 });
+    await scrapeLinkedInRsc('Data Engineer', 'US', null, {
+        session: fakeSession(lease),
+        template: TEMPLATE,
+        paginateImpl: async () => ({ posts: [], emptyConfirmed: true }),
+        canaryTracker: tracker,
+        runCanaryImpl: async ({ lease: l }) => { await l.reportFailure(); return 'shadow_banned'; },
+    });
+    assert.deepEqual(order, ['failure'], 'ban report must precede (and replace) the success ping');
+});
+
+test('a healthy canary verdict still sends the liveness success ping', async () => {
+    const order = [];
+    const lease = {
+        credential: { profile_key: 'acct-a', name: 'A' },
+        reportSuccess: async () => order.push('success'),
+        reportFailure: async () => order.push('failure'),
+    };
+    const tracker = new CanaryTracker({ threshold: 1 });
+    await scrapeLinkedInRsc('Data Engineer', 'US', null, {
+        session: fakeSession(lease),
+        template: TEMPLATE,
+        paginateImpl: async () => ({ posts: [], emptyConfirmed: true }),
+        canaryTracker: tracker,
+        runCanaryImpl: async () => 'healthy',
+    });
+    assert.deepEqual(order, ['success']);
+});
