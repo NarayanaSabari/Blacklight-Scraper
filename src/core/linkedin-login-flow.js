@@ -60,18 +60,58 @@ export async function openLoginBrowser({ profileKey = null, proxy = null } = {},
     return { context, page };
 }
 
+// Explicit lifetime given to session-only auth cookies before the login
+// browser closes. 90 days tracks li_at's own typical lifetime; the value is
+// LinkedIn's, only the expiry changes.
+const PERSISTED_COOKIE_TTL_S = 90 * 24 * 3600;
+
 /**
  * Read cookies from the LIVE context, before closing it. Never throws — a
  * read failure comes back as `{ cookies: [], error }` so the caller can
  * decide what to do (the CLI warns and continues; the panel folds it into a
  * failed verdict).
+ *
+ * Also persists JSESSIONID with an explicit expiry (docs/TROUBLESHOOTING.md,
+ * "session cookies missing right after a successful login"): LinkedIn
+ * sometimes issues it as a session cookie (`expires: -1`), and Chromium
+ * discards session cookies when the browser closes. The RSC transport needs
+ * JSESSIONID as its csrf token, so without this step a freshly onboarded
+ * profile is dead on its first scrape — observed live onboarding the second
+ * pool account 2026-08-17: 27 cookies captured, JSESSIONID gone after close.
+ * Same value, only the lifetime changes. Best-effort: a persist failure is
+ * reported but does not fail the capture.
  */
-export async function captureSession({ context }) {
+export async function captureSession({ context, now = () => Date.now() }) {
+    let cookies;
     try {
-        const cookies = await context.cookies();
-        return { cookies, error: null };
+        cookies = await context.cookies();
     } catch (err) {
         return { cookies: [], error: err.message };
+    }
+
+    const sessionOnly = cookies.filter(
+        (c) => c.name === 'JSESSIONID'
+            && /linkedin/i.test(c.domain ?? '')
+            && (c.expires === undefined || c.expires === -1 || c.expires === 0),
+    );
+    if (sessionOnly.length === 0) return { cookies, error: null };
+
+    try {
+        await context.addCookies(sessionOnly.map((c) => ({
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            path: c.path || '/',
+            secure: c.secure !== false,
+            httpOnly: Boolean(c.httpOnly),
+            sameSite: c.sameSite || 'None',
+            expires: Math.floor(now() / 1000) + PERSISTED_COOKIE_TTL_S,
+        })));
+        return { cookies, error: null };
+    } catch (err) {
+        // The jar itself was read fine — surface the persist failure without
+        // discarding the capture.
+        return { cookies, error: `JSESSIONID persist failed: ${err.message}` };
     }
 }
 
