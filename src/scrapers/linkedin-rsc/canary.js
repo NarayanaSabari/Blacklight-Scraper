@@ -95,11 +95,23 @@ export class CanaryTracker {
         const key = keyFor(lease);
         const n = (this._streaks.get(key) ?? 0) + 1;
         this._streaks.set(key, n);
-        if (n < this._threshold) return false;
         // `!== undefined`, not truthiness: a probe recorded at timestamp 0 is
         // still a probe (bites with injected clocks in tests).
         const last = this._probedAt.get(key);
-        return !(last !== undefined && this._now() - last < this._probeIntervalMs);
+        const probeDue = n >= this._threshold
+            && !(last !== undefined && this._now() - last < this._probeIntervalMs);
+        // Streak telemetry. Sparse on purpose (approach + every 10th) so a
+        // banned account cycling fast doesn't flood the log — but never
+        // silent: production 2026-08-17 hit 51 consecutive zeros with no
+        // canary and no way to tell from the log which link of the chain
+        // (call, key, threshold, probe floor) had broken.
+        if (probeDue || n === this._threshold - 1 || n % 10 === 0) {
+            log.info('Zero-yield streak', {
+                key, streak: n, threshold: this._threshold, probeDue,
+                lastProbeAgoMs: last === undefined ? null : this._now() - last,
+            });
+        }
+        return probeDue;
     }
 
     noteProbe(lease) {
