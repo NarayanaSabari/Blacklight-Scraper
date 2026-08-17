@@ -20,6 +20,11 @@ import { pickSessionQuery, buildBooleanSearchQuery } from '../../core/linkedin-q
 import { paginate as defaultPaginate, countPerRequest } from './client.js';
 import { getLinkedInRscSession } from './session.js';
 import { getHighWaterStore } from './high-water.js';
+import { CanaryTracker, runCanary } from './canary.js';
+
+// One tracker per process: streaks are per-credential inside it, and the
+// canary's whole job is to observe across consecutive scrapes.
+const defaultCanaryTracker = new CanaryTracker();
 import { titleFromPost, locationFromPost, companyFromPost } from './post-fields.js';
 
 const log = createLogger('linkedin-rsc');
@@ -126,6 +131,8 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         datePosted = process.env.LINKEDIN_DATE_POSTED || 'past-24h',
         rng = Math.random,
         highWater = getHighWaterStore(),
+        canaryTracker = defaultCanaryTracker,
+        runCanaryImpl = runCanary,
     } = options;
 
     // A recruiter-authored query is used EXACTLY as written — no random pick.
@@ -213,6 +220,24 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
 
         // Per-role liveness against the held lease, as the DOM path does.
         await lease?.reportSuccess?.(`RSC scrape: ${posts.length} posts`);
+
+        // Shadow-ban canary. Posts — or known ground reached (`upToDate`,
+        // LinkedIn positively served posts we already hold) — prove account
+        // health. A zero-yield scrape feeds the credential's streak; at the
+        // threshold, one extra request on a query that always has results
+        // settles whether the account is banned or the queries were thin.
+        // Runs here, while the lease and cookie jar are still held.
+        if (jobs.length > 0 || upToDate) {
+            canaryTracker.recordHealthy(lease);
+        } else if (canaryTracker.recordEmpty(lease)) {
+            await runCanaryImpl({
+                tracker: canaryTracker,
+                lease,
+                template: requestTemplate,
+                cookies,
+                paginateImpl,
+            });
+        }
 
         return { jobs, emptyConfirmed, upToDate: Boolean(upToDate) };
     });
