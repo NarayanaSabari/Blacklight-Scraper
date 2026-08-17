@@ -56,10 +56,10 @@ test('openLoginBrowser: a profileKey routes through the per-account profile laun
 
 test('captureSession: returns cookies on success, never throws on failure', async () => {
     const ok = await captureSession({ context: fakeContext({ cookies: [{ name: 'li_at' }] }) });
-    assert.deepEqual(ok, { cookies: [{ name: 'li_at' }], error: null });
+    assert.deepEqual(ok, { cookies: [{ name: 'li_at' }], persisted: 0, error: null });
 
     const failed = await captureSession({ context: fakeContext({ cookiesError: new Error('closed') }) });
-    assert.deepEqual(failed, { cookies: [], error: 'closed' });
+    assert.deepEqual(failed, { cookies: [], persisted: 0, error: 'closed' });
 });
 
 test('captureSession: a session-only JSESSIONID is re-added with an explicit expiry', async () => {
@@ -73,8 +73,9 @@ test('captureSession: a session-only JSESSIONID is re-added with an explicit exp
             { name: 'JSESSIONID', value: '"ajax:1"', domain: '.www.linkedin.com', expires: -1 },
         ],
     });
-    const { error } = await captureSession({ context: ctx, now: () => 1_000_000_000_000 });
+    const { error, persisted } = await captureSession({ context: ctx, now: () => 1_000_000_000_000 });
     assert.equal(error, null);
+    assert.equal(persisted, 1, 'the response must report the persist so operators can verify without a profile read');
     assert.equal(ctx.added.length, 1);
     assert.equal(ctx.added[0].name, 'JSESSIONID');
     assert.equal(ctx.added[0].value, '"ajax:1"');

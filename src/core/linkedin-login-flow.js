@@ -86,7 +86,7 @@ export async function captureSession({ context, now = () => Date.now() }) {
     try {
         cookies = await context.cookies();
     } catch (err) {
-        return { cookies: [], error: err.message };
+        return { cookies: [], persisted: 0, error: err.message };
     }
 
     const sessionOnly = cookies.filter(
@@ -94,7 +94,7 @@ export async function captureSession({ context, now = () => Date.now() }) {
             && /linkedin/i.test(c.domain ?? '')
             && (c.expires === undefined || c.expires === -1 || c.expires === 0),
     );
-    if (sessionOnly.length === 0) return { cookies, error: null };
+    if (sessionOnly.length === 0) return { cookies, persisted: 0, error: null };
 
     try {
         await context.addCookies(sessionOnly.map((c) => ({
@@ -107,11 +107,11 @@ export async function captureSession({ context, now = () => Date.now() }) {
             sameSite: c.sameSite || 'None',
             expires: Math.floor(now() / 1000) + PERSISTED_COOKIE_TTL_S,
         })));
-        return { cookies, error: null };
+        return { cookies, persisted: sessionOnly.length, error: null };
     } catch (err) {
         // The jar itself was read fine — surface the persist failure without
         // discarding the capture.
-        return { cookies, error: `JSESSIONID persist failed: ${err.message}` };
+        return { cookies, persisted: 0, error: `JSESSIONID persist failed: ${err.message}` };
     }
 }
 

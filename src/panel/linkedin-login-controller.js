@@ -139,12 +139,20 @@ export class LinkedInLoginController {
         this._state = STATES.CAPTURING;
 
         const handle = this._handle;
-        let captured = { cookies: [], error: null };
+        let captured = { cookies: [], persisted: 0, error: null };
         let verdict;
         try {
-            captured = await this._flow.captureSession(handle);
+            // Validate FIRST, capture LAST. validateSession navigates to the
+            // feed, and that navigation makes LinkedIn re-issue JSESSIONID as
+            // a session-only cookie — so a capture done before validation had
+            // its persisted JSESSIONID overwritten and then dropped on close.
+            // Observed live onboarding li-acct-2 (2026-08-17): two capture
+            // rounds both reported healthy cookie counts, both left the
+            // profile without JSESSIONID. The persist must be the LAST write
+            // before the context closes.
             this._state = STATES.VALIDATING;
             verdict = await this._flow.validateSession(handle);
+            captured = await this._flow.captureSession(handle);
         } catch (error) {
             this._lastError = error.message;
             verdict = { ok: false, reason: 'error', error: error.message, finalUrl: null };
@@ -168,6 +176,10 @@ export class LinkedInLoginController {
             profileDir: this._profileDir,
             profileKey: this._profileKey,
             cookiesCaptured: captured.cookies.length,
+            // Session-only auth cookies re-added with an explicit expiry —
+            // lets the operator confirm JSESSIONID survival without a
+            // separate profile read (each of those costs a browser launch).
+            sessionCookiesPersisted: captured.persisted ?? 0,
             cookieCaptureError: captured.error,
         };
     }
