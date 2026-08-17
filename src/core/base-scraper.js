@@ -23,15 +23,19 @@ import { classifyUrl } from './url-quality.js';
 
 function normalizeResult(result) {
     if (Array.isArray(result)) {
-        return { jobs: result, emptyConfirmed: false };
+        return { jobs: result, emptyConfirmed: false, upToDate: false };
     }
     if (result && Array.isArray(result.jobs)) {
-        return { jobs: result.jobs, emptyConfirmed: result.emptyConfirmed === true };
+        return {
+            jobs: result.jobs,
+            emptyConfirmed: result.emptyConfirmed === true,
+            upToDate: result.upToDate === true,
+        };
     }
     // Non-array / missing `jobs`, or null/undefined → bad/empty return
     // treated as UNCONFIRMED empty on purpose: it must surface loudly
     // via the zero-jobs path, never silently as a confirmed success.
-    return { jobs: [], emptyConfirmed: false };
+    return { jobs: [], emptyConfirmed: false, upToDate: false };
 }
 
 export class BaseScraper {
@@ -87,7 +91,7 @@ export class BaseScraper {
         this.log.info('Starting scrape', { jobTitle, location, sessionId });
         try {
             const raw = await this.scraperFn(jobTitle, location, sessionId, options);
-            const { jobs, emptyConfirmed } = normalizeResult(raw);
+            const { jobs, emptyConfirmed, upToDate } = normalizeResult(raw);
             const durationMs = Date.now() - start;
             const jobCount = jobs.length;
 
@@ -99,7 +103,13 @@ export class BaseScraper {
                 // Observability must never crash the scraping path.
             }
 
-            if (jobCount === 0 && !emptyConfirmed) {
+            if (jobCount === 0 && upToDate) {
+                // The scraper reached posts it had already forwarded. LinkedIn
+                // served results, we simply hold all of them — the healthiest
+                // possible outcome for an incremental sweep, and emphatically
+                // not the zero-jobs block signature handled below.
+                this.log.info('Scrape complete (already up to date)', { jobCount: 0, durationMs });
+            } else if (jobCount === 0 && !emptyConfirmed) {
                 this.log.warn('Scrape returned 0 jobs (unconfirmed) — possible block / DOM change', {
                     durationMs,
                     scraper_alert: 'zero_jobs_unconfirmed',
@@ -124,7 +134,19 @@ export class BaseScraper {
             // `emptyConfirmed` is only meaningful when jobCount === 0. A non-empty
             // result is reported false so the backend never has to reason about
             // "confirmed empty but 12 jobs".
-            return { jobs, emptyConfirmed: jobCount === 0 && emptyConfirmed === true };
+            //
+            // `upToDate` reports as confirmed-empty ON THE WIRE deliberately.
+            // The wire flag answers one question for the backend — "is this
+            // zero trustworthy, or does it smell like a block?" — and a sweep
+            // that reached known ground is the most trustworthy zero there is.
+            // The two are kept distinct in the logs above, where the difference
+            // between "LinkedIn had nothing" and "we already had it all"
+            // actually matters to an operator.
+            return {
+                jobs,
+                emptyConfirmed: jobCount === 0 && (emptyConfirmed === true || upToDate === true),
+                upToDate: jobCount === 0 && upToDate === true,
+            };
         } catch (error) {
             const durationMs = Date.now() - start;
             const reason = classifyError(error);

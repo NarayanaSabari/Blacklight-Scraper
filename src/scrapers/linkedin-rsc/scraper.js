@@ -19,6 +19,7 @@ import { normalizeJobData } from '../../core/normalize.js';
 import { pickSessionQuery, buildBooleanSearchQuery } from '../../core/linkedin-query.js';
 import { paginate as defaultPaginate, countPerRequest } from './client.js';
 import { getLinkedInRscSession } from './session.js';
+import { getHighWaterStore } from './high-water.js';
 import { titleFromPost, locationFromPost, companyFromPost } from './post-fields.js';
 
 const log = createLogger('linkedin-rsc');
@@ -124,6 +125,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         count = countPerRequest(),
         datePosted = process.env.LINKEDIN_DATE_POSTED || 'past-24h',
         rng = Math.random,
+        highWater = getHighWaterStore(),
     } = options;
 
     // A recruiter-authored query is used EXACTLY as written — no random pick.
@@ -146,6 +148,13 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
     const effectiveMaxPages = scoped ? CANDIDATE_MAX_PAGES : undefined;
     const timeBudgetMs = scoped ? CANDIDATE_TIME_BUDGET_MS : 0;
 
+    // Role sweeps only. A candidate query is a recruiter asking for a specific
+    // search and is contracted to run to exhaustion (see CANDIDATE_MAX_POSTS);
+    // silently trimming it to "posts since last time" would make a re-run look
+    // like it lost most of its results. Role sweeps have no such expectation —
+    // they exist to notice new postings, which is exactly what the mark tracks.
+    const sinceActivityId = scoped ? null : highWater?.get?.(keywords, datePosted) ?? null;
+
     log.info('Starting RSC scrape', {
         jobTitle, keywords, datePosted, count,
         maxPosts: scoped ? 'uncapped' : maxPosts,
@@ -155,7 +164,9 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
     return session.withCookies(sessionId, async (cookies, lease) => {
         const requestTemplate = template ?? await session.template();
 
-        const { posts, emptyConfirmed, pages, budgetExhausted } = await paginateImpl({
+        const {
+            posts, emptyConfirmed, upToDate, newestActivityId: newestSeen, pages, budgetExhausted,
+        } = await paginateImpl({
             template: requestTemplate,
             cookies,
             keywords,
@@ -164,6 +175,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             count,
             ...(effectiveMaxPages ? { maxPages: effectiveMaxPages } : {}),
             timeBudgetMs,
+            sinceActivityId,
         });
 
         if (budgetExhausted) {
@@ -182,12 +194,19 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
 
         const jobs = posts.map((post) => postToJob(post, location));
 
+        // Advance only after the walk succeeded — a throw skips this and the
+        // next run re-covers the same ground, which is the safe direction.
+        // The store itself refuses to move a mark backward.
+        if (!scoped && newestSeen) highWater?.advance?.(keywords, datePosted, newestSeen);
+
         log.info('RSC scrape complete', {
             posts: posts.length,
             withText: posts.filter((p) => (p.text_length ?? 0) > 80).length,
             withEmail: posts.filter((p) => (p.contact_emails ?? []).length > 0).length,
             requests: pages?.length ?? 0,
             emptyConfirmed,
+            upToDate: Boolean(upToDate),
+            sinceActivityId,
             candidateScoped: scoped,
             budgetExhausted,
         });
@@ -195,6 +214,6 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // Per-role liveness against the held lease, as the DOM path does.
         await lease?.reportSuccess?.(`RSC scrape: ${posts.length} posts`);
 
-        return { jobs, emptyConfirmed };
+        return { jobs, emptyConfirmed, upToDate: Boolean(upToDate) };
     });
 }
