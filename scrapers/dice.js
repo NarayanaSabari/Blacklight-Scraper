@@ -159,15 +159,31 @@ export function classifyDiceSearchPage({ url, bodyText, anchorCount, bytes }) {
 }
 
 // Reads the skills list from the rendered detail page. The Skills heading
-// is an <h3>; the list is the immediately-following <ul>. Returns [] when
-// the heading is absent (Dice has been known to ship pages without it).
+// is an <h3>. Returns [] when the heading is absent (Dice has been known to
+// ship pages without it).
 export function extractSkills($job) {
-    const skills = [];
     const heading = $job('h3').filter((_, el) => $job(el).text().trim() === 'Skills');
-    if (!heading.length) return skills;
-    heading.next('ul').find('li').each((_, el) => {
+    if (!heading.length) return [];
+    // Two markup shapes:
+    //   LEGACY  - the list is the heading's immediate <ul> sibling.
+    //   CURRENT (observed live 2026-07-24) - the list is nested inside a
+    //     wrapper <div>, alongside an `aria-hidden="true"` duplicate <ul>
+    //     that Dice renders purely to measure badge widths.
+    // Matching only the legacy shape returned [] for EVERY job (silent total
+    // skill loss, 0/40 on a live run); matching every <li> under the
+    // container instead returns each skill twice, via the aria-hidden decoy.
+    // Scope strictly to the heading's IMMEDIATE next sibling. Widening to
+    // heading.parent() pulls in neighbouring <ul>s (description bullets,
+    // "Dice Id"/"Posted" metadata) - live check returned 14 bogus entries.
+    const legacy = heading.next('ul');
+    const lists = legacy.length
+        ? legacy
+        : heading.next().find('ul:not([aria-hidden="true"])');
+    const seen = new Set();
+    const skills = [];
+    lists.find('li').each((_, el) => {
         const v = $job(el).text().trim();
-        if (v) skills.push(v);
+        if (v && !seen.has(v)) { seen.add(v); skills.push(v); }
     });
     return skills;
 }
