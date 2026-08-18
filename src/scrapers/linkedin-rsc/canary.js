@@ -33,6 +33,7 @@
 // false ban report.
 
 import { createLogger } from '../../logger/index.js';
+import { getMetrics } from '../../metrics/registry.js';
 
 const log = createLogger('linkedin-rsc:canary');
 
@@ -281,7 +282,7 @@ export function suspicionStrikes(env = process.env) {
  * that triggered it already succeeded on the wire, and a probe failure must
  * not turn a healthy zero into a failed session.
  *
- * @returns {Promise<'healthy'|'shadow_banned'|'suspected'|'inconclusive'>}
+ * @returns {Promise<'healthy'|'shadow_banned'|'suspected'|'inconclusive'|'request_refused'>}
  */
 export async function runCanary({
     tracker, lease, template, cookies, paginateImpl,
@@ -295,6 +296,11 @@ export async function runCanary({
     // could convict a healthy account on the strength of a request it never
     // would have made itself.
     fetchImpl = undefined,
+    // Asks "is our REQUEST the problem?" before blaming the account. See the
+    // block below for why this gate exists. Injected so tests can drive either
+    // answer, and so a caller with no template context can pass null to keep
+    // the previous behaviour.
+    verifyRequestHealth = null,
 }) {
     tracker.noteProbe(lease);
     const streak = tracker.streak(lease);
@@ -345,8 +351,65 @@ export async function runCanary({
         return 'suspected';
     }
 
-    // Corroborated across independent probes with different control queries:
-    // shadow-ban confirmed.
+    // LAST GATE BEFORE CONVICTING THE ACCOUNT.
+    //
+    // Everything above measures the account through OUR request. If the request
+    // itself is being refused, every observation feeding this verdict is
+    // worthless — and the two causes are indistinguishable from here, because
+    // LinkedIn answers both with a well-formed "no results".
+    //
+    // Production 2026-08-18 is the case in point. The captured template had
+    // fallen 269 client builds behind, so LinkedIn stopped honouring the
+    // request and returned confirmed empties for EVERY query. A browser on the
+    // same profile, at the same moment, saw live posts. The canary did exactly
+    // what it was designed to do and reached exactly the wrong conclusion:
+    // both healthy credentials cooled for four hours, the pipeline at zero for
+    // five, and the recorded cause ("shadow-banned") pointed every remedy in
+    // the wrong direction.
+    //
+    // So before reporting a ban, ask whether our request is even valid. A
+    // stale-template verdict is CHEAP to check (one page fetch, no search
+    // budget) and its remedy is automatic, whereas a wrong ban verdict is
+    // expensive and self-inflicted. Only convict the account when the request
+    // is known-good.
+    if (verifyRequestHealth) {
+        let requestHealthy = true;
+        try {
+            requestHealthy = await verifyRequestHealth();
+        } catch (err) {
+            // Could not tell. Treat as inconclusive rather than guessing:
+            // failing toward "do not ban" is the recoverable direction, since
+            // a genuinely banned account simply gets convicted on the next
+            // probe instead.
+            log.warn('Could not verify request health — deferring the ban verdict', {
+                err: err?.message,
+            });
+            requestHealthy = false;
+        }
+        if (!requestHealthy) {
+            log.error(
+                'Canary empty BUT our request looks stale/refused — NOT banning the account',
+                {
+                    streak,
+                    canaryQuery,
+                    strike,
+                    scraper_alert: 'linkedin_request_refused_not_ban',
+                },
+            );
+            // Each increment is one false shadow-ban prevented, which is the
+            // clearest measure of whether this gate is earning its keep.
+            try { getMetrics()?.recordLinkedInRequestRefused?.(); } catch { /* never break a scrape */ }
+            // Clear the evidence. It was gathered through a request LinkedIn
+            // was refusing, so it says nothing about this credential, and
+            // keeping it would convict the account the moment the template is
+            // fixed and a thin query happens to land first.
+            tracker.reset(lease);
+            return 'request_refused';
+        }
+    }
+
+    // Corroborated across independent probes with different control queries,
+    // and our request is known-good: shadow-ban confirmed.
     log.error('Canary returned empty — LinkedIn account is shadow-banned', {
         streak,
         canaryQuery,

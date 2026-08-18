@@ -38,6 +38,7 @@ function pickLatestSession(activeSessions) {
  * @param {import('./overrides.js').PlatformOverrides} deps.overrides
  * @param {{list: () => Array}} deps.recent
  * @param {import('./linkedin-login-controller.js').LinkedInLoginController} [deps.loginController]
+ * @param {() => (object|null)} [deps.templateStatus] - last known RSC template freshness
  * @param {() => Date} [deps.now]
  * @returns {Promise<object>}
  */
@@ -53,6 +54,10 @@ export async function buildStatus(deps) {
         overrides,
         recent,
         loginController,
+        // A pure read of whatever the session last observed. Deliberately NOT a
+        // live check: buildStatus runs on every 3s panel poll, and issuing a
+        // LinkedIn request per poll would be its own automation signal.
+        templateStatus: templateStatusFn,
         now = () => new Date(),
     } = deps;
 
@@ -90,6 +95,11 @@ export async function buildStatus(deps) {
 
     const linkedInSession = getLinkedInSession ? getLinkedInSession() : null;
     const sessionAlive = !!linkedInSession?.isAlive?.();
+    // Pure read of the last observed verdict; null until the session has run
+    // its first freshness check.
+    const templateStatus = templateStatusFn
+        ? templateStatusFn()
+        : (linkedInSession?.templateStatus?.() ?? null);
     const profileDir = bootInfo.profileDir ?? null;
     const profileDirExists = !!(profileDir && profileDir !== 'unknown' && existsSync(profileDir));
     // `login` is the two-step control-panel flow's OWN state (see
@@ -106,6 +116,12 @@ export async function buildStatus(deps) {
         profileDirExists,
         needsRelogin: profileDirExists && !sessionAlive,
         login,
+        // Request-template freshness. Surfaced because the failure it describes
+        // is otherwise invisible AND actively misleading: a stale template makes
+        // LinkedIn answer every search "no results", which the panel would
+        // otherwise show as a healthy scraper quietly finding nothing, while the
+        // canary cools credentials for a ban that never happened.
+        template: templateStatus ?? null,
     };
 
     // Per-platform sweep cadence + the last sweep's counters, so the -83%
@@ -122,6 +138,17 @@ export async function buildStatus(deps) {
     const alerts = [];
     if (linkedin.needsRelogin) {
         alerts.push({ level: 'error', message: 'LinkedIn needs re-login — profile exists but the session is not alive.' });
+    }
+    // Ranked above the delivery alerts on purpose: when this one is firing, the
+    // scraper is returning zero for everything and the shadow-ban alerts below
+    // it are downstream symptoms, not independent problems.
+    if (templateStatus?.stale) {
+        alerts.push({
+            level: 'error',
+            message: `LinkedIn request template is STALE (captured ${templateStatus.captured ?? '?'}, `
+                + `live ${templateStatus.live ?? '?'}, ${templateStatus.lag ?? '?'} builds behind) — `
+                + 'searches will return phantom empties. Re-capture: npm run linkedin:rsc-template',
+        });
     }
     // Two DIFFERENT conditions, deliberately not merged into "spool is non-empty".
     // That single test is why the panel warned "backend delivery is failing" for

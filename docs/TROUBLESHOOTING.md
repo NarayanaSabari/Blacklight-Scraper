@@ -95,6 +95,66 @@ node -e "import('./src/scrapers/linkedin-rsc/session.js').then(async m=>{ \
 with an explicit expiry before closing the context. Only the lifetime changes, not the value.
 Verify by reopening the profile cold and reading the jar again.
 
+## LinkedIn: every query is empty and the accounts get "shadow-banned"
+
+**This is the highest-cost failure in this file. Read it before you touch a credential.**
+
+**Symptom.** Every LinkedIn scrape returns `posts: 0, emptyConfirmed: true`, including searches
+that obviously have results. Shortly afterwards the canary reports one or both accounts as
+shadow-banned and cools them for hours, and the pipeline goes to zero.
+
+**It is almost certainly NOT a ban.** The captured RSC request template carries LinkedIn's client
+build number (`x-li-application-version`). LinkedIn ships new builds continuously, and once the
+captured one falls a few hundred builds behind, the pagination endpoint stops honouring the
+request. It does not return an error: it returns `200` with a well-formed "No results found" page
+carrying the positive no-results flag. That is byte-for-byte the shape of a genuine empty, so
+every layer above it draws the wrong conclusion.
+
+Measured 2026-08-18: template captured at `0.2.6546` on 07-31, LinkedIn live on `0.2.6815`, a lag
+of 269 builds. Every query empty from 15:00 UTC. Both credentials falsely cooled for four hours
+each. Five hours at zero ingest. A browser on the same profile, at the same moment, saw live
+posts.
+
+**Diagnose in one command:**
+
+```bash
+node scripts/linkedin-template-status.js     # captured vs live version + verdict
+```
+
+**If that is inconclusive, settle it definitively:**
+
+```bash
+node scripts/linkedin-browser-check.js       # what a REAL browser sees on this profile
+```
+
+The browser check is the tie-breaker, because it removes our request from the equation:
+
+| Browser sees | HTTP transport sees | Meaning | Action |
+|---|---|---|---|
+| posts | nothing | our REQUEST is refused | re-capture the template |
+| nothing | nothing | the ACCOUNT is restricted | quiet time; do not re-login |
+| login wall | nothing | the SESSION is dead | `npm run linkedin:login` |
+
+**Fix:**
+
+```bash
+npm run linkedin:rsc-template                # re-capture
+# then restart via the control panel so the new template is loaded
+```
+
+Then clear any cooldown the canary applied, because it was a false positive: set the affected
+`scraper_credentials` rows back to `available` with a null `cooldown_until`.
+
+**This should now self-heal.** The daemon checks template freshness every four hours and
+re-captures automatically, the canary refuses to report a ban while the template looks stale, and
+the control panel raises an explicit alert naming both versions. The manual steps above are the
+fallback for when that machinery itself fails - watch for
+`scraper_alert: linkedin_template_recapture_failed`.
+
+**Why the cost is asymmetric.** Re-capturing a healthy template costs one browser launch. Wrongly
+cooling a healthy account costs four hours of that account's throughput and sends every
+subsequent diagnosis in the wrong direction. When in doubt, re-capture first.
+
 ## Everything returns 0 and the profile looks logged in
 
 Cookies can be *present* and still be dead. `li_at` in the jar proves nothing on its own.

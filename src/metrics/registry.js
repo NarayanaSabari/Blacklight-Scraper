@@ -188,6 +188,36 @@ class MetricsRegistry {
             registers: reg,
         });
 
+        // LinkedIn request-template freshness -------------------------------
+        // The template carries LinkedIn's client build number. When it falls far
+        // enough behind, LinkedIn answers every search with a well-formed
+        // "No results found" instead of an error — which the shadow-ban canary
+        // reads as a banned account. On 2026-08-18 that misdiagnosis cooled both
+        // production credentials and held the pipeline at zero for five hours.
+        //
+        // Exported so the dashboard can distinguish the two causes at a glance:
+        // a spike in zero-yield sessions WITH a rising version lag is a stale
+        // template (self-healing, our fault); the same spike with a flat lag is
+        // a real platform-side problem.
+        this.linkedinTemplateVersionLag = new Gauge({
+            name: 'scraper_linkedin_template_version_lag',
+            help: 'LinkedIn client builds between the captured RSC template and the live client. Large + growing = the template is about to stop working, and zero-yield scrapes are OUR fault, not a ban.',
+            registers: reg,
+        });
+
+        this.linkedinTemplateRecapturesTotal = new Counter({
+            name: 'scraper_linkedin_template_recaptures_total',
+            help: 'Automatic RSC template re-captures, by result. A rising `failed` means the host will drift back into serving phantom empties.',
+            labelNames: ['result'], // succeeded|failed
+            registers: reg,
+        });
+
+        this.linkedinRequestRefusedTotal = new Counter({
+            name: 'scraper_linkedin_request_refused_total',
+            help: 'Canary verdicts withheld because OUR request was stale rather than the account being banned. Each one is a false shadow-ban prevented.',
+            registers: reg,
+        });
+
         // Queue ------------------------------------------------------------
         this.queueChecksTotal = new Counter({
             name: 'scraper_queue_checks_total',
@@ -335,6 +365,22 @@ class MetricsRegistry {
         this.#safe(() =>
             this.linkedinQueryYieldTotal.labels(String(queryIndex)).inc(count),
         );
+    }
+
+    /** Current gap between the captured template and LinkedIn's live client. */
+    recordLinkedInTemplateLag(lag) {
+        if (!Number.isFinite(lag)) return;
+        this.#safe(() => this.linkedinTemplateVersionLag.set(lag));
+    }
+
+    /** @param {'succeeded'|'failed'} result */
+    recordLinkedInTemplateRecapture(result) {
+        this.#safe(() => this.linkedinTemplateRecapturesTotal.labels(result).inc());
+    }
+
+    /** A shadow-ban verdict withheld because our own request was stale. */
+    recordLinkedInRequestRefused() {
+        this.#safe(() => this.linkedinRequestRefusedTotal.inc());
     }
 
     recordQueueCheck(result) {

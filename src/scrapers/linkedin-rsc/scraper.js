@@ -308,6 +308,24 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
                 cookies,
                 paginateImpl,
                 fetchImpl: boundFetch,
+                // Before blaming the ACCOUNT, rule out our own request. A
+                // template that has fallen behind LinkedIn's client version
+                // makes every search answer "no results", which is exactly the
+                // evidence the canary treats as proof of a ban (2026-08-18:
+                // both credentials falsely cooled, five hours at zero).
+                //
+                // Checked lazily and only at the point of conviction, so the
+                // ordinary healthy path never pays for it.
+                //
+                // Passed as undefined when the session cannot answer, rather
+                // than as a function that throws. A session without this
+                // capability means NO OPINION, and the canary must fall back to
+                // its previous behaviour — treating "cannot ask" as "request is
+                // broken" would silently disable ban detection everywhere the
+                // capability is absent.
+                verifyRequestHealth: typeof session.isRequestHealthy === 'function'
+                    ? () => session.isRequestHealthy()
+                    : undefined,
             });
         }
 

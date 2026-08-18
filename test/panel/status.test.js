@@ -114,6 +114,45 @@ test('buildStatus: orchestrator absent (no Blacklight config) does not fire the 
     assert.ok(!status.alerts.some((a) => /not running/.test(a.message)));
 });
 
+test('buildStatus: a stale RSC template fires an error alert naming the versions', async () => {
+    // The 2026-08-18 outage was invisible on this panel: every field looked
+    // healthy while LinkedIn refused every request and the canary cooled two
+    // good credentials. The operator needs to see the CAUSE here, not just the
+    // downstream shadow-ban symptoms.
+    const status = await buildStatus(baseDeps({
+        templateStatus: () => ({
+            stale: true, reason: 'version_lag', lag: 269,
+            captured: '0.2.6546', live: '0.2.6815',
+        }),
+    }));
+    const alert = status.alerts.find((a) => /template is STALE/.test(a.message));
+    assert.ok(alert, 'a stale template must raise an alert');
+    assert.equal(alert.level, 'error');
+    assert.match(alert.message, /0\.2\.6546/, 'names the captured version');
+    assert.match(alert.message, /0\.2\.6815/, 'names the live version');
+    assert.match(alert.message, /269 builds behind/, 'quantifies the lag');
+    assert.match(alert.message, /linkedin:rsc-template/, 'states the remedy');
+    assert.equal(status.linkedin.template.lag, 269, 'and is readable as structured data');
+});
+
+test('buildStatus: a fresh RSC template fires no template alert', async () => {
+    const status = await buildStatus(baseDeps({
+        templateStatus: () => ({
+            stale: false, reason: null, lag: 12,
+            captured: '0.2.6820', live: '0.2.6832',
+        }),
+    }));
+    assert.ok(!status.alerts.some((a) => /template is STALE/.test(a.message)));
+});
+
+test('buildStatus: an unknown template status is not treated as stale', async () => {
+    // Before the first freshness check there is simply no verdict. Reporting
+    // that as a problem would train the operator to ignore the alert.
+    const status = await buildStatus(baseDeps({ templateStatus: () => null }));
+    assert.ok(!status.alerts.some((a) => /template is STALE/.test(a.message)));
+    assert.equal(status.linkedin.template, null);
+});
+
 test('buildStatus: a long-remaining cooldown fires a warn alert; a short one does not', async () => {
     const status = await buildStatus(baseDeps({
         cooldownSnapshot: () => ({
