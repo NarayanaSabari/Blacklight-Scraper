@@ -62,7 +62,11 @@ test('strictEmpty still throws on an unconfirmed empty, before any wire report',
 test('strictEmpty does NOT throw on a CONFIRMED empty', async () => {
     // SCR-23 (#406): a genuine no-results query must not be recorded as a
     // platform failure just because the result set is empty.
+    //
+    // `upToDate` joined this shape in #492 (known-ground early stop) and is
+    // false here: a confirmed empty from a scraper that reported no
+    // high-water mark is an ordinary empty result, not known ground.
     const s = scraper(async () => ({ jobs: [], emptyConfirmed: true }), { strictEmpty: true });
     const out = await s.executeWithMeta('node', 'remote', 'sess');
-    assert.deepEqual(out, { jobs: [], emptyConfirmed: true });
+    assert.deepEqual(out, { jobs: [], emptyConfirmed: true, upToDate: false });
 });

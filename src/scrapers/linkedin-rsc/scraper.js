@@ -21,6 +21,8 @@ import { paginate as defaultPaginate, countPerRequest } from './client.js';
 import { getLinkedInRscSession } from './session.js';
 import { getHighWaterStore } from './high-water.js';
 import { CanaryTracker, runCanary } from './canary.js';
+import { getRequestPacer } from './pacer.js';
+import { fetchForCredential } from './egress.js';
 
 // One tracker per process: streaks are per-credential inside it, and the
 // canary's whole job is to observe across consecutive scrapes.
@@ -55,6 +57,24 @@ const CANDIDATE_MAX_PAGES = 2000;
 // alert below fires and the result is knowingly incomplete. Raising the backend
 // grace window without raising this is safe; the reverse is not.
 const CANDIDATE_TIME_BUDGET_MS = 420_000;
+
+// ⚠️ The pacer's wait is spent INSIDE the lease but OUTSIDE the time budget
+// above (the budget clock starts when pagination does). So the real worst case
+// against the backend's 600s orphan window is:
+//
+//     pacer wait (20s floor + up to 10s jitter)  +  420s budget  =  450s
+//
+// leaving 150s of margin rather than the 180s the comment above describes.
+// That is still comfortable, but the coupling is now three-way and easy to
+// break silently: raising LINKEDIN_MIN_REQUEST_SPACING_MS far enough would eat
+// the margin and start handing live sessions to a second scraper, which
+// double-scrapes and doubles the request load on an account this whole change
+// exists to protect.
+//
+// Asserted in test/scrapers/linkedin-acceptance.test.js so the arithmetic
+// fails loudly rather than in production.
+export const ORPHAN_WINDOW_MS = 600_000;   // mirrors INFLIGHT_GRACE_SECONDS
+export const CANDIDATE_BUDGET_MS = CANDIDATE_TIME_BUDGET_MS;
 
 // Author display names are not in this payload, only the profile handle. Present
 // it readably rather than inventing a company. LinkedIn post "company" was
@@ -133,6 +153,12 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         highWater = getHighWaterStore(),
         canaryTracker = defaultCanaryTracker,
         runCanaryImpl = runCanary,
+        // Null disables pacing. The default is the process-wide pacer; callers
+        // that inject their own `paginateImpl` are not touching LinkedIn at all
+        // (tests, replays), so they get a no-op rather than real wall-clock
+        // sleeps — otherwise a suite that exercises the scrape path would sit
+        // through a 20s floor per call.
+        pacer = paginateImpl === defaultPaginate ? getRequestPacer() : null,
     } = options;
 
     // A recruiter-authored query is used EXACTLY as written — no random pick.
@@ -171,6 +197,25 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
     return session.withCookies(sessionId, async (cookies, lease) => {
         const requestTemplate = template ?? await session.template();
 
+        // Space this scrape from the previous one on the SAME credential. The
+        // backend's 15-minute floor (#493) is per queue row: it bounds how often
+        // one search repeats and cannot see how close together DIFFERENT
+        // searches land on one account. Prod 2026-08-18 fired 12 sessions in 27
+        // seconds that way. Held inside the lease so the wait is attributed to
+        // the credential it protects, and after template load so a cold start
+        // does not pay twice.
+        await pacer?.pace?.(lease);
+
+        // Bind egress to the credential's own proxy. A LinkedIn cookie is
+        // issued to the IP that logged in; the login path routes through
+        // `credential.proxy` (linkedin-browser.js) while this transport used
+        // plain global fetch, so an account with a proxy scraped from a
+        // different IP than it authenticated from. Prod 2026-08-18: Link1 had a
+        // proxy set and was the hardest-hit account; Link2 had none and its
+        // login and scrape agreed. No proxy on the credential still means
+        // direct egress, unchanged.
+        const boundFetch = fetchForCredential(lease?.credential);
+
         const {
             posts, emptyConfirmed, upToDate, newestActivityId: newestSeen, pages, budgetExhausted,
         } = await paginateImpl({
@@ -183,6 +228,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             ...(effectiveMaxPages ? { maxPages: effectiveMaxPages } : {}),
             timeBudgetMs,
             sinceActivityId,
+            fetchImpl: boundFetch,
         });
 
         if (budgetExhausted) {
@@ -218,11 +264,31 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             budgetExhausted,
         });
 
-        // Shadow-ban canary. Posts — or known ground reached (`upToDate`,
-        // LinkedIn positively served posts we already hold) — prove account
-        // health. A zero-yield scrape feeds the credential's streak; at the
-        // threshold, one extra request on a query that always has results
-        // settles whether the account is banned or the queries were thin.
+        // Shadow-ban canary. Three things prove the account is being served
+        // normally, and none of them may feed the ban counter:
+        //
+        //   • posts came back;
+        //   • `upToDate` — LinkedIn positively served posts we already hold;
+        //   • a CONFIRMED empty for a search that carries a high-water mark.
+        //
+        // That third one is the 2026-08-18 outage. #492 made every steady-state
+        // sweep ask for "posts newer than <mark>", and LinkedIn answers a
+        // repeated identical search with its positive "no results" flag and no
+        // rows. No rows means paginate() cannot set `upToDate` (that needs to
+        // have SEEN a known post), so a perfectly healthy up-to-date sweep wore
+        // the exact shape of a shadow-banned account's polite empty. At ~154
+        // marked queue rows this reached the streak threshold in seconds:
+        // Link2 reported success at 06:29:29 and was banned 4.2s later, and
+        // with both accounts cooled the pipeline went to a hard zero.
+        //
+        // A confirmed empty with NO mark is still counted — that is a genuine
+        // "nothing in the last 24h at all", which is the signature the canary
+        // exists to catch.
+        const refusedRepeat = emptyConfirmed && sinceActivityId !== null;
+
+        // A zero-yield scrape feeds the credential's streak; at the threshold,
+        // one extra request on a query that always has results settles whether
+        // the account is banned or the queries were thin.
         //
         // MUST run BEFORE reportSuccess: reportSuccess releases the lease, and
         // the canary's ban report needs the lease alive to land. Observed in
@@ -232,7 +298,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // credential stayed `available` and kept being leased for four more
         // hours of zero-yield sessions.
         let canaryVerdict = null;
-        if (jobs.length > 0 || upToDate) {
+        if (jobs.length > 0 || upToDate || refusedRepeat) {
             canaryTracker.recordHealthy(lease);
         } else if (canaryTracker.recordEmpty(lease)) {
             canaryVerdict = await runCanaryImpl({
@@ -241,6 +307,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
                 template: requestTemplate,
                 cookies,
                 paginateImpl,
+                fetchImpl: boundFetch,
             });
         }
 
@@ -250,7 +317,24 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // lease — a success ping here would land on the dead lease and, worse,
         // contradict the verdict.
         if (canaryVerdict !== 'shadow_banned') {
-            await lease?.reportSuccess?.(`RSC scrape: ${posts.length} posts`);
+            // Best-effort. The jobs are ALREADY SCRAPED by this point, and the
+            // caller submits them after we return, so letting a failed liveness
+            // ping propagate would discard completed work over a bookkeeping
+            // call. Verified: with reportSuccess throwing "backend down", a
+            // scrape carrying a real post threw and the post never reached the
+            // backend.
+            //
+            // The same reasoning the HTTP client already applies to submitJobs,
+            // which is exempted from the circuit breaker precisely so an
+            // unrelated outage cannot bin scraped jobs.
+            try {
+                await lease?.reportSuccess?.(`RSC scrape: ${posts.length} posts`);
+            } catch (error) {
+                log.warn('Liveness ping failed — scrape result kept', {
+                    err: error?.message,
+                    posts: posts.length,
+                });
+            }
         }
 
         return { jobs, emptyConfirmed, upToDate: Boolean(upToDate) };
