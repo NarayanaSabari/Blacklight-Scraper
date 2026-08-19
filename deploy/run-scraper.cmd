@@ -26,6 +26,28 @@ REM reachable at http://<tailnet-ip>:3001/panel without an SSH tunnel. The
 REM LAN (192.168.x / 10.x) and everything else still get 403. This is an
 REM address allowlist, not auth - it trusts every device on the tailnet.
 set PANEL_ALLOWED_CIDRS=100.64.0.0/10
+REM LinkedIn meters CONTENT SEARCH separately from the rest of the site, and the
+REM PACER - not the sweep interval - is what actually caps our request rate.
+REM
+REM 20s floor + 10s jitter, across 2 credentials running concurrently, is a
+REM ceiling of 288 scrapes/hour. That is EXACTLY the rate measured when LinkedIn
+REM cut content search off on 2026-08-18/19: both accounts, simultaneously, for
+REM 2-5 hours at a time, recovering on their own. The hours that yielded most
+REM were the ones that asked least (208 scrapes -> 5689 posts; 288 -> 0).
+REM
+REM Raising the sweep interval alone does NOT fix this: 154 queue rows coming
+REM due every 30 minutes still demands ~308/hour, so the pacer stays the binding
+REM constraint. 45s + 15s puts the real ceiling near 137/hour.
+REM
+REM ⚠️ Do NOT raise these further without raising the backend's
+REM INFLIGHT_GRACE_SECONDS first. Worst-case lease hold is
+REM spacing + jitter + the 420s candidate budget, and
+REM test/scrapers/linkedin-acceptance.test.js asserts >=120s of margin under the
+REM 600s orphan window. 45s+15s sits exactly at that limit; anything larger
+REM starts handing live sessions to a second scraper, which double-scrapes and
+REM doubles the load this setting exists to reduce.
+set LINKEDIN_MIN_REQUEST_SPACING_MS=45000
+set LINKEDIN_REQUEST_SPACING_JITTER_MS=15000
 if not exist C:\scraper\logs mkdir C:\scraper\logs
 :run
 "C:\Program Files\nodejs\node.exe" server.js >> C:\scraper\logs\stdout.log 2>> C:\scraper\logs\stderr.log

@@ -337,3 +337,72 @@ describe('the production incident', () => {
         assert.equal(snap.consecutiveEmpty, 0);
     });
 });
+
+describe('request-rate ceiling', () => {
+    it('the pacer, not the sweep interval, is what bounds the request rate', async () => {
+        // The trap this documents cost a full extra iteration to find.
+        //
+        // The obvious lever for "we are asking LinkedIn too often" is the sweep
+        // interval, so that is what got raised first (0 -> 30 min). It barely
+        // helped: 154 queue rows coming due every 30 minutes still demands
+        // ~308 scrapes/hour, which is ABOVE what the pacer already allowed, so
+        // the pacer stayed the binding constraint and the real rate did not
+        // move.
+        //
+        // Measured ceiling with the shipped defaults: 20s floor + 10s jitter
+        // averaged, across max_inflight=2 credentials, is 288/hour - exactly
+        // the rate observed in the hours LinkedIn cut content search off.
+        //
+        // This asserts the relationship rather than a magic number, so it stays
+        // true if either knob moves.
+        const {
+            DEFAULT_MIN_SPACING_MS, DEFAULT_JITTER_MS,
+        } = await import('../../src/scrapers/linkedin-rsc/pacer.js');
+
+        const MAX_INFLIGHT = 2;              // scraper_platforms.max_inflight for linkedin
+        const avgSpacingMs = DEFAULT_MIN_SPACING_MS + (DEFAULT_JITTER_MS / 2);
+        const ceilingPerHour = (3600_000 / avgSpacingMs) * MAX_INFLIGHT;
+
+        // The rate LinkedIn demonstrably tolerated (208/hour returned 5,689
+        // posts) versus the rate at which it cut us off (285-288/hour returned
+        // zero). A default that sits at or above the refusal rate means the
+        // host ships pre-loaded to trip the quota.
+        const OBSERVED_REFUSAL_RATE = 285;
+
+        assert.ok(
+            ceilingPerHour >= OBSERVED_REFUSAL_RATE,
+            'sanity: the shipped default really is at the rate that got refused '
+            + `(${Math.round(ceilingPerHour)}/hour) - if this ever fails, the default was `
+            + 'lowered and this test should be updated to assert the new relationship',
+        );
+
+        // The knob that actually moves the rate. Documented here because the
+        // sweep interval does NOT, and that is genuinely counter-intuitive.
+        const pacedCeiling = (spacing, jitter) => (3600_000 / (spacing + jitter / 2)) * MAX_INFLIGHT;
+        assert.ok(
+            pacedCeiling(45_000, 15_000) < 150,
+            'the production override (45s/15s) must bring the ceiling well under '
+            + 'the refusal rate',
+        );
+    });
+
+    it('the production pacing override stays inside the orphan-window margin', async () => {
+        // The ceiling cannot simply be lowered without limit: the pacer's wait
+        // is spent INSIDE the credential lease but OUTSIDE the scrape budget,
+        // so raising spacing eats the margin under the backend's 600s orphan
+        // window. Past that, the backend hands the live session to a second
+        // scraper, which double-scrapes - doubling the very load this is
+        // trying to reduce.
+        const { ORPHAN_WINDOW_MS, CANDIDATE_BUDGET_MS } = await import('../../src/scrapers/linkedin-rsc/scraper.js');
+
+        const PROD_SPACING_MS = 45_000;   // deploy/run-scraper.cmd
+        const PROD_JITTER_MS = 15_000;
+
+        const worstCase = PROD_SPACING_MS + PROD_JITTER_MS + CANDIDATE_BUDGET_MS;
+        assert.ok(
+            ORPHAN_WINDOW_MS - worstCase >= 120_000,
+            `the production pacing override leaves only ${(ORPHAN_WINDOW_MS - worstCase) / 1000}s `
+            + 'of margin; raising it further requires raising INFLIGHT_GRACE_SECONDS first',
+        );
+    });
+});
