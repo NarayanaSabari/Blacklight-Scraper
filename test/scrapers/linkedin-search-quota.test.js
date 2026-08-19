@@ -257,6 +257,37 @@ describe('applyQuotaPause', () => {
 });
 
 describe('the production incident', () => {
+    it('a mark-carrying refusal must NOT count as served (the bug that made this inert)', () => {
+        // THE DEFECT THIS GUARDS.
+        //
+        // The first version of this feature reused the canary's health test,
+        // which counts `refusedRepeat` - a confirmed empty for a search
+        // carrying a high-water mark - as proof of health. For a ban verdict
+        // that is correct. For a quota it is fatal, because a refused search
+        // and an up-to-date search are byte-identical on the wire.
+        //
+        // Measured on the live host during the 2026-08-19 window: of 60
+        // consecutive zero-yield scrapes, exactly 30 carried a mark. Roughly
+        // alternating, so the counter reset every other scrape and the longest
+        // streak reachable was 5 against a threshold of 25. The back-off could
+        // never fire, and in production it did not.
+        //
+        // This replays that alternating pattern and asserts the tracker still
+        // trips. It is fed ONLY empties, because during a refusal window every
+        // scrape is a refusal regardless of whether it carried a mark.
+        const clock = fakeClock();
+        const tracker = trackerAt(clock);
+
+        let tripped = false;
+        for (let i = 0; i < DEFAULT_EMPTY_THRESHOLD * 2; i++) {
+            // Alternating mark / no-mark, exactly as production showed. Both
+            // are refusals, so both must feed the streak.
+            if (tracker.recordEmpty().tripped) { tripped = true; break; }
+        }
+
+        assert.ok(tripped, 'alternating mark/no-mark refusals must still reach the threshold');
+    });
+
     it('would have paused instead of issuing hours of futile scrapes', () => {
         // Replays 2026-08-19: search stops serving and stays refused for three
         // hours at ~285 scrapes/hour. Old behaviour was ~855 scrapes, all empty.

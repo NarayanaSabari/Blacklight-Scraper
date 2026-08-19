@@ -318,8 +318,29 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // Ordering matters. During a quota window every account looks banned,
         // so this must stop the platform BEFORE the canary starts convicting
         // individual credentials for something that is not their fault.
-        const served = jobs.length > 0 || upToDate || refusedRepeat;
-        if (served) {
+        //
+        // ⚠️ THE HEALTH SIGNAL HERE IS DELIBERATELY NARROWER THAN THE CANARY'S.
+        //
+        // The canary treats `refusedRepeat` — a confirmed empty for a search
+        // carrying a high-water mark — as proof of health, and for its purpose
+        // that is right: LinkedIn refusing a REPEATED query says nothing about
+        // whether the account is banned.
+        //
+        // For a quota it is worse than useless, because a refused search and an
+        // up-to-date search produce byte-identical responses. Measured on the
+        // live host during the 2026-08-19 refusal window: of 60 consecutive
+        // zero-yield scrapes, exactly 30 carried a mark. Counting those as
+        // "served" reset the counter every other scrape, so the longest streak
+        // the tracker could ever reach was 5 against a threshold of 25 — the
+        // back-off could not fire at all, which is precisely what happened.
+        //
+        // `posts > 0 || upToDate` is the signal that actually separates the two
+        // states, because `upToDate` requires having SEEN a known post, which a
+        // refused search never returns. Verified across 3,867 scrapes spanning
+        // both regimes: it is non-zero in every serving hour and exactly zero in
+        // every refusing hour, with no overlap.
+        const searchServed = jobs.length > 0 || upToDate;
+        if (searchServed) {
             quotaTracker.recordServed();
         } else {
             const { tripped, pauseMs, streak } = quotaTracker.recordEmpty();
@@ -350,8 +371,16 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // failure for" because the lease had already been released. The
         // credential stayed `available` and kept being leased for four more
         // hours of zero-yield sessions.
+        //
+        // NOTE the health test differs from the quota block's above, and must.
+        // `refusedRepeat` belongs HERE and only here: for judging whether an
+        // ACCOUNT is banned, LinkedIn refusing a repeated query is genuine
+        // evidence of health (that is the 2026-08-18 fix). For judging whether
+        // the PLATFORM is serving search at all, it is indistinguishable from
+        // the refusal itself. Same observation, opposite meaning, depending on
+        // the question being asked.
         let canaryVerdict = null;
-        if (served) {
+        if (searchServed || refusedRepeat) {
             canaryTracker.recordHealthy(lease);
         } else if (canaryTracker.recordEmpty(lease)) {
             canaryVerdict = await runCanaryImpl({

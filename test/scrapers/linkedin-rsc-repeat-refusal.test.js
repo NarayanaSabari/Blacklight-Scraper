@@ -321,3 +321,53 @@ test('a lease with no reportSuccess at all is tolerated', async () => {
     });
     assert.deepEqual(result.jobs, []);
 });
+
+// ─── platform-wide search quota ─────────────────────────────────────────
+
+// The quota back-off and the ban canary read the SAME observation and must
+// reach OPPOSITE conclusions from it. A confirmed-empty on a marked query means
+// "this account is fine" (no ban) but also "search returned nothing" (feeds the
+// quota streak). Getting that backwards is not theoretical: the first version
+// of the quota feature shipped to production reusing the canary's health test,
+// and was completely inert as a result.
+test('a marked-query refusal feeds the quota streak while still NOT banning the account', async () => {
+    const body = await noResultsBody();
+    const { SearchQuotaTracker } = await import('../../src/scrapers/linkedin-rsc/search-quota.js');
+
+    // Threshold of 5 keeps the test quick; the real value is 25.
+    const quotaTracker = new SearchQuotaTracker({ threshold: 5 });
+    const canaryTracker = new CanaryTracker({ threshold: 10, probeIntervalMs: 0 });
+
+    const bans = [];
+    const lease = {
+        credential: { id: 15, name: 'Link1' },
+        reportSuccess: async () => {},
+        reportFailure: async (msg) => { bans.push(msg); },
+    };
+
+    const pauses = [];
+
+    // Every sweep carries a mark - the exact production steady state, and the
+    // shape that made the first implementation inert.
+    for (let i = 0; i < 10; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await scrapeLinkedInRsc('Business Analyst', 'United States', null, {
+            session: fakeSession(lease),
+            template: TEMPLATE,
+            highWater: markedStore,
+            canaryTracker,
+            quotaTracker,
+            pacer: null,
+            applyQuotaPauseImpl: ({ pauseMs }) => { pauses.push(pauseMs); return true; },
+            paginateImpl: (args) => realPaginate(args, body),
+        });
+    }
+
+    // The quota side must have noticed. On the broken version this array was
+    // empty because the streak reset on every single scrape.
+    assert.equal(pauses.length, 1, 'the quota back-off must fire exactly once');
+    assert.ok(pauses[0] > 0, 'and request a real pause');
+
+    // The ban side must NOT have. This is the 2026-08-18 invariant, still held.
+    assert.deepEqual(bans, [], 'a marked-query refusal must never ban the account');
+});
