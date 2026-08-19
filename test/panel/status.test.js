@@ -153,6 +153,33 @@ test('buildStatus: an unknown template status is not treated as stale', async ()
     assert.equal(status.linkedin.template, null);
 });
 
+test('buildStatus: a search-quota pause warns, and blames the platform not the accounts', async () => {
+    // The whole point of surfacing this: when LinkedIn meters search, every
+    // account looks dead and the instinct is to go investigate the credentials.
+    // The alert has to say plainly that they are fine.
+    const status = await buildStatus(baseDeps({
+        quotaStatus: () => ({
+            paused: true,
+            pausedUntil: '2026-08-19T06:00:00.000Z',
+            consecutiveTrips: 2,
+            consecutiveEmpty: 25,
+        }),
+    }));
+    const alert = status.alerts.find((a) => /search quota/i.test(a.message));
+    assert.ok(alert, 'a quota pause must be visible');
+    assert.equal(alert.level, 'warn', 'this is the system working, not a fault');
+    assert.match(alert.message, /accounts are fine/, 'must redirect away from the credentials');
+    assert.match(alert.message, /2026-08-19T06:00:00.000Z/, 'says when it lifts');
+    assert.equal(status.linkedin.searchQuota.consecutiveTrips, 2);
+});
+
+test('buildStatus: no quota pause fires no quota alert', async () => {
+    const status = await buildStatus(baseDeps({
+        quotaStatus: () => ({ paused: false, pausedUntil: null, consecutiveTrips: 0, consecutiveEmpty: 3 }),
+    }));
+    assert.ok(!status.alerts.some((a) => /search quota/i.test(a.message)));
+});
+
 test('buildStatus: a long-remaining cooldown fires a warn alert; a short one does not', async () => {
     const status = await buildStatus(baseDeps({
         cooldownSnapshot: () => ({

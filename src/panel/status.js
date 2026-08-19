@@ -58,6 +58,8 @@ export async function buildStatus(deps) {
         // live check: buildStatus runs on every 3s panel poll, and issuing a
         // LinkedIn request per poll would be its own automation signal.
         templateStatus: templateStatusFn,
+        // Pure read of the process-wide search-quota tracker.
+        quotaStatus: quotaStatusFn,
         now = () => new Date(),
     } = deps;
 
@@ -100,6 +102,7 @@ export async function buildStatus(deps) {
     const templateStatus = templateStatusFn
         ? templateStatusFn()
         : (linkedInSession?.templateStatus?.() ?? null);
+    const quotaStatus = quotaStatusFn ? quotaStatusFn() : null;
     const profileDir = bootInfo.profileDir ?? null;
     const profileDirExists = !!(profileDir && profileDir !== 'unknown' && existsSync(profileDir));
     // `login` is the two-step control-panel flow's OWN state (see
@@ -122,6 +125,11 @@ export async function buildStatus(deps) {
         // otherwise show as a healthy scraper quietly finding nothing, while the
         // canary cools credentials for a ban that never happened.
         template: templateStatus ?? null,
+        // Search-quota state. Distinct from `template` above and from any
+        // credential cooldown: this says "LinkedIn is refusing search for the
+        // whole host right now", which is the one reading that should stop an
+        // operator from investigating the accounts.
+        searchQuota: quotaStatus ?? null,
     };
 
     // Per-platform sweep cadence + the last sweep's counters, so the -83%
@@ -148,6 +156,17 @@ export async function buildStatus(deps) {
             message: `LinkedIn request template is STALE (captured ${templateStatus.captured ?? '?'}, `
                 + `live ${templateStatus.live ?? '?'}, ${templateStatus.lag ?? '?'} builds behind) — `
                 + 'searches will return phantom empties. Re-capture: npm run linkedin:rsc-template',
+        });
+    }
+    // A warn, not an error: this is the system working as intended. The alert
+    // exists so "LinkedIn looks dead" has a visible, self-resolving explanation
+    // rather than sending someone to look at the accounts, which are fine.
+    if (quotaStatus?.paused) {
+        alerts.push({
+            level: 'warn',
+            message: `LinkedIn search quota hit — backed off until ${quotaStatus.pausedUntil ?? '?'} `
+                + `(${quotaStatus.consecutiveTrips ?? 1} consecutive). The accounts are fine; `
+                + 'LinkedIn is metering search. Repeated trips mean the sweep cadence is still too high.',
         });
     }
     // Two DIFFERENT conditions, deliberately not merged into "spool is non-empty".

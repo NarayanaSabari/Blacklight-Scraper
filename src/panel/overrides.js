@@ -15,18 +15,42 @@ import { PLATFORM_NAMES } from '../scrapers/registry.js';
 
 const log = createLogger('panel:overrides');
 
-// Built-in sweep cadences, in minutes. Only Indeed is slowed by default:
-// measured 2026-08-03 it re-scraped every role every ~5.1 min for a 0.29%
-// import rate (344 scraped records per import, vs Dice's 4), because 69.4% of
-// what came back was `duplicate_platform_id`. Import volume tracks how fast
-// Indeed publishes, not how often we ask. Every other platform keeps its
-// historical every-cycle behaviour.
+// Built-in sweep cadences, in minutes.
+//
+// Indeed: measured 2026-08-03 it re-scraped every role every ~5.1 min for a
+// 0.29% import rate (344 scraped records per import, vs Dice's 4), because
+// 69.4% of what came back was `duplicate_platform_id`. Import volume tracks how
+// fast Indeed publishes, not how often we ask.
+//
+// LinkedIn: metered differently, and the constraint is not waste but ACCESS.
+// LinkedIn quotas content search and stops serving it entirely past some
+// volume. Production 2026-08-18/19 ran ~250-290 scrapes/hour and lost search
+// twice, for 2-3 hours each time, on both accounts simultaneously:
+//
+//   19:00  135 -> 1224 posts     00:00  208 -> 5689 posts
+//   20:00  231 ->  781           01:00  279 -> 1106
+//   21:00  285 ->    0           02:00  248 -> 2457
+//   22:00  285 ->    0           03:00  288 ->    0
+//   23:00  286 ->    0           04:00  131 ->    0
+//
+// Note 00:00: 208 scrapes returned 5689 posts, while 285-288 scrapes returned
+// nothing at all. Asking harder was not just wasteful, it was counterproductive
+// — the hours that yielded most were the ones that asked least.
+//
+// 30 minutes puts a full ~154-row sweep at roughly 2 passes/hour rather than
+// continuous re-claiming, which lands well under the level that tripped the
+// quota while still being far fresher than the 24h window LinkedIn's own
+// `past-24h` filter covers. The search-quota back-off
+// (scrapers/linkedin-rsc/search-quota.js) is the safety net beneath this; the
+// cadence is what should keep us from needing it.
 //
 // Precedence: an explicit value in platform-overrides.json (set from the
 // control panel) > env SCRAPE_INTERVAL_<PLATFORM>_MINUTES > this default.
 // A stored 0 means "the operator deliberately turned the cadence OFF" and is
-// NOT re-defaulted.
-export const DEFAULT_SWEEP_INTERVAL_MINUTES = Object.freeze({ indeed: 60 });
+// NOT re-defaulted — so raising a default here does NOT change a host that
+// already has an explicit 0 on disk. That host must be updated through the
+// panel, or the stored value removed.
+export const DEFAULT_SWEEP_INTERVAL_MINUTES = Object.freeze({ indeed: 60, linkedin: 30 });
 
 function envInterval(platform, env = process.env) {
     const raw = env?.[`SCRAPE_INTERVAL_${platform.toUpperCase()}_MINUTES`];

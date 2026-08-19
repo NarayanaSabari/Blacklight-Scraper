@@ -95,6 +95,53 @@ node -e "import('./src/scrapers/linkedin-rsc/session.js').then(async m=>{ \
 with an explicit expiry before closing the context. Only the lifetime changes, not the value.
 Verify by reopening the profile cold and reading the jar again.
 
+## LinkedIn: search stops for a few hours, then comes back on its own
+
+**Symptom.** Every LinkedIn scrape returns 0, on **both** accounts, starting within the same
+minute. The template checks out as fresh. A few hours later it starts working again with no
+intervention.
+
+**This is a search quota, not a ban.** LinkedIn meters content search separately from the rest of
+the site. Past some volume it stops serving search while leaving the account otherwise completely
+functional. Confirm with `node scripts/linkedin-browser-check.js`: during a quota window the feed
+and notifications render normally and the account is clearly logged in, but search shows
+"No results found".
+
+Measured 2026-08-18/19 (scrapes issued per hour, and posts returned):
+
+| Hour (UTC) | Scrapes | Posts | |
+|---|---|---|---|
+| 19:00 | 135 | 1224 | serving |
+| 20:00 | 231 | 781 | serving |
+| 21-23 | ~285 | 0 | refusing |
+| 00:00 | 208 | 5689 | serving, recovered by itself |
+| 01:00 | 279 | 1106 | serving |
+| 02:00 | 248 | 2457 | serving |
+| 03-04 | ~288 | 0 | refusing |
+
+Note the shape: the hours that returned the **most** are the ones that asked **least**. 208
+scrapes returned 5,689 posts; 288 returned nothing. Pushing harder is not merely wasteful here,
+it is counterproductive.
+
+**How to tell it apart from the two lookalikes:**
+
+| Template fresh? | Browser sees posts? | Both accounts at once? | Cause |
+|---|---|---|---|
+| no | yes | yes | stale template (see the section above) |
+| yes | yes | no | that one account is restricted |
+| yes | **no** | **yes** | **search quota - this section** |
+
+**It handles itself now.** After 25 consecutive empty scrapes across all credentials, the scraper
+writes the LinkedIn platform cooldown marker and stops claiming work for 30 minutes, doubling on
+repeat trips up to 4 hours, decaying after a clean period. The control panel shows a warn alert
+naming the accounts as fine, and `scraper_linkedin_quota_pauses_total` counts the trips.
+
+**If it keeps tripping, lower the cadence — do not touch the accounts.** The sweep interval is the
+control that matters: `linkedin` defaults to 30 minutes
+(`DEFAULT_SWEEP_INTERVAL_MINUTES` in `src/panel/overrides.js`), but a stored value in
+`config/platform-overrides.json` overrides it, and a stored `0` means "no cadence limit at all",
+which is what produced the ~285 scrapes/hour above. Check that file first.
+
 ## LinkedIn: every query is empty and the accounts get "shadow-banned"
 
 **This is the highest-cost failure in this file. Read it before you touch a credential.**

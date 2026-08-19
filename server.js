@@ -41,6 +41,7 @@ import { cooldownSnapshot } from './src/core/platform-cooldowns.js';
 import { spoolStats } from './src/core/submit-spool.js';
 import { getPlatformOverrides } from './src/panel/overrides.js';
 import * as recentSubmissions from './src/panel/recent.js';
+import { searchQuotaStatus } from './src/scrapers/linkedin-rsc/scraper.js';
 
 const log = createLogger('server');
 
@@ -149,6 +150,7 @@ async function main() {
         overrides: getPlatformOverrides(),
         recent: recentSubmissions,
         loginController,
+        quotaStatus: searchQuotaStatus,
         requestRestart: () => shutdownFn?.('panel-restart'),
     });
 

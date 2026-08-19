@@ -218,6 +218,24 @@ class MetricsRegistry {
             registers: reg,
         });
 
+        // LinkedIn search quota -------------------------------------------
+        // LinkedIn meters content search separately from the rest of the site
+        // and stops serving it past some volume, platform-wide, while the
+        // accounts stay otherwise healthy. Production 2026-08-18/19 lost search
+        // on both accounts twice for 2-3h each while still issuing ~285
+        // scrapes/hour into the block.
+        this.linkedinQuotaPausesTotal = new Counter({
+            name: 'scraper_linkedin_quota_pauses_total',
+            help: 'Times LinkedIn search was detected as refused platform-wide and scraping backed off. Rising = we are pushing past the search quota; tune the sweep cadence, not the accounts.',
+            registers: reg,
+        });
+
+        this.linkedinQuotaPauseSeconds = new Gauge({
+            name: 'scraper_linkedin_quota_pause_seconds',
+            help: 'Duration of the most recent search-quota back-off. Escalates while the quota keeps being hit, so a growing value means the cadence is still too high.',
+            registers: reg,
+        });
+
         // Queue ------------------------------------------------------------
         this.queueChecksTotal = new Counter({
             name: 'scraper_queue_checks_total',
@@ -381,6 +399,13 @@ class MetricsRegistry {
     /** A shadow-ban verdict withheld because our own request was stale. */
     recordLinkedInRequestRefused() {
         this.#safe(() => this.linkedinRequestRefusedTotal.inc());
+    }
+
+    /** Search refused platform-wide; scraping backed off for `pauseMs`. */
+    recordLinkedInQuotaPause(pauseMs) {
+        this.#safe(() => this.linkedinQuotaPausesTotal.inc());
+        if (!Number.isFinite(pauseMs)) return;
+        this.#safe(() => this.linkedinQuotaPauseSeconds.set(Math.round(pauseMs / 1000)));
     }
 
     recordQueueCheck(result) {

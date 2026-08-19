@@ -23,11 +23,23 @@ import { getHighWaterStore } from './high-water.js';
 import { CanaryTracker, runCanary } from './canary.js';
 import { getRequestPacer } from './pacer.js';
 import { fetchForCredential } from './egress.js';
+import { SearchQuotaTracker, applyQuotaPause } from './search-quota.js';
+import * as linkedinCooldown from '../../core/linkedin-cooldown.js';
+import { getMetrics } from '../../metrics/registry.js';
+import { titleFromPost, locationFromPost, companyFromPost } from './post-fields.js';
 
 // One tracker per process: streaks are per-credential inside it, and the
 // canary's whole job is to observe across consecutive scrapes.
 const defaultCanaryTracker = new CanaryTracker();
-import { titleFromPost, locationFromPost, companyFromPost } from './post-fields.js';
+
+// Also one per process, but for the opposite reason: this signal is a property
+// of the PLATFORM, so every credential's result feeds the same counter.
+const defaultQuotaTracker = new SearchQuotaTracker();
+
+/** Live search-quota state, for the control panel. Pure read. */
+export function searchQuotaStatus() {
+    return defaultQuotaTracker.snapshot();
+}
 
 const log = createLogger('linkedin-rsc');
 
@@ -159,6 +171,14 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // sleeps — otherwise a suite that exercises the scrape path would sit
         // through a 20s floor per call.
         pacer = paginateImpl === defaultPaginate ? getRequestPacer() : null,
+        // Platform-wide search-quota back-off. Same injection rule as the
+        // pacer: a caller supplying its own paginateImpl is not talking to
+        // LinkedIn, so it must not be able to write a real cooldown marker into
+        // the operator's home directory as a side effect of a unit test.
+        quotaTracker = defaultQuotaTracker,
+        quotaCooldown = linkedinCooldown,
+        applyQuotaPauseImpl = paginateImpl === defaultPaginate ? applyQuotaPause : () => false,
+        metrics = getMetrics(),
     } = options;
 
     // A recruiter-authored query is used EXACTLY as written — no random pick.
@@ -286,6 +306,39 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // exists to catch.
         const refusedRepeat = emptyConfirmed && sinceActivityId !== null;
 
+        // PLATFORM-WIDE search quota, tracked across every credential.
+        //
+        // Distinct from the per-credential canary below, and checked first,
+        // because it describes a different thing: LinkedIn metering content
+        // search for the whole host rather than restricting one account.
+        // Production 2026-08-18/19 lost search on BOTH accounts within the same
+        // minute, twice, recovering on its own after ~2-3h each time — while we
+        // kept issuing ~285 scrapes an hour into the wall.
+        //
+        // Ordering matters. During a quota window every account looks banned,
+        // so this must stop the platform BEFORE the canary starts convicting
+        // individual credentials for something that is not their fault.
+        const served = jobs.length > 0 || upToDate || refusedRepeat;
+        if (served) {
+            quotaTracker.recordServed();
+        } else {
+            const { tripped, pauseMs, streak } = quotaTracker.recordEmpty();
+            if (tripped) {
+                const paused = applyQuotaPauseImpl({
+                    cooldown: quotaCooldown,
+                    pauseMs,
+                    now: new Date(),
+                });
+                log.error('LinkedIn is refusing search platform-wide — pausing to let the quota recover', {
+                    consecutiveEmpty: streak,
+                    pauseMinutes: Math.round(pauseMs / 60000),
+                    markerWritten: paused,
+                    scraper_alert: 'linkedin_search_quota',
+                });
+                try { metrics?.recordLinkedInQuotaPause?.(pauseMs); } catch { /* never break a scrape */ }
+            }
+        }
+
         // A zero-yield scrape feeds the credential's streak; at the threshold,
         // one extra request on a query that always has results settles whether
         // the account is banned or the queries were thin.
@@ -298,7 +351,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // credential stayed `available` and kept being leased for four more
         // hours of zero-yield sessions.
         let canaryVerdict = null;
-        if (jobs.length > 0 || upToDate || refusedRepeat) {
+        if (served) {
             canaryTracker.recordHealthy(lease);
         } else if (canaryTracker.recordEmpty(lease)) {
             canaryVerdict = await runCanaryImpl({
