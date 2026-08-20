@@ -142,6 +142,71 @@ control that matters: `linkedin` defaults to 30 minutes
 `config/platform-overrides.json` overrides it, and a stored `0` means "no cadence limit at all",
 which is what produced the ~285 scrapes/hour above. Check that file first.
 
+## The quota pause keeps re-arming and never recovers
+
+**Symptom.** `searchQuota` on the panel shows a high `consecutiveTrips` (5, 9, ...), `pausedUntil`
+several hours out and `nextPauseMs` pinned at the 4-hour ceiling, and it does not clear on its own.
+Observed 2026-08-19/20: trips climbed 3 -> 9 overnight and the host sat idle for 8.6 hours.
+
+**Check `sessionAlive` first.** A dead session returns a *confirmed empty* for every query, which is
+byte-identical to a quota refusal. The quota tracker cannot tell them apart, so an unauthenticated
+host manufactures a platform-wide pause out of its own dead session, and each expiry re-trips and
+doubles again. The tell is **`lastServedAt: null`** - a genuine quota window follows a period of
+being served, so a tracker that has never once been served is describing a broken host, not a quota.
+
+Two alerts firing together is the giveaway, and they contradict each other:
+
+```
+ERROR  LinkedIn needs re-login - profile exists but the session is not alive.
+WARN   LinkedIn search quota hit ... "The accounts are fine; LinkedIn is metering search."
+```
+
+**Recovery.** Re-login, then clear the marker and restart - all three, in that order:
+
+```powershell
+Remove-Item $env:USERPROFILE\.blacklight-linkedin-cooldown -Force
+```
+
+The marker is on disk and outlives the process, and the trip count is in memory and outlives the
+marker, so neither a restart alone nor deleting the marker alone is enough.
+
+**Beware: two writers share that one marker file.** `search-quota.js` (quota back-off) and
+`session.js` (auth cooldown) both write `~/.blacklight-linkedin-cooldown`, and the write is
+last-one-wins. A quota pause can bury the auth cooldown, which is how the "run `npm run
+linkedin:login`" instruction goes missing while the host sits idle with a dead session.
+
+**`sessionAlive: false` immediately after a restart is normal.** `isAlive()` reads an in-memory
+cookie cache that is empty until the first LinkedIn scrape populates it. Judge it after a sweep has
+run, not at boot.
+
+## A platform fails every session and hammers the site
+
+**Symptom.** One platform's `sessions_total{result="failed"}` climbs by hundreds in minutes.
+Measured 2026-08-20: dice logged a fresh search every ~1.3 seconds and burned **124 failed sessions
+in about two minutes**, while techfetch relaunched CloakBrowser every ~3 seconds. Between them they
+held both licence seats, starving every other browser platform.
+
+**Cause.** `DEFAULT_SWEEP_INTERVAL_MINUTES` (`src/panel/overrides.js`) only defines `indeed` and
+`linkedin`. A platform with no cadence re-claims continuously, so a platform that fails fast retries
+as fast as it can fail.
+
+**Do not diagnose this as an IP block without testing.** Fetch the same URL three ways - it takes a
+minute and it eliminated the obvious wrong answer immediately:
+
+```powershell
+# on the host itself
+(Invoke-WebRequest "https://www.dice.com/jobs?q=Agile+Coach&location=United+States").Content `
+  | Select-String -Pattern "/job-detail/" -AllMatches
+```
+
+On 2026-08-20 that returned **103 job links from m1's own IP**, identical to a laptop on a different
+network, while the same search through CloakBrowser returned **zero anchors**. The IP was fine and
+the site was up; only the browser path was being served empty. That points at the browser
+fingerprint, not the network, and it is the opposite of what "every session fails" suggests.
+
+**Stopgap:** pause the platform from the panel. A platform that fails every session is worth less
+than idle, because it is also consuming the licence seats LinkedIn's login needs.
+
 ## LinkedIn: every query is empty and the accounts get "shadow-banned"
 
 **This is the highest-cost failure in this file. Read it before you touch a credential.**
