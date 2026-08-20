@@ -19,7 +19,18 @@ import { ScraperError, BlockedError } from './errors.js';
 import { getProxyPool } from './proxy-pool.js';
 import { getMetrics } from '../metrics/registry.js';
 import { classifyError } from '../metrics/classify.js';
-import { classifyUrl } from './url-quality.js';
+import { classifyUrl, evaluateUrlQuality } from './url-quality.js';
+
+// Every platform scraper funnels its jobs through normalizeJobData()
+// (core/normalize.js) before they reach here, which nests the wire fields
+// under `job.job` (`{ _metadata, job: { url, title, ... }, company, ... }`).
+// `job?.url` on that shape is always undefined. Falling back to `job?.url`
+// keeps this working for the (test-only) legacy case of a scraperFn that
+// returns flat job objects directly, per BaseScraper's documented bare-array
+// contract above.
+function urlForQuality(job) {
+    return job?.job?.url ?? job?.url;
+}
 
 function normalizeResult(result) {
     if (Array.isArray(result)) {
@@ -96,8 +107,30 @@ export class BaseScraper {
             const jobCount = jobs.length;
 
             try {
-                for (const job of jobs) {
-                    metrics.recordUrlQuality?.(this.platform, classifyUrl(job?.url));
+                const qualities = jobs.map((job) => classifyUrl(urlForQuality(job)));
+                for (const quality of qualities) {
+                    metrics.recordUrlQuality?.(this.platform, quality);
+                }
+                // Guard against a repeat of the 2026-08-20 incident: 6148/6148
+                // LinkedIn jobs classified 'empty' and nothing alerted, because
+                // the metric itself was reading the wrong field and so was
+                // ALWAYS 'empty' - a permanent false positive nobody could
+                // trust enough to page on. Now that the field is read
+                // correctly, a high empty ratio in one scrape's own batch is a
+                // real signal (a genuinely broken extractor), so it gets its
+                // own scraper_alert rather than only ever showing up as a
+                // counter someone has to remember to graph. Scoped to THIS
+                // scrape's jobs, not a rolling/global rate - a broken run must
+                // not be diluted by healthy ones on either side of it, and a
+                // healthy run must not inherit a stale streak from a bad one.
+                const quality = evaluateUrlQuality(qualities);
+                if (quality.degraded) {
+                    this.log.error('Most jobs this scrape carried no URL - suspected broken extractor', {
+                        jobCount: quality.jobCount,
+                        emptyCount: quality.emptyCount,
+                        emptyRatio: Number(quality.emptyRatio.toFixed(3)),
+                        scraper_alert: 'url_quality_degraded',
+                    });
                 }
             } catch (_e) {
                 // Observability must never crash the scraping path.
