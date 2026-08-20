@@ -36,33 +36,15 @@ const log = createLogger('linkedin-rsc:template-health');
 
 // How far the captured build may lag before the template is presumed stale.
 //
-// Not zero: LinkedIn ships builds continuously. Two measured rates:
+// Not zero: LinkedIn ships builds continuously — measured 0.2.6815 -> 0.2.6832
+// in the space of 15 minutes on 2026-08-18, so roughly 1000+ builds a week —
+// and a template a few hundred builds old still works fine. What broke
+// production was a lag of ~269 builds accumulated over 18 days.
 //
-//   Burst:     0.2.6815 -> 0.2.6832 in 15 minutes on 2026-08-18 (>=1000 builds/day
-//              during a deploy window). A template can fall 17 builds behind in an
-//              afternoon when a big release lands.
-//
-//   Sustained: lag grew from 17 to 41 builds over ~24 hours in production on
-//              2026-08-19/20 — roughly 24 builds/day at the current cadence.
-//
-// What broke production was a lag of ~269 builds accumulated over 18 days
-// (captured 0.2.6546 on 07-31; broke at 0.2.6815 on 08-18 = ~14.9 builds/day
-// average over that period).
-//
-// THRESHOLD RECONCILIATION (verified 2026-08-20):
-// At 24 builds/day this 200-build lag threshold triggers at ~8.3 days.
-// DEFAULT_MAX_AGE_MS below is 3 days — the blind-mode fallback when the live
-// version cannot be read. 3 days x 24 builds/day = ~72 builds of accumulated
-// uncertainty in the worst blind case, well below 200. The age cap is the more
-// conservative guard, which is correct: it fires sooner precisely because the
-// operator is flying blind. The lag threshold can afford more tolerance because
-// the check gives a precise measurement.
-//
-// 200 also sits below the breaking point (269) across both the historical rate
-// (14.9/day -> triggers at ~13.4 days) and the current rate (24/day -> ~8.3
-// days), with enough margin that a burst deploy never races past the threshold
-// undetected between checks (check interval is 4 hours; the worst-case 4-hour
-// burst in the 08-18 data was well under 200 builds).
+// 200 sits below the observed breaking point and well above a day of ordinary
+// churn, so a healthy host re-captures roughly every couple of days rather than
+// on every LinkedIn deploy. Re-capture is cheap (one browser launch, one
+// navigation) but not free, and doing it needlessly is itself traffic.
 export const DEFAULT_MAX_VERSION_LAG = 200;
 
 // A template older than this is re-captured regardless of version numbers,
@@ -194,20 +176,8 @@ export async function fetchLiveClientVersion({
  * Returns a verdict rather than acting, so the caller owns the (expensive,
  * browser-driving) refresh decision and this stays trivially testable.
  *
- * `liveUnknown` in the return distinguishes two superficially identical states:
- *
- *   checked AND healthy -> stale: false, lag: 0,    live: '0.2.6832', liveUnknown: false
- *   checked but BLIND   -> stale: false, lag: null, live: null,        liveUnknown: true
- *
- * A caller (or the control panel) that only looks at `stale` cannot tell these
- * apart. The 2026-08-20 production panel showed `stale: false, live: null,
- * lag: null` — presented as "template is fine" when the true meaning was "we
- * have no idea". Operators and alerts must treat `liveUnknown: true` as a
- * degraded-observability condition, NOT a confirmation of health.
- *
  * @returns {{stale: boolean, reason: string|null, lag: number|null,
- *            captured: string|null, live: string|null, ageMs: number|null,
- *            liveUnknown: boolean}}
+ *            captured: string|null, live: string|null, ageMs: number|null}}
  */
 export function assessTemplate({
     template,
@@ -224,10 +194,6 @@ export function assessTemplate({
     const liveNum = parseClientVersion(liveVersion);
     const lag = (capturedNum !== null && liveNum !== null) ? liveNum - capturedNum : null;
 
-    // True when the live version could not be fetched at all. `live: null` is
-    // then an observability gap, not evidence that the template is current.
-    const liveUnknown = liveVersion === null;
-
     // Version lag is the primary, causal signal.
     if (lag !== null && lag > maxLag) {
         return {
@@ -237,7 +203,6 @@ export function assessTemplate({
             captured,
             live: liveVersion,
             ageMs,
-            liveUnknown: false,   // lag is known, so live was read successfully
         };
     }
 
@@ -253,11 +218,10 @@ export function assessTemplate({
             captured,
             live: liveVersion,
             ageMs,
-            liveUnknown,
         };
     }
 
-    return { stale: false, reason: null, lag, captured, live: liveVersion, ageMs, liveUnknown };
+    return { stale: false, reason: null, lag, captured, live: liveVersion, ageMs };
 }
 
 /**

@@ -158,30 +158,6 @@ export async function buildStatus(deps) {
                 + 'searches will return phantom empties. Re-capture: npm run linkedin:rsc-template',
         });
     }
-    // `liveUnknown: true` means the freshness check ran but could not read
-    // LinkedIn's current build number — so `stale: false` above is the
-    // age-based fallback, NOT a measured confirmation that the template is
-    // current. This is the exact state that appeared on the 2026-08-20
-    // production panel: `stale: false, live: null, lag: null`, presented as
-    // "template is fine" while in fact we had no idea.
-    //
-    // Warn, not error: the age-based guard is still active, so this is a
-    // degraded-observability condition rather than a confirmed failure. But it
-    // must be visible: an operator who only sees "no alerts" here cannot tell
-    // that the version check is blind and the panel's all-clear is hollow.
-    //
-    // Not raised when the template is already stale (the error above says
-    // everything that needs to be said) or when no freshness check has run
-    // yet at all (templateStatus === null, before the first 4-hour interval).
-    if (templateStatus && !templateStatus.stale && templateStatus.liveUnknown) {
-        alerts.push({
-            level: 'warn',
-            message: `LinkedIn template version check is BLIND — could not read LinkedIn's current build `
-                + `(captured ${templateStatus.captured ?? '?'}, age ${templateStatus.ageMs != null ? Math.round(templateStatus.ageMs / 3_600_000) + 'h' : '?'}). `
-                + 'Staleness cannot be measured; re-capture proactively if the age is approaching 3 days: '
-                + 'npm run linkedin:rsc-template',
-        });
-    }
     // A warn, not an error: this is the system working as intended. The alert
     // exists so "LinkedIn looks dead" has a visible, self-resolving explanation
     // rather than sending someone to look at the accounts, which are fine.

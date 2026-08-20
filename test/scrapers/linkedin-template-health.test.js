@@ -201,55 +201,6 @@ describe('assessTemplate', () => {
         assert.equal(verdict.stale, false);
     });
 
-    it('marks liveUnknown:false when the live version was successfully read', () => {
-        const verdict = assessTemplate({
-            template: templateAt('0.2.6832', '2026-08-18T12:00:00.000Z'),
-            liveVersion: '0.2.6832',
-            now: Date.parse('2026-08-18T19:00:00.000Z'),
-        });
-        assert.equal(verdict.liveUnknown, false,
-            'a successful version read must not be mistaken for an observability gap');
-    });
-
-    it('marks liveUnknown:true when the live version could not be fetched', () => {
-        // This is the exact state from 2026-08-20 production:
-        // stale: false, live: null, lag: null — looks like an all-clear but is
-        // actually blind. liveUnknown lets callers distinguish the two.
-        const verdict = assessTemplate({
-            template: templateAt('0.2.6815', '2026-08-19T10:00:00.000Z'),
-            liveVersion: null,
-            now: Date.parse('2026-08-20T10:05:00.000Z'),
-        });
-        assert.equal(verdict.stale, false);
-        assert.equal(verdict.liveUnknown, true,
-            'live: null with a young template must expose the observability gap, not claim a clean check');
-    });
-
-    it('marks liveUnknown:true on the age-based stale path', () => {
-        // When we fire on age (the blind fallback), liveUnknown should still
-        // be true so callers know which path triggered.
-        const verdict = assessTemplate({
-            template: templateAt('weird-format', '2026-08-01T00:00:00.000Z'),
-            liveVersion: null,
-            now: Date.parse('2026-08-18T00:00:00.000Z'),
-        });
-        assert.equal(verdict.stale, true);
-        assert.equal(verdict.reason, 'age_unverifiable_version');
-        assert.equal(verdict.liveUnknown, true);
-    });
-
-    it('marks liveUnknown:false on the version-lag stale path', () => {
-        // Stale by version lag means we DID read the live version, so liveUnknown
-        // must be false even though the outcome is bad.
-        const verdict = assessTemplate({
-            template: templateAt('0.2.6546', '2026-07-31T01:13:03.000Z'),
-            liveVersion: '0.2.6815',
-            now: Date.parse('2026-08-18T19:00:00.000Z'),
-        });
-        assert.equal(verdict.stale, true);
-        assert.equal(verdict.liveUnknown, false);
-    });
-
     it('never reports stale for a NEWER captured version', () => {
         // Negative lag means our capture is ahead of what we read, which is a
         // measurement artifact (A/B bucket, CDN skew), never a reason to churn.

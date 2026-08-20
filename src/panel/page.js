@@ -281,41 +281,6 @@ function renderLinkedin(linkedin) {
             : pill('FAILED: ' + (login.lastVerdict.reason || 'unknown reason'), 'error');
     }
 
-    // Template freshness. Three distinct states an operator must be able to
-    // tell apart:
-    //
-    //   1. checked AND healthy (stale: false, liveUnknown: false)
-    //      -> green pill, show lag and live version
-    //   2. checked but BLIND   (stale: false, liveUnknown: true)
-    //      -> amber pill, age is the only guard
-    //   3. stale               (stale: true)
-    //      -> red pill, re-capture needed
-    //   4. never checked yet   (template === null)
-    //      -> muted pill
-    //
-    // State 2 is the one that caused the 2026-08-20 production confusion: it
-    // looked identical to state 1 in the old rendering (both showed "fresh").
-    let templatePill;
-    let templateDetail = '';
-    const t = linkedin.template;
-    if (!t) {
-        templatePill = pill('not yet checked', 'muted');
-    } else if (t.stale) {
-        templatePill = pill('STALE', 'error');
-        templateDetail = esc(t.captured || '?') + ' vs live ' + esc(t.live || '?')
-            + ' (' + esc(t.lag != null ? t.lag + ' builds behind' : 'unknown lag') + ')';
-    } else if (t.liveUnknown) {
-        templatePill = pill('blind — cannot measure', 'warn');
-        templateDetail = 'captured ' + esc(t.captured || '?')
-            + ', age ' + (t.ageMs != null ? esc(Math.round(t.ageMs / 3_600_000) + 'h') : '?')
-            + ' (live version unavailable)';
-    } else {
-        templatePill = pill('current', 'ok');
-        templateDetail = 'captured ' + esc(t.captured || '?')
-            + ', live ' + esc(t.live || '?')
-            + (t.lag != null ? ', ' + esc(t.lag) + ' builds behind' : '');
-    }
-
     el('linkedin').innerHTML =
         '<dt>Session</dt><dd>' + (linkedin.sessionAlive ? pill('alive', 'ok') : pill('dead', 'error')) + '</dd>' +
         '<dt>Profile dir</dt><dd>' + esc(linkedin.profileDir || '—') + '</dd>' +
@@ -324,9 +289,7 @@ function renderLinkedin(linkedin) {
         '<dt>Login state</dt><dd>' + loginStatePill(state) + '</dd>' +
         '<dt>Login profile</dt><dd>' + esc(login.profileDir || '—') + (login.profileKey ? ' (' + esc(login.profileKey) + ')' : '') + '</dd>' +
         '<dt>Last verdict</dt><dd>' + verdict + '</dd>' +
-        '<dt>Last error</dt><dd>' + esc(login.lastError || '—') + '</dd>' +
-        '<dt>Template</dt><dd>' + templatePill + (templateDetail ? ' ' + templateDetail : '') + '</dd>' +
-        '<dt>Template checked</dt><dd>' + esc(t ? fmtDate(t.checkedAt) : '—') + '</dd>';
+        '<dt>Last error</dt><dd>' + esc(login.lastError || '—') + '</dd>';
 
     const actions = el('linkedinActions');
     let html = '';

@@ -180,54 +180,6 @@ test('buildStatus: no quota pause fires no quota alert', async () => {
     assert.ok(!status.alerts.some((a) => /search quota/i.test(a.message)));
 });
 
-test('buildStatus: liveUnknown:true raises a warn alert about the observability gap', async () => {
-    // The 2026-08-20 production failure: the version check ran but could not
-    // read LinkedIn's current build. stale:false was the age-based fallback,
-    // not a measured confirmation. The panel must not present this as an
-    // all-clear.
-    const status = await buildStatus(baseDeps({
-        templateStatus: () => ({
-            stale: false, reason: null, lag: null,
-            captured: '0.2.6815', live: null, ageMs: 138_748_819,
-            liveUnknown: true, checkedAt: '2026-08-20T10:05:53.666Z',
-        }),
-    }));
-    const alert = status.alerts.find((a) => /BLIND/.test(a.message));
-    assert.ok(alert, 'a blind version check must raise an alert');
-    assert.equal(alert.level, 'warn', 'degraded observability is a warn, not an error');
-    assert.match(alert.message, /0\.2\.6815/, 'names the captured version');
-    assert.match(alert.message, /39h/, 'quantifies the template age (138748819ms rounds to 39h)');
-    assert.match(alert.message, /linkedin:rsc-template/, 'states the remedy');
-});
-
-test('buildStatus: liveUnknown:true does not fire blind alert when template is already stale', async () => {
-    // The stale error is the definitive alert; the observability-gap warn
-    // would be redundant and confusing alongside it.
-    const status = await buildStatus(baseDeps({
-        templateStatus: () => ({
-            stale: true, reason: 'age_unverifiable_version', lag: null,
-            captured: '0.2.6815', live: null, ageMs: 300_000_000,
-            liveUnknown: true,
-        }),
-    }));
-    assert.ok(status.alerts.some((a) => /template is STALE/.test(a.message)), 'stale error fires');
-    assert.ok(!status.alerts.some((a) => /BLIND/.test(a.message)), 'blind warn must not double-fire');
-});
-
-test('buildStatus: liveUnknown:false on a fresh check fires no blind alert', async () => {
-    // A successful version read must not produce any template alerts.
-    const status = await buildStatus(baseDeps({
-        templateStatus: () => ({
-            stale: false, reason: null, lag: 41,
-            captured: '0.2.6815', live: '0.2.6856', ageMs: 138_748_819,
-            liveUnknown: false, checkedAt: '2026-08-20T10:05:53.666Z',
-        }),
-    }));
-    assert.ok(!status.alerts.some((a) => /BLIND/.test(a.message)),
-        'a successful version read must not raise the blind alert');
-    assert.ok(!status.alerts.some((a) => /template is STALE/.test(a.message)));
-});
-
 test('buildStatus: a long-remaining cooldown fires a warn alert; a short one does not', async () => {
     const status = await buildStatus(baseDeps({
         cooldownSnapshot: () => ({
