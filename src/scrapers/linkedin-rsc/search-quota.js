@@ -79,9 +79,22 @@ export const DEFAULT_MAX_PAUSE_MS = 4 * 60 * 60 * 1000;
 // previous pause was too short.
 export const DEFAULT_ESCALATION_FACTOR = 2;
 
-// A clean run this long retires the escalation: the quota window is over and
-// the next trip should start from the base pause again. Without this, a host
-// that had a bad night would carry a 4h pause into a healthy day.
+// A clean run this long retires the escalation when NOTHING has been served in
+// the meantime — a quiet host that simply stopped tripping.
+//
+// ⚠️ This is the SECONDARY decay path. The primary one is a served scrape (see
+// recordServed), because this timer alone cannot retire an escalation that has
+// reached the ceiling:
+//
+//     escalated pause  ->  4h   (DEFAULT_MAX_PAUSE_MS)
+//     decay window     ->  6h   measured from the LAST TRIP
+//
+// The gap between them is only 2h, and every trip restarts the 6h clock. A host
+// tripping even once per recovery window therefore never reaches decay, so
+// `consecutiveTrips` only ever climbs. Production 2026-08-21 rode this to 7
+// trips and a permanent 4h pause WHILE SCRAPING NORMALLY — 6,242 posts
+// overnight, a served scrape at 05:16, and a fresh 4h pause applied at 05:26
+// ten minutes later.
 export const DEFAULT_ESCALATION_DECAY_MS = 6 * 60 * 60 * 1000;
 
 export function emptyThreshold(env = process.env) {
@@ -138,11 +151,28 @@ export class SearchQuotaTracker {
     /**
      * A scrape that produced posts, or positively reached known ground.
      *
-     * Proof the platform is serving us, so the empty run resets. Escalation is
-     * retired only after a sustained clean period (see the decay note): a
-     * single success right after a pause expires does not prove the window has
-     * closed, and treating it as proof would let the pause collapse back to its
-     * base value while the quota is still in force.
+     * Proof the platform is serving us, so the empty run resets AND the
+     * escalation is retired.
+     *
+     * Retiring escalation here was previously gated behind
+     * `escalationDecayMs` elapsing since the last trip, on the reasoning that
+     * one success right after a pause expires does not prove the window has
+     * closed. That reasoning was wrong in the direction that matters, because
+     * the gate is unreachable once the pause reaches its ceiling: a 4h pause
+     * inside a 6h decay window means any host that keeps tripping never decays
+     * at all. Production 2026-08-21 sat at 7 consecutive trips and a permanent
+     * 4h pause while scraping 6,242 posts a night — served at 05:16, paused 4h
+     * at 05:26.
+     *
+     * A served scrape is the strongest evidence available that the platform is
+     * not metering us, and it is the same signal `_consecutiveEmpty = 0`
+     * already trusts unconditionally two lines up. Trusting it for the streak
+     * but not the trip count was the inconsistency.
+     *
+     * The cost of being wrong is bounded and self-correcting: if the quota IS
+     * still in force, the next 25 empties trip again, merely starting from the
+     * 30-minute base instead of 4h. The cost of the old behaviour was
+     * unbounded — a healthy host pinned at the ceiling indefinitely.
      */
     recordServed() {
         this._consecutiveEmpty = 0;
@@ -150,9 +180,7 @@ export class SearchQuotaTracker {
         this._lastServedAt = now;
         // Search is flowing, so whatever pause was in force is over.
         this._pausedUntil = null;
-        if (this._lastTripAt !== null && now - this._lastTripAt > this._escalationDecayMs) {
-            this._consecutiveTrips = 0;
-        }
+        this._consecutiveTrips = 0;
     }
 
     /**
@@ -246,6 +274,10 @@ export function applyQuotaPause({ cooldown, pauseMs, now = new Date() }) {
         cooldown.writeCooldownMarker({
             writeFile: cooldown.defaultWriteFile(),
             rename: cooldown.defaultRename(),
+            // Lets the marker extend rather than truncate a longer claim
+            // already written by the auth-cooldown path. See
+            // core/linkedin-cooldown.js for why these two collided.
+            readFile: cooldown.defaultReadFile(),
             now,
             cooldownMs: pauseMs,
             path: cooldown.cooldownPath(),

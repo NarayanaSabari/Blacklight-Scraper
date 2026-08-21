@@ -146,9 +146,25 @@ describe('escalation', () => {
             'escalation should have retired, starting again from the base pause');
     });
 
-    it('does NOT decay on a single success straight after a pause', () => {
-        // The window may still be in force; one lucky result is not proof it
-        // has closed, and collapsing the pause back to base would re-trip.
+    it('DOES decay on a success, because the alternative never decays at all', () => {
+        // This assertion is the REVERSE of what it originally required, and the
+        // reversal is deliberate.
+        //
+        // The original intent was sound in the abstract: one lucky result after
+        // a pause does not prove the quota window has closed, so hold the
+        // escalation. In practice it made escalation permanent, because the
+        // decay it deferred to is unreachable — a 4h ceiling pause sits inside
+        // a 6h decay window measured from the last trip, and every trip
+        // restarts that clock.
+        //
+        // Production 2026-08-21 is the counter-example: 7 consecutive trips and
+        // a standing 4h pause on a host that had scraped 6,242 posts overnight
+        // and was served at 05:16, ten minutes before a fresh 4h pause landed.
+        // The tracker was describing a quota window that had long since closed.
+        //
+        // Being wrong in this direction is bounded and self-correcting: if the
+        // window really is still open, the next 25 empties trip again from the
+        // 30-minute base. Being wrong in the old direction was unbounded.
         const clock = fakeClock();
         const tracker = trackerAt(clock);
 
@@ -157,8 +173,8 @@ describe('escalation', () => {
         tracker.recordServed();
 
         const second = feedEmpty(tracker, DEFAULT_EMPTY_THRESHOLD)[0];
-        assert.equal(second.pauseMs, DEFAULT_BASE_PAUSE_MS * 2,
-            'escalation must persist until a sustained clean period');
+        assert.equal(second.pauseMs, DEFAULT_BASE_PAUSE_MS,
+            'a served scrape retires the escalation, so the next trip starts from base');
     });
 });
 
@@ -228,6 +244,9 @@ describe('applyQuotaPause', () => {
             writeCooldownMarker: (args) => calls.push(args),
             defaultWriteFile: () => 'writeFile',
             defaultRename: () => 'rename',
+            // The marker is extend-only now (two writers share the file), so
+            // the writer needs to be able to read the existing claim.
+            defaultReadFile: () => 'readFile',
             cooldownPath: () => '/tmp/marker',
         };
 
@@ -403,6 +422,43 @@ describe('request-rate ceiling', () => {
             ORPHAN_WINDOW_MS - worstCase >= 120_000,
             `the production pacing override leaves only ${(ORPHAN_WINDOW_MS - worstCase) / 1000}s `
             + 'of margin; raising it further requires raising INFLIGHT_GRACE_SECONDS first',
+        );
+    });
+});
+
+// ── Production 2026-08-21: escalation that cannot decay ────────────────────
+//
+// Reproduces the exact observed sequence. See the tracker for the fix.
+describe('escalation decay vs the pause it is gated behind', () => {
+    it('retires escalation after a served scrape, even mid-quota-window', () => {
+        let now = 0;
+        const tracker = new SearchQuotaTracker({ now: () => now });
+
+        // Walk the escalation up the way production did, overnight.
+        for (let trip = 1; trip <= 7; trip++) {
+            for (let i = 0; i < DEFAULT_EMPTY_THRESHOLD; i++) tracker.recordEmpty();
+            const snap = tracker.snapshot();
+            assert.equal(snap.paused, true, `trip ${trip} should pause`);
+            // Sit out the pause that was just applied.
+            now = Date.parse(snap.pausedUntil) + 1;
+        }
+
+        // Production reading at 05:26 UTC: seven trips, pinned at the ceiling.
+        assert.equal(tracker.snapshot().consecutiveTrips, 7);
+        assert.equal(tracker.snapshot().nextPauseMs, DEFAULT_MAX_PAUSE_MS);
+
+        // Now LinkedIn serves. Production did this at 05:16 - 6242 posts had
+        // been scraped overnight, so this is not hypothetical.
+        tracker.recordServed();
+
+        // THE BUG: escalation only decays after DEFAULT_ESCALATION_DECAY_MS
+        // (6h) measured from the last trip, but the pause that precedes it is
+        // capped at 4h. A host that is being served again therefore carries its
+        // full escalation into the next thin patch, and the very next streak
+        // re-applies a 4h pause - which is what put production at 7 trips.
+        assert.equal(
+            tracker.snapshot().consecutiveTrips, 0,
+            'a served scrape proves the quota window is over and must retire escalation',
         );
     });
 });

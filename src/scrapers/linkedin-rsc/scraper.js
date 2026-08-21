@@ -217,6 +217,20 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
     return session.withCookies(sessionId, async (cookies, lease) => {
         const requestTemplate = template ?? await session.template();
 
+        // Is this session actually authenticated? Read BEFORE the scrape, so a
+        // failure during the walk cannot retroactively change the answer.
+        //
+        // Tri-state on purpose, and consumed as such by the quota block below:
+        //   true      -> authenticated; an empty result is about the PLATFORM
+        //   false     -> not authenticated; an empty result is about US
+        //   undefined -> the session cannot answer; no opinion, behave as before
+        //
+        // A session without `isAlive` must not silently disable quota
+        // detection, which is why this resolves to undefined rather than false.
+        const sessionAlive = typeof session.isAlive === 'function'
+            ? Boolean(session.isAlive())
+            : undefined;
+
         // Space this scrape from the previous one on the SAME credential. The
         // backend's 15-minute floor (#493) is per queue row: it bounds how often
         // one search repeats and cannot see how close together DIFFERENT
@@ -342,6 +356,37 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         const searchServed = jobs.length > 0 || upToDate;
         if (searchServed) {
             quotaTracker.recordServed();
+        } else if (sessionAlive === false) {
+            // A DEAD SESSION IS NOT A QUOTA WINDOW.
+            //
+            // An unauthenticated session answers every query with a confirmed
+            // empty, which is byte-identical on the wire to LinkedIn metering
+            // search. Feeding those empties to a PLATFORM-wide verdict lets a
+            // host manufacture a quota window out of its own broken login, and
+            // because a pause cannot fix a dead session, every expiry re-trips
+            // and doubles.
+            //
+            // Production 2026-08-19: `sessionAlive: false`, `lastServedAt:
+            // null`, 26 empties, 3 trips within 3.4h of boot, then 9 trips and
+            // a permanent 4h pause by the next morning — 8.6 hours idle for
+            // want of a re-login nobody was told to run, because the quota
+            // pause had overwritten the auth cooldown marker that carries that
+            // instruction.
+            //
+            // Skipped entirely rather than counted: the observation is not
+            // evidence about the platform, so it should not move a
+            // platform-scoped counter in either direction. The dead session
+            // has its own alert path (`needsRelogin`), which is where an
+            // operator should be sent.
+            //
+            // `undefined` (a session that cannot answer) deliberately falls
+            // through to the normal path — no opinion must not disable quota
+            // detection, which is the same rule the canary's
+            // `verifyRequestHealth` gate follows.
+            log.warn('Zero-yield scrape on a dead session — not counting it toward the search quota', {
+                keywords,
+                scraper_alert: 'linkedin_quota_skipped_dead_session',
+            });
         } else {
             const { tripped, pauseMs, streak } = quotaTracker.recordEmpty();
             if (tripped) {

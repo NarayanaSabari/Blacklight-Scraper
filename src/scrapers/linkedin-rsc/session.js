@@ -424,6 +424,9 @@ export class LinkedInRscSession {
             this._cooldown.writeCooldownMarker({
                 writeFile: this._cooldown.defaultWriteFile(),
                 rename: this._cooldown.defaultRename(),
+                // Extend, never truncate: a search-quota pause may already
+                // hold a longer claim on this same marker file.
+                readFile: this._cooldown.defaultReadFile(),
                 now: new Date(),
                 cooldownMs: this._cooldown.cooldownMs(),
                 path: this._cooldown.cooldownPath(),

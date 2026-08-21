@@ -52,10 +52,46 @@ export function readCooldownMarker({ readFile, now, path: markerPath }) {
     return { blockedUntil };
 }
 
-export function writeCooldownMarker({ writeFile, rename, now, cooldownMs: ms, path: markerPath }) {
-    const expiry = new Date(now.getTime() + ms).toISOString();
+// Extend-only. NEVER moves an expiry backward.
+//
+// ⚠️ TWO INDEPENDENT WRITERS SHARE THIS ONE MARKER FILE:
+//   • scrapers/linkedin-rsc/session.js  — the session is dead, needs a re-login
+//   • scrapers/linkedin-rsc/search-quota.js — LinkedIn is metering search
+//
+// Neither can see the other, and a plain `now + ms` write is last-one-wins, so
+// they silently truncated each other. Production 2026-08-19/20 hit both
+// directions: a 4h quota pause shortened to 30 minutes by an auth write (the
+// host resumed scraping straight back into the wall the pause existed to
+// avoid), and an auth marker overwritten by a quota pause, which took the
+// `linkedin_auth_cooldown` alert with it — so the host sat idle with a dead
+// session and no instruction to run `npm run linkedin:login`.
+//
+// Taking the LATER of the two expiries is the safe resolution: both writers are
+// saying "do not scrape until at least T", and honouring the longer claim
+// satisfies both. The cost of over-waiting is bounded and visible on the panel;
+// the cost of under-waiting is scraping into a live block.
+//
+// This mirrors high-water.js, which refuses to move its mark backward for the
+// same class of bug.
+//
+// Best-effort read: an unreadable or malformed existing marker resolves to "no
+// existing claim" and the new expiry is written as-is, because failing to write
+// a cooldown at all is worse than failing to extend one.
+export function writeCooldownMarker({ writeFile, rename, now, cooldownMs: ms, path: markerPath, readFile }) {
+    const requested = new Date(now.getTime() + ms);
+
+    let expiry = requested;
+    if (typeof readFile === 'function') {
+        try {
+            const existing = readCooldownMarker({ readFile, now, path: markerPath });
+            if (existing.blockedUntil instanceof Date && existing.blockedUntil > requested) {
+                expiry = existing.blockedUntil;
+            }
+        } catch { /* unreadable existing marker — write the new expiry as-is */ }
+    }
+
     const tmp = `${markerPath}.tmp`;
-    writeFile(tmp, expiry);
+    writeFile(tmp, expiry.toISOString());
     rename(tmp, markerPath);
 }
 
