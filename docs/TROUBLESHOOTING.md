@@ -204,6 +204,17 @@ network, while the same search through CloakBrowser returned **zero anchors**. T
 the site was up; only the browser path was being served empty. That points at the browser
 fingerprint, not the network, and it is the opposite of what "every session fails" suggests.
 
+**Then wait before you fix anything.** Both platforms recovered on their own overnight with no code
+change: re-checked 2026-08-21, dice ran 12/12 successful sessions for 380 jobs and techfetch 2/2 for
+80, all accepted. The failure was transient - browser-side and self-clearing, the same shape as the
+LinkedIn content-search block a few sections up.
+
+So the ordering that actually works is: prove the IP is fine with the fetch above, pause the
+platform, and re-test in the morning. Only chase the fingerprint if it is *still* failing then. A
+day of "every session fails" is not by itself evidence of a defect, and dice's page classifier
+(`classifyDiceSearchPage`) already refuses to call a zero-anchor page a confirmed empty - it raises
+`dom_changed` or `network_error` instead, so a silent block does not reach the backend as truth.
+
 **Stopgap:** pause the platform from the panel. A platform that fails every session is worth less
 than idle, because it is also consuming the licence seats LinkedIn's login needs.
 

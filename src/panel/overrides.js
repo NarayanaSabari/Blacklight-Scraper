@@ -50,7 +50,35 @@ const log = createLogger('panel:overrides');
 // NOT re-defaulted — so raising a default here does NOT change a host that
 // already has an explicit 0 on disk. That host must be updated through the
 // panel, or the stored value removed.
-export const DEFAULT_SWEEP_INTERVAL_MINUTES = Object.freeze({ indeed: 60, linkedin: 30 });
+// Dice and TechFetch: browser platforms, and the constraint is the LICENCE
+// SEAT, not the site's tolerance. There are 2 CloakBrowser seats, and only
+// browser-bound platforms compete for them (Indeed is a plain HTTP API and
+// LinkedIn's RSC transport is HTTP after a brief cookie read).
+//
+// Left uncapped, a browser platform re-claims continuously. Measured on the
+// live host 2026-08-21 with dice HEALTHY: ~18s per session, i.e. ~200
+// sessions/hour, holding a seat for essentially all of it. The failure mode is
+// far worse: on 2026-08-20, while dice was being served empty pages, it turned
+// over a session every ~1.3s and burned 124 failed sessions in two minutes,
+// with techfetch relaunching its browser every ~3s. Between them they pinned
+// both seats, which starves every other browser platform AND the panel's
+// LinkedIn login, which needs a free seat to open a window.
+//
+// 20 minutes is derived from the seat budget, not picked for roundness. A full
+// pass over the ~154-row queue at ~18s/session is ~46 minutes of seat time per
+// platform; with two browser platforms sharing 2 seats, a 20-minute cadence
+// keeps each one's passes from overlapping continuously while still refreshing
+// well inside the 7-day `postedDate` window dice searches. Dice's import rate
+// is also the highest of any platform (~4 scraped records per import vs
+// Indeed's 344), so its results are worth refreshing more often than Indeed's
+// hourly sweep - hence 20 rather than 60.
+//
+// This is a floor on how often a sweep STARTS, not a rate limit on requests
+// within one. It does not replace per-platform backoff: it bounds the steady
+// state, and a platform that is genuinely failing still needs its own cooldown.
+export const DEFAULT_SWEEP_INTERVAL_MINUTES = Object.freeze({
+    indeed: 60, linkedin: 30, dice: 20, techfetch: 20,
+});
 
 function envInterval(platform, env = process.env) {
     const raw = env?.[`SCRAPE_INTERVAL_${platform.toUpperCase()}_MINUTES`];
