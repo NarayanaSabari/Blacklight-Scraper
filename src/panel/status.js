@@ -113,11 +113,34 @@ export async function buildStatus(deps) {
     const login = loginController ? loginController.status() : {
         state: 'idle', profileKey: null, profileDir: null, startedAt: null, lastVerdict: null, lastError: null,
     };
+    // `sessionAlive` is a CACHE reading, not an auth check. It reports whether a
+    // cookie jar was read within the last 30 minutes (LINKEDIN_RSC_COOKIE_TTL_MIN),
+    // and only a scrape refreshes it. So any window where LinkedIn is not being
+    // scraped ages the cache out and reports a perfectly healthy account as dead.
+    //
+    // A quota pause is exactly such a window, and it is up to 4 hours against a
+    // 30-minute TTL, so this false alarm is guaranteed rather than unlucky.
+    // Observed 2026-08-24: `sessionAlive: false` and "needs re-login" showing as
+    // an ERROR while scripts/linkedin-search-scope.js proved the account was
+    // logged in and serving — 11 profiles on `all` search, with only the content
+    // vertical blocked. The host had scraped 25,209 LinkedIn posts that run.
+    //
+    // Suppressing the alarm during a cooldown is the honest reading: we have no
+    // fresh evidence either way, and "no evidence" must not be presented as
+    // "confirmed dead" — that is the same mistake the template check made
+    // (see template-health.js `liveUnknown`). A genuinely dead session still
+    // surfaces the moment the cooldown lifts and the next scrape fails to
+    // establish cookies.
+    const linkedinCooled = Boolean(cooldowns?.linkedin?.onCooldown);
     const linkedin = {
         sessionAlive,
         profileDir,
         profileDirExists,
-        needsRelogin: profileDirExists && !sessionAlive,
+        needsRelogin: profileDirExists && !sessionAlive && !linkedinCooled,
+        // True when we simply cannot tell: the cookie cache has aged out only
+        // because nothing has been allowed to scrape. Distinct from a confirmed
+        // dead session, and rendered differently.
+        sessionUnknown: profileDirExists && !sessionAlive && linkedinCooled,
         login,
         // Request-template freshness. Surfaced because the failure it describes
         // is otherwise invisible AND actively misleading: a stale template makes
@@ -146,6 +169,15 @@ export async function buildStatus(deps) {
     const alerts = [];
     if (linkedin.needsRelogin) {
         alerts.push({ level: 'error', message: 'LinkedIn needs re-login — profile exists but the session is not alive.' });
+    }
+    if (linkedin.sessionUnknown) {
+        alerts.push({
+            level: 'info',
+            message: 'LinkedIn session state is unknown while the platform is cooled down — the cookie '
+                + 'cache ages out when nothing is scraping. This is NOT a re-login signal; it resolves '
+                + 'itself on the first scrape after the cooldown lifts. To check the account now: '
+                + 'node scripts/linkedin-search-scope.js',
+        });
     }
     // Ranked above the delivery alerts on purpose: when this one is firing, the
     // scraper is returning zero for everything and the shadow-ban alerts below

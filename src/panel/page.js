@@ -56,6 +56,7 @@ header .muted { color: var(--muted); font-size: 12px; }
 }
 .alert.error { background: rgba(232, 85, 90, 0.12); border-color: var(--error); color: #ffb0b3; }
 .alert.warn { background: rgba(232, 179, 57, 0.12); border-color: var(--warn); color: #f2cd7c; }
+.alert.info { background: rgba(139, 147, 163, 0.12); border-color: var(--muted); color: #c3c9d6; }
 main {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -320,7 +321,12 @@ function renderLinkedin(linkedin) {
         '<dt>Session</dt><dd>' + (linkedin.sessionAlive ? pill('alive', 'ok') : pill('dead', 'error')) + '</dd>' +
         '<dt>Profile dir</dt><dd>' + esc(linkedin.profileDir || '—') + '</dd>' +
         '<dt>Profile exists</dt><dd>' + esc(linkedin.profileDirExists) + '</dd>' +
-        '<dt>Needs relogin</dt><dd>' + (linkedin.needsRelogin ? pill('yes', 'error') : pill('no', 'ok')) + '</dd>' +
+        // Three states, not two. An unknown state means the cookie cache aged
+        // out during a cooldown, which says nothing about the account - showing
+        // that as a confident 'no' is as wrong as showing it as 'yes'.
+        '<dt>Needs relogin</dt><dd>' + (linkedin.needsRelogin
+            ? pill('yes', 'error')
+            : linkedin.sessionUnknown ? pill('unknown (cooled down)', 'muted') : pill('no', 'ok')) + '</dd>' +
         '<dt>Login state</dt><dd>' + loginStatePill(state) + '</dd>' +
         '<dt>Login profile</dt><dd>' + esc(login.profileDir || '—') + (login.profileKey ? ' (' + esc(login.profileKey) + ')' : '') + '</dd>' +
         '<dt>Last verdict</dt><dd>' + verdict + '</dd>' +

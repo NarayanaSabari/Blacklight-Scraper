@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildStatus } from '../../src/panel/status.js';
 
@@ -255,4 +255,54 @@ test('buildStatus: picks the most recently started active session', async () => 
     }));
     assert.equal(status.session.sessionId, 's2');
     assert.equal(status.poll.mutexLocked, true);
+});
+
+// ── A cooldown must not be reported as a dead session (2026-08-24) ─────────
+//
+// `sessionAlive` reads a 30-minute cookie CACHE that only a scrape refreshes,
+// so a quota pause of up to 4h guarantees it ages out. Production showed
+// "LinkedIn needs re-login" at ERROR level while the account was provably fine:
+// scripts/linkedin-search-scope.js returned 11 profiles on `all` search, only
+// the content vertical was blocked, and that same run had scraped 25,209 posts.
+describe('LinkedIn session state during a platform cooldown', () => {
+    const base = {
+        bootInfo: { profileDir: process.cwd(), gitSha: 'x', pkgVersion: '1', nodeVersion: 'v1', pid: 1, bootedAt: 'now', knownPlatforms: [] },
+        getLinkedInSession: () => ({ isAlive: () => false }),
+        orchestrator: null,
+        licensePool: null,
+        proxyPool: null,
+        spoolStats: async () => ({ count: 0, recent: 0, oldest: null, newest: null, deliveryFailingNow: false, backlog: false }),
+        overrides: { pausedList: () => [] },
+        recent: { list: () => [] },
+        loginController: null,
+    };
+
+    it('does NOT claim a re-login is needed while LinkedIn is cooled down', async () => {
+        const status = await buildStatus({
+            ...base,
+            cooldownSnapshot: () => ({ linkedin: { onCooldown: true, until: '2026-08-24T14:50:29.050Z' } }),
+        });
+
+        assert.equal(status.linkedin.needsRelogin, false, 'a cooled-down platform proves nothing about the session');
+        assert.equal(status.linkedin.sessionUnknown, true);
+        assert.equal(
+            status.alerts.filter((a) => a.level === 'error' && /re-login/.test(a.message)).length, 0,
+            'no ERROR alert: we have no evidence the session is dead',
+        );
+    });
+
+    it('DOES claim a re-login is needed when nothing is blocking a scrape', async () => {
+        // The real signal must survive. With no cooldown, an aged-out cache
+        // means scrapes are running and failing to establish cookies.
+        const status = await buildStatus({
+            ...base,
+            cooldownSnapshot: () => ({ linkedin: { onCooldown: false, until: null } }),
+        });
+
+        assert.equal(status.linkedin.needsRelogin, true);
+        assert.equal(status.linkedin.sessionUnknown, false);
+        assert.equal(
+            status.alerts.filter((a) => a.level === 'error' && /re-login/.test(a.message)).length, 1,
+        );
+    });
 });
