@@ -170,6 +170,7 @@ export class LinkedInRscSession {
         this._heartbeatMs = heartbeatMs;
         this._scheduler = scheduler;
         this._cookies = new Map();
+        this._authFailures = new Set();
         this._cookiesAt = new Map();
         this._template = null;
         this._refreshing = new Map();
@@ -399,6 +400,14 @@ export class LinkedInRscSession {
     // tell we are remote, so a single-account host never silently loses the pause.
     get isLocal() { return this._apiClient?.isLocal !== false; }
 
+    authenticationStatus() {
+        return { cookieCacheFresh: this.isAlive(), failedProfiles: this._authFailures.size };
+    }
+
+    noteSearchServed(lease) {
+        this._authFailures.delete(cacheKey(lease?.credential?.profile_key ?? null));
+    }
+
     /** True when a usable session jar is cached. Reported by /healthz. */
     isAlive() {
         return [...this._cookies.keys()].some((key) => this.#cookiesFresh(key));
@@ -523,6 +532,7 @@ export class LinkedInRscSession {
             return await fn(cookies, lease);
         } catch (err) {
             if (err instanceof AuthError && err.code !== 'NEEDS_TEMPLATE') {
+                this._authFailures.add(cacheKey(lease.credential?.profile_key ?? null));
                 // A dead session must not be reused by the next role...
                 this.invalidateCookies(lease.credential?.profile_key ?? null);
                 // ...and the BACKEND has to know, or it keeps the credential

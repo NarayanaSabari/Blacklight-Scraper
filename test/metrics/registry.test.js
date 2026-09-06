@@ -54,3 +54,13 @@ test('scraper_up help no longer claims to be a health signal', async () => {
     assert.match(text, /# HELP scraper_up .*liveness/i);
     assert.match(text, /scraper_last_nonzero_scrape_timestamp_seconds/);
 });
+
+test('LinkedIn outcome metrics distinguish deferrals and track actual request yield', async () => {
+    const m = freshMetrics();
+    m.recordLinkedInSearch('role', 'deferred', 0, 0, 0);
+    m.recordLinkedInSearch('candidate', 'served', 3, 20, 2);
+    const text = await m.snapshot();
+    assert.match(text, /scraper_linkedin_search_outcomes_total\{[^}]*mode="role"[^}]*outcome="deferred"[^}]*\} 1/);
+    assert.match(text, /scraper_linkedin_search_requests_total\{[^}]*mode="candidate"[^}]*\} 3/);
+    assert.match(text, /scraper_linkedin_search_new_posts_total\{[^}]*mode="candidate"[^}]*\} 2/);
+});

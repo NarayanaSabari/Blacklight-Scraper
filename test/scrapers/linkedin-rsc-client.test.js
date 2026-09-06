@@ -305,3 +305,13 @@ test('paginate: no budget by default, and budgetExhausted stays false', async ()
     });
     assert.equal(budgetExhausted, false);
 });
+
+test('a stalled HTTP response body is bounded by the request deadline', async (t) => {
+    const { createServer } = await import('node:http');
+    const server = createServer((_req, res) => { res.writeHead(200); res.write('partial'); });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => { server.closeAllConnections(); server.close(); });
+    const template = { url: `http://127.0.0.1:${server.address().port}`, headers: {}, postData: '{}' };
+    const cookies = [{ name: 'li_at', value: 'test' }, { name: 'JSESSIONID', value: '"ajax:1"' }];
+    await assert.rejects(fetchPage({ template, cookies, params: { keywords: 'engineer' }, timeoutMs: 30 }), /timeout|abort|deadline/i);
+});

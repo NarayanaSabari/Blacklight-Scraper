@@ -150,3 +150,36 @@ test('newestActivityId reports the max seen, including filtered-out posts', asyn
     assert.equal(r.posts.length, 0);
     assert.equal(r.newestActivityId, P2);
 });
+
+test('seen-ID refresh walks beyond known pages and retains unseen older posts', async () => {
+    const pages = [
+        pageOf(card(P3, 'known', 'Hiring a Data Engineer on W2')),
+        pageOf(card(P2, 'also-known', 'Hiring a Data Engineer on W2')),
+        pageOf(card(P1, 'unseen-older', 'Hiring a Junior Data Engineer on W2')),
+        '0:[]\n',
+    ];
+    let calls = 0;
+    const result = await paginate({
+        template: TEMPLATE, cookies: COOKIES, keywords: 'data engineer',
+        seenPostIds: new Set([P3, P2]), maxPages: 10,
+        fetchImpl: async () => okResponse(pages[calls++]), delay: async () => {},
+    });
+    assert.deepEqual(result.posts.map((p) => p.activity_id), [P1]);
+    assert.equal(result.rawPosts.length, 3);
+    assert.equal(calls, 4);
+});
+
+test('page evidence reaches durable sink before a later network failure', async () => {
+    let calls = 0;
+    const archived = [];
+    await assert.rejects(paginate({
+        template: TEMPLATE, cookies: COOKIES, keywords: 'engineer',
+        fetchImpl: async () => {
+            if (calls++) throw new Error('connection lost');
+            return okResponse(pageOf(card(P1, 'recruiter', 'Hiring a Data Engineer on W2')));
+        },
+        onPage: async (page) => archived.push(page), delay: async () => {},
+    }), /connection lost/);
+    assert.equal(archived.length, 1);
+    assert.equal(archived[0].posts[0].activity_id, P1);
+});

@@ -64,6 +64,8 @@ export function registerPanelRoutes(app, deps) {
         recent: deps.recent,
         loginController: deps.loginController,
         quotaStatus: deps.quotaStatus,
+        refreshStatus: deps.refreshStatus,
+        archiveStats: deps.archiveStats,
     });
 
     app.get('/panel', panelAccessGuard, (_req, res) => {

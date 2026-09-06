@@ -41,6 +41,8 @@ function normalizeResult(result) {
             jobs: result.jobs,
             emptyConfirmed: result.emptyConfirmed === true,
             upToDate: result.upToDate === true,
+            searchOutcome: result.searchOutcome,
+            nextRefreshAt: result.nextRefreshAt,
         };
     }
     // Non-array / missing `jobs`, or null/undefined → bad/empty return
@@ -102,7 +104,11 @@ export class BaseScraper {
         this.log.info('Starting scrape', { jobTitle, location, sessionId });
         try {
             const raw = await this.scraperFn(jobTitle, location, sessionId, options);
-            const { jobs, emptyConfirmed, upToDate } = normalizeResult(raw);
+            const { jobs, emptyConfirmed, upToDate, searchOutcome, nextRefreshAt } = normalizeResult(raw);
+            if (searchOutcome === 'deferred' && jobs.length === 0) {
+                this.log.info('Search deferred until due', { nextRefreshAt });
+                return { jobs, emptyConfirmed: false, upToDate: false, searchOutcome, nextRefreshAt };
+            }
             const durationMs = Date.now() - start;
             const jobCount = jobs.length;
 
@@ -179,6 +185,7 @@ export class BaseScraper {
                 jobs,
                 emptyConfirmed: jobCount === 0 && (emptyConfirmed === true || upToDate === true),
                 upToDate: jobCount === 0 && upToDate === true,
+                ...(searchOutcome ? { searchOutcome, nextRefreshAt } : {}),
             };
         } catch (error) {
             const durationMs = Date.now() - start;

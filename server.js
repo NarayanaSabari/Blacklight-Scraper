@@ -1,3 +1,5 @@
+import { getQueryState } from './src/scrapers/linkedin-rsc/query-state.js';
+import { getScrapeArchive } from './src/scrapers/linkedin-rsc/archive.js';
 // Unified Job Scraper API — HTTP entry point.
 //
 // Everything of substance lives under src/:
@@ -18,13 +20,14 @@
 import express from 'express';
 import { getConfig, reloadConfig } from './src/config/env.js';
 import { ensureApiKey } from './src/setup/ensure-api-key.js';
-import { createLogger, attachLokiSink, attachMetricsSink } from './src/logger/index.js';
+import { createLogger, attachLokiSink, attachMetricsSink, attachLocalSink } from './src/logger/index.js';
 import { initializeCredentialsClient, getCredentialsClient } from './src/api/credentials.js';
 import { getLinkedInRscSession } from './src/scrapers/linkedin-rsc/session.js';
 import { QueueOrchestrator } from './src/queue/orchestrator.js';
 import { getMetrics } from './src/metrics/registry.js';
 import { getPusher } from './src/metrics/push.js';
 import { Heartbeat } from './src/metrics/heartbeat.js';
+import { LocalLogSink } from './src/logger/local-log.js';
 import { initializeLokiTransport } from './src/logger/loki-transport.js';
 import { resolveBootInfo } from './src/config/boot-info.js';
 import { exitCodeFor, EXIT_REASONS } from './src/server/exit-codes.js';
@@ -43,6 +46,8 @@ import { getPlatformOverrides } from './src/panel/overrides.js';
 import * as recentSubmissions from './src/panel/recent.js';
 import { searchQuotaStatus } from './src/scrapers/linkedin-rsc/scraper.js';
 
+const localLogs = new LocalLogSink();
+attachLocalSink(localLogs);
 const log = createLogger('server');
 
 function buildOrchestrator(config) {
@@ -85,7 +90,7 @@ function bootTelemetry(config) {
     const heartbeat = new Heartbeat();
     heartbeat.start();
 
-    return { metrics, lokiTransport, pusher, heartbeat };
+    return { metrics, lokiTransport, pusher, heartbeat, localLogs };
 }
 
 async function main() {
@@ -151,6 +156,8 @@ async function main() {
         recent: recentSubmissions,
         loginController,
         quotaStatus: searchQuotaStatus,
+        refreshStatus: () => getQueryState().snapshot(),
+        archiveStats: () => getScrapeArchive().stats(),
         requestRestart: () => shutdownFn?.('panel-restart'),
     });
 
@@ -190,6 +197,7 @@ async function main() {
 
         setTimeout(() => {
             log.warn('Hard-exit budget exhausted; forcing exit', { reason: shutdownReason });
+            telemetry.localLogs.close();
             process.exit(exitCodeFor(shutdownReason));
         }, SHUTDOWN_BUDGET_MS).unref();
 
@@ -216,6 +224,7 @@ async function main() {
 
         server.close(() => {
             log.info('Server closed', { reason: shutdownReason });
+            telemetry.localLogs.close();
             process.exit(exitCodeFor(shutdownReason));
         });
     };
@@ -236,7 +245,11 @@ async function main() {
 }
 
 main().catch((error) => {
-    // eslint-disable-next-line no-console
-    console.error('Fatal startup error:', error);
+    try { log.error('Fatal startup error', { error }); }
+    catch {
+        console.error('Fatal startup error before logger initialization');
+        localLogs.enqueue('error', 'server', 'Fatal startup error before logger initialization');
+    }
+    localLogs.close();
     process.exit(exitCodeFor(EXIT_REASONS.CRASH));
 });

@@ -19,7 +19,8 @@ import { normalizeJobData } from '../../core/normalize.js';
 import { pickSessionQuery, buildBooleanSearchQuery } from '../../core/linkedin-query.js';
 import { paginate as defaultPaginate, countPerRequest } from './client.js';
 import { getLinkedInRscSession } from './session.js';
-import { getHighWaterStore } from './high-water.js';
+import { getScrapeArchive } from './archive.js';
+import { getQueryState } from './query-state.js';
 import { CanaryTracker, runCanary } from './canary.js';
 import { getRequestPacer } from './pacer.js';
 import { fetchForCredential } from './egress.js';
@@ -34,7 +35,7 @@ const defaultCanaryTracker = new CanaryTracker();
 
 // Also one per process, but for the opposite reason: this signal is a property
 // of the PLATFORM, so every credential's result feeds the same counter.
-const defaultQuotaTracker = new SearchQuotaTracker();
+const defaultQuotaTracker = new SearchQuotaTracker({ startupProbe: true });
 
 /** Live search-quota state, for the control panel. Pure read. */
 export function searchQuotaStatus() {
@@ -49,8 +50,8 @@ const log = createLogger('linkedin-rsc');
 // discarding roughly 3.4x the results. Pagination already terminates on its own
 // when a page adds nothing new, so "no cap" is bounded by LinkedIn, not by us.
 //
-// Role sweeps deliberately KEEP the 100 cap. They run ~135 roles/hour and
-// lifting it there multiplies steady-state load for a different purpose.
+// Ordinary role refreshes retain the 100 cap. Periodic reconciliation uses
+// the same bounded full walk as a candidate query to cover reordered results.
 const CANDIDATE_MAX_POSTS = Number.MAX_SAFE_INTEGER;
 
 // Page guard, not a result limit. At the modest page size this is ~20k posts —
@@ -162,7 +163,12 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         count = countPerRequest(),
         datePosted = process.env.LINKEDIN_DATE_POSTED || 'past-24h',
         rng = Math.random,
-        highWater = getHighWaterStore(),
+        highWater = null,
+        scheduledRefresh = false,
+        candidateQueryId = null,
+        queryFeedback = null,
+        archive = paginateImpl === defaultPaginate ? getScrapeArchive() : null,
+        queryState = paginateImpl === defaultPaginate ? getQueryState() : null,
         canaryTracker = defaultCanaryTracker,
         runCanaryImpl = runCanary,
         // Null disables pacing. The default is the process-wide pacer; callers
@@ -176,6 +182,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // LinkedIn, so it must not be able to write a real cooldown marker into
         // the operator's home directory as a side effect of a unit test.
         quotaTracker = defaultQuotaTracker,
+        quotaAdmission = paginateImpl === defaultPaginate,
         quotaCooldown = linkedinCooldown,
         applyQuotaPauseImpl = paginateImpl === defaultPaginate ? applyQuotaPause : () => false,
         metrics = getMetrics(),
@@ -197,23 +204,39 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
     // low because a large page size is the most obvious automation tell in this
     // approach, and the account is worth more than the saved requests.
     const scoped = Boolean(candidateQuery);
-    const effectiveMaxPosts = scoped ? CANDIDATE_MAX_POSTS : maxPosts;
-    const effectiveMaxPages = scoped ? CANDIDATE_MAX_PAGES : undefined;
-    const timeBudgetMs = scoped ? CANDIDATE_TIME_BUDGET_MS : 0;
+    const mode = scoped ? 'candidate' : 'role';
+    const queryKey = JSON.stringify([datePosted, location, candidateQueryId, keywords]);
+    if (scheduledRefresh && queryFeedback) queryState?.applyFeedback(queryKey, queryFeedback);
+    const refresh = scheduledRefresh ? queryState?.plan(queryKey) : null;
+    if (refresh && !refresh.due) {
+        metrics?.recordLinkedInSearch?.(mode, 'deferred', 0, 0, 0);
+        return { jobs: [], emptyConfirmed: false, searchOutcome: 'deferred',
+            nextRefreshAt: new Date(refresh.nextDueAt).toISOString() };
+    }
+    const fullWalk = scoped || refresh?.reconcile;
+    const effectiveMaxPosts = fullWalk ? CANDIDATE_MAX_POSTS : maxPosts;
+    const effectiveMaxPages = fullWalk ? CANDIDATE_MAX_PAGES : undefined;
+    const timeBudgetMs = fullWalk ? CANDIDATE_TIME_BUDGET_MS : 0;
 
-    // Role sweeps only. A candidate query is a recruiter asking for a specific
-    // search and is contracted to run to exhaustion (see CANDIDATE_MAX_POSTS);
-    // silently trimming it to "posts since last time" would make a re-run look
-    // like it lost most of its results. Role sweeps have no such expectation —
-    // they exist to notice new postings, which is exactly what the mark tracks.
-    const sinceActivityId = scoped ? null : highWater?.get?.(keywords, datePosted) ?? null;
+    // Legacy injected callers can still supply a mark. Production scheduled
+    // searches use exact seen IDs; explicit candidate searches always run full.
+    const sinceActivityId = scoped || refresh ? null : highWater?.get?.(keywords, datePosted) ?? null;
 
     log.info('Starting RSC scrape', {
         jobTitle, keywords, datePosted, count,
-        maxPosts: scoped ? 'uncapped' : maxPosts,
+        maxPosts: fullWalk ? 'uncapped' : maxPosts,
         candidateScoped: scoped,
     });
 
+    const admission = quotaAdmission ? quotaTracker.beginSearch() : { allowed: true, recovery: false };
+    if (!admission.allowed) {
+        metrics?.recordLinkedInSearch?.(mode, 'deferred', 0, 0, 0);
+        return { jobs: [], emptyConfirmed: false, searchOutcome: 'deferred',
+            nextRefreshAt: new Date(admission.retryAt).toISOString() };
+    }
+    // A completed probe releases its reservation before the requested query
+    // runs. That query must never cancel a later assignment's reservation.
+    let recoveryPending = admission.recovery;
     return session.withCookies(sessionId, async (cookies, lease) => {
         const requestTemplate = template ?? await session.template();
 
@@ -250,8 +273,42 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // direct egress, unchanged.
         const boundFetch = fetchForCredential(lease?.credential);
 
+        if (admission.recovery) {
+            // A broad, one-page probe avoids using a thin recruiter query as
+            // evidence that search is unavailable. Retain probe results too.
+            let probe;
+            try {
+                probe = await paginateImpl({ template: requestTemplate, cookies,
+                    keywords: 'hiring', datePosted, count, maxPosts: count, maxPages: 1,
+                    timeBudgetMs: 30_000, fetchImpl: boundFetch });
+            } catch (error) {
+                const recovery = quotaTracker.finishRecovery(false);
+                recoveryPending = false;
+                applyQuotaPauseImpl({ cooldown: quotaCooldown, pauseMs: recovery.pauseMs, now: new Date() });
+                metrics?.recordLinkedInQuotaPause?.(recovery.pauseMs);
+                metrics?.recordLinkedInSearch?.('recovery', 'failed', 1, 0, 0);
+                await archive?.save({ sessionId, keywords: 'hiring', location, datePosted,
+                    outcome: 'recovery_failed' });
+                throw error;
+            }
+            const served = probe.posts.length > 0;
+            metrics?.recordLinkedInSearch?.('recovery', served ? 'served' : 'unavailable', probe.pages?.length ?? 0, probe.posts.length, 0);
+            await archive?.save({ sessionId, keywords: 'hiring', location, datePosted,
+                posts: probe.rawPosts ?? probe.posts, pages: probe.pages,
+                outcome: served ? 'recovery_served' : 'recovery_unavailable' });
+            const recovery = quotaTracker.finishRecovery(served);
+            recoveryPending = false;
+            if (!served) {
+                applyQuotaPauseImpl({ cooldown: quotaCooldown, pauseMs: recovery.pauseMs, now: new Date() });
+                metrics?.recordLinkedInQuotaPause?.(recovery.pauseMs);
+                return { jobs: [], emptyConfirmed: false, searchOutcome: 'deferred',
+                    nextRefreshAt: quotaTracker.snapshot().pausedUntil };
+            }
+            await pacer?.pace?.(lease);
+        }
+
         const {
-            posts, emptyConfirmed, upToDate, newestActivityId: newestSeen, pages, budgetExhausted,
+            posts, rawPosts, emptyConfirmed, upToDate, newestActivityId: newestSeen, pages, budgetExhausted, exhausted,
         } = await paginateImpl({
             template: requestTemplate,
             cookies,
@@ -262,7 +319,10 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             ...(effectiveMaxPages ? { maxPages: effectiveMaxPages } : {}),
             timeBudgetMs,
             sinceActivityId,
+            ...(refresh ? { seenPostIds: refresh.seenPostIds, knownPageLimit: refresh.reconcile ? Number.MAX_SAFE_INTEGER : 3 } : {}),
             fetchImpl: boundFetch,
+            onPage: archive ? (page) => archive.save({ sessionId, keywords, location, datePosted,
+                ...page, outcome: 'page', candidateScoped: scoped }) : null,
         });
 
         if (budgetExhausted) {
@@ -270,16 +330,28 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             // 7-minute budget. If it does, the result is incomplete AND the
             // scrape is approaching the backend's 600s orphan window, which
             // would let a second scraper claim the same platform.
-            log.error('Candidate query hit its time budget — result is incomplete', {
+            log.error('Full search hit its time budget; result is incomplete', {
                 keywords,
                 posts: posts.length,
                 requests: pages?.length ?? 0,
                 budgetMs: CANDIDATE_TIME_BUDGET_MS,
-                scraper_alert: 'candidate_query_time_budget',
+                scraper_alert: scoped ? 'candidate_query_time_budget' : 'role_reconciliation_time_budget',
             });
         }
 
         const jobs = posts.map((post) => postToJob(post, location));
+        const observedPosts = rawPosts ?? posts;
+        const newPostCount = refresh
+            ? observedPosts.filter((post) => !refresh.knownPostIds.has(post.activity_id || post.post_url)).length
+            : posts.length;
+        const searchOutcome = jobs.length ? 'served' : upToDate ? 'up_to_date' : emptyConfirmed ? 'empty' : 'unavailable';
+        metrics?.recordLinkedInSearch?.(mode, searchOutcome, pages?.length ?? 0, observedPosts.length, newPostCount);
+        await archive?.save({ sessionId, keywords, location, datePosted, posts: observedPosts,
+            jobs, pages, outcome: searchOutcome, candidateScoped: scoped, budgetExhausted });
+        const nextRefresh = refresh ? queryState.record(queryKey, {
+            posts: observedPosts, newPosts: newPostCount, requests: pages?.length ?? 0,
+            reconciled: refresh.reconcile && exhausted === true && !budgetExhausted,
+        }) : null;
 
         // Advance only after the walk succeeded — a throw skips this and the
         // next run re-covers the same ground, which is the safe direction.
@@ -355,6 +427,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // every refusing hour, with no overlap.
         const searchServed = jobs.length > 0 || upToDate;
         if (searchServed) {
+            session.noteSearchServed?.(lease);
             quotaTracker.recordServed();
         } else if (sessionAlive === false) {
             // A DEAD SESSION IS NOT A QUOTA WINDOW.
@@ -426,8 +499,8 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // the question being asked.
         let canaryVerdict = null;
         if (searchServed || refusedRepeat) {
-            canaryTracker.recordHealthy(lease);
-        } else if (canaryTracker.recordEmpty(lease)) {
+            canaryTracker?.recordHealthy(lease);
+        } else if (canaryTracker?.recordEmpty(lease)) {
             canaryVerdict = await runCanaryImpl({
                 tracker: canaryTracker,
                 lease,
@@ -482,6 +555,9 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             }
         }
 
-        return { jobs, emptyConfirmed, upToDate: Boolean(upToDate) };
+        return { jobs, emptyConfirmed, upToDate: Boolean(upToDate), searchOutcome,
+            nextRefreshAt: nextRefresh ? new Date(nextRefresh.nextDueAt).toISOString() : null };
+    }).finally(() => {
+        if (recoveryPending) quotaTracker.cancelRecovery();
     });
 }

@@ -218,6 +218,23 @@ class MetricsRegistry {
             registers: reg,
         });
 
+        this.linkedinSearchOutcomes = new Counter({
+            name: 'scraper_linkedin_search_outcomes_total', help: 'LinkedIn searches and deferred refreshes by explicit outcome.',
+            labelNames: ['mode', 'outcome'], registers: reg,
+        });
+        this.linkedinSearchRequests = new Counter({
+            name: 'scraper_linkedin_search_requests_total', help: 'LinkedIn pagination requests, including recovery probes.',
+            labelNames: ['mode'], registers: reg,
+        });
+        this.linkedinSearchRawPosts = new Counter({
+            name: 'scraper_linkedin_search_raw_posts_total', help: 'LinkedIn posts observed before incremental filtering.',
+            labelNames: ['mode'], registers: reg,
+        });
+        this.linkedinSearchNewPosts = new Counter({
+            name: 'scraper_linkedin_search_new_posts_total', help: 'LinkedIn posts forwarded after incremental filtering; not backend imports.',
+            labelNames: ['mode'], registers: reg,
+        });
+
         // LinkedIn search quota -------------------------------------------
         // LinkedIn meters content search separately from the rest of the site
         // and stops serving it past some volume, platform-wide, while the
@@ -402,6 +419,15 @@ class MetricsRegistry {
     }
 
     /** Search refused platform-wide; scraping backed off for `pauseMs`. */
+    recordLinkedInSearch(mode, outcome, requests, rawPosts, newPosts) {
+        this.#safe(() => {
+            this.linkedinSearchOutcomes.labels(mode, outcome).inc();
+            this.linkedinSearchRequests.labels(mode).inc(requests);
+            this.linkedinSearchRawPosts.labels(mode).inc(rawPosts);
+            this.linkedinSearchNewPosts.labels(mode).inc(newPosts);
+        });
+    }
+
     recordLinkedInQuotaPause(pauseMs) {
         this.#safe(() => this.linkedinQuotaPausesTotal.inc());
         if (!Number.isFinite(pauseMs)) return;

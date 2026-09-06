@@ -111,6 +111,7 @@ export async function spoolUndeliverableSubmission(payload) {
         errorMessage: payload.errorMessage ?? null,
         deliveryError: payload.deliveryError,
         jobs: payload.jobs,
+        requestBody: payload.requestBody,
     };
 
     try {

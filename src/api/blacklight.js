@@ -2,6 +2,8 @@
 // All Blacklight-specific HTTP contracts live here; the orchestrator only
 // sees domain-level methods (checkActiveSession, getNextRole, ...).
 
+import path from 'node:path';
+import { writeArchiveRecord } from '../core/record-archive.js';
 import { requestWithRetry } from '../http/client.js';
 import { NetworkError } from '../core/errors.js';
 import { getMetrics } from '../metrics/registry.js';
@@ -57,16 +59,8 @@ export class BlacklightApiClient {
             return response.json();
         }
 
-        // 4xx non-retryable: surface a structured error.
-        //
-        // SCR-26 (#409): there was a 409 special-case here claiming "Scraper
-        // already has an active session". None of this client's five endpoints
-        // can return 409 — the queue blueprint has no 409 at all, and the one
-        // credentials endpoint reached from here (queue/availability) only ever
-        // answers 200. Worse, the message described a single-active-session
-        // model that no longer holds (see #389), so the one thing the branch
-        // could do was misreport. An unexpected 409 now gets the accurate
-        // generic message below, which names the method, path and status.
+        // Preserve HTTP status, including 409 for a conflicting receipt retry.
+        // These failures must not be misreported as an active-session conflict.
         throw new NetworkError(
             `Blacklight ${method} ${path} → ${response.status} ${response.statusText}`,
             { statusCode: response.status },
@@ -137,9 +131,17 @@ export class BlacklightApiClient {
         // it means anything. Omitted otherwise so the field's presence itself
         // signals "this is the empty-result case", and so older backends that
         // don't know the field are unaffected on the normal path.
+        if (meta.searchOutcome) body.search_outcome = meta.searchOutcome;
+        if (meta.nextRefreshAt) body.next_refresh_at = meta.nextRefreshAt;
         if (status === 'success' && jobs.length === 0 && typeof meta.emptyConfirmed === 'boolean') {
             body.empty_confirmed = meta.emptyConfirmed;
         }
+        // Preserve the exact body on this host before the backend accepts a
+        // temporary processing copy. No API headers or credentials are archived.
+        await writeArchiveRecord(
+            process.env.SCRAPER_SUBMISSION_ARCHIVE_DIR || path.join('results', 'submission-archive'),
+            { version: 1, archivedAt: new Date().toISOString(), sessionId, platform, requestBody: body },
+        );
         // SCR-15: submit is exempt from the circuit breaker entirely.
         // Jobs are already scraped by this point — blocking the call on an
         // open circuit (opened by, say, a credentials-API outage) would
@@ -152,6 +154,7 @@ export class BlacklightApiClient {
             await spoolUndeliverableSubmission({
                 sessionId, platform, jobs, status, errorMessage,
                 deliveryError: error.message,
+                requestBody: body,
             });
             this.#recordSubmissionForPanel(sessionId, platform, jobs, 'failed', meta, error.message);
             throw error;
@@ -165,6 +168,8 @@ export class BlacklightApiClient {
         try {
             let outcome = 'accepted';
             if (status === 'failed') outcome = 'failed';
+            else if (meta?.searchOutcome === 'deferred') outcome = 'deferred';
+            else if (meta?.searchOutcome === 'up_to_date') outcome = 'up_to_date';
             else if (jobs.length === 0 && meta?.emptyConfirmed === true) outcome = 'empty_confirmed';
             recordSubmission({
                 platform,

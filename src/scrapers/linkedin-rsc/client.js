@@ -124,13 +124,13 @@ export function buildHeaders(template, cookies, params) {
  * it surfaces as AuthError (cool the credential, rotate). A 429 is the platform
  * pushing back, so it surfaces as BlockedError.
  */
-export async function fetchPage({ template, cookies, params, fetchImpl = fetch }) {
+export async function fetchPage({ template, cookies, params, fetchImpl = fetch, timeoutMs = 30_000 }) {
     const headers = buildHeaders(template, cookies, params);
     const body = buildPaginationBody(template, params);
 
     let response;
     try {
-        response = await fetchImpl(template.url, { method: 'POST', headers, body });
+        response = await fetchImpl(template.url, { method: 'POST', headers, body, signal: AbortSignal.timeout(Math.max(1, Math.ceil(timeoutMs))) });
     } catch (cause) {
         throw new NetworkError(`LinkedIn RSC request failed: ${cause?.message ?? cause}`, {
             platform: 'linkedin', cause,
@@ -153,7 +153,13 @@ export async function fetchPage({ template, cookies, params, fetchImpl = fetch }
             platform: 'linkedin', statusCode: response.status,
         });
     }
-    return response.text();
+    try {
+        return await response.text();
+    } catch (cause) {
+        throw new NetworkError(`LinkedIn RSC response deadline or body failure: ${cause?.message ?? cause}`, {
+            platform: 'linkedin', cause,
+        });
+    }
 }
 
 // Jittered pause between requests. Uniform back-to-back requests are a
@@ -186,16 +192,22 @@ export async function paginate({
     // nothing above it ends the walk. Null disables the behaviour entirely,
     // which is the first-run and candidate-query case.
     sinceActivityId = null,
+    seenPostIds = null,
+    knownPageLimit = 3,
+    onPage = null,
     fetchImpl = fetch,
     delay = defaultDelay,
     rng = Math.random,
     now = () => Date.now(),
 }) {
     const posts = [];
+    const rawPosts = [];
+    let consecutiveKnownPages = 0;
     const seen = new Set();
     const pages = [];
     let sawNoResultsSignal = false;
     let budgetExhausted = false;
+    let exhausted = false;
     // Distinguishes "LinkedIn had results, we already had all of them" from
     // "LinkedIn had nothing". Both yield zero posts; only the latter is an
     // empty result set, and neither is a block.
@@ -214,6 +226,8 @@ export async function paginate({
             break;
         }
         if (page > 0) await delay(nextPause(rng));
+        const remainingMs = timeBudgetMs > 0 ? timeBudgetMs - (now() - runStartedAt) : 30_000;
+        if (remainingMs <= 0) { budgetExhausted = true; break; }
 
         const startedAt = Date.now();
         const body = await fetchPage({
@@ -221,20 +235,28 @@ export async function paginate({
             cookies,
             params: { keywords, datePosted, startIndex: page * count, count },
             fetchImpl,
+            timeoutMs: Math.min(30_000, remainingMs),
         });
 
         if (isConfirmedEmpty(body)) sawNoResultsSignal = true;
 
+        const pagePosts = [...extractPosts(body)];
+        await onPage?.({ posts: pagePosts, pages: [{ page: page + 1, bytes: body.length }] });
         let added = 0;
         // Counts posts this page returned at all, new or not. A page that
         // returned rows but added nothing NEW is the stop condition; a page
         // that returned no rows at all is ordinary exhaustion.
         let pageRows = 0;
-        for (const post of extractPosts(body)) {
+        for (const post of pagePosts) {
             pageRows++;
             const key = post.activity_id || post.post_url;
             if (seen.has(key)) continue;
             seen.add(key);
+            rawPosts.push(post);
+            if (seenPostIds?.has(key)) {
+                sawKnownPost = true;
+                continue;
+            }
             if (post.activity_id) newestSeen = newestActivityId([newestSeen, post.activity_id]);
             // Known ground. Skip rather than break: LinkedIn orders content
             // search by relevance as well as recency, so a single old post can
@@ -261,14 +283,25 @@ export async function paginate({
         // result set is exhausted. With a mark set, a page that returned rows
         // but nothing above the mark means we have reached known ground — the
         // whole point of the mark, and where the request saving comes from.
+        if (seenPostIds && pageRows > 0) {
+            consecutiveKnownPages = added === 0 ? consecutiveKnownPages + 1 : 0;
+            if (consecutiveKnownPages < knownPageLimit) continue;
+        }
         if (added === 0) {
             if (sinceActivityId && pageRows > 0) reachedKnownGround = true;
+            // A cap or known-page overlap is only partial coverage. An empty
+            // terminal page, or the ordinary full walk's repeated window,
+            // establishes exhaustion; an unexplained first empty page does not.
+            exhausted = pageRows === 0
+                ? sawNoResultsSignal || posts.length > 0 || sawKnownPost
+                : !seenPostIds && !sinceActivityId;
             break;
         }
     }
 
     return {
         posts,
+        rawPosts,
         // Only a positive LinkedIn signal counts as confirmed-empty. An empty
         // result with no signal is the silent-block signature and must stay
         // unconfirmed so it surfaces as a failure rather than a clean zero.
@@ -285,5 +318,6 @@ export async function paginate({
         // out. The caller alerts on this: it should never happen in practice,
         // and if it does the result is silently incomplete.
         budgetExhausted,
+        exhausted,
     };
 }

@@ -27,6 +27,7 @@ export const scrapeRequestSchema = z.object({
     platform: platformField,
     jobTitle: z.string().min(1).max(200),
     location: z.string().min(1).max(200),
+    candidateQuery: z.string().min(1).max(200).optional(),
 });
 
 export function parseScrapeRequest(body) {

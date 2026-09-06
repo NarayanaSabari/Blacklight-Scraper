@@ -571,3 +571,15 @@ test('shutdown: drops the cached jar (there is no browser to close)', async () =
     await session.shutdown();
     assert.equal(session.isAlive(), false);
 });
+
+test('authentication status distinguishes unknown cookie cache from observed auth failure', async () => {
+    const { session } = makeSession();
+    assert.equal(session.authenticationStatus().failedProfiles, 0);
+    const lease = fakeLease();
+    await assert.rejects(session.withCookies('s', async () => {
+        throw new AuthError('login rejected', { platform: 'linkedin' });
+    }), AuthError);
+    assert.equal(session.authenticationStatus().failedProfiles, 1);
+    session.noteSearchServed(lease);
+    assert.equal(session.authenticationStatus().failedProfiles, 0);
+});

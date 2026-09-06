@@ -128,6 +128,7 @@ export class SearchQuotaTracker {
         escalationFactor = DEFAULT_ESCALATION_FACTOR,
         escalationDecayMs = DEFAULT_ESCALATION_DECAY_MS,
         now = () => Date.now(),
+        startupProbe = false,
     } = {}) {
         this._threshold = threshold;
         this._basePause = basePause;
@@ -146,7 +147,43 @@ export class SearchQuotaTracker {
         // module, and coupling two components to agree on that timing is how
         // they end up disagreeing.
         this._pausedUntil = null;
+        this._recoveryInFlight = false;
+        // The shared cooldown marker survives restart but quota trip history
+        // does not. Production starts conservatively: serialize three served
+        // probes before admitting the ordinary queue, including after restart.
+        this._probationRemaining = startupProbe ? 3 : 0;
     }
+
+    // Admission is synchronous so two assignments cannot reserve the same
+    // recovery slot across an await. Ordinary search pacing remains unchanged.
+    beginSearch() {
+        const now = this._now();
+        if (this._pausedUntil !== null && now < this._pausedUntil) {
+            return { allowed: false, retryAt: this._pausedUntil };
+        }
+        const recovery = this._pausedUntil !== null || this._probationRemaining > 0;
+        if (recovery && this._recoveryInFlight) return { allowed: false, retryAt: now + 60_000 };
+        if (recovery) this._recoveryInFlight = true;
+        return { allowed: true, recovery };
+    }
+
+    finishRecovery(served) {
+        this._recoveryInFlight = false;
+        if (!served) {
+            this._pausedUntil = null;
+            this._probationRemaining = 0;
+            this._consecutiveEmpty = this._threshold - 1;
+            return this.recordEmpty();
+        }
+        this._pausedUntil = null;
+        this._consecutiveEmpty = 0;
+        this._lastServedAt = this._now();
+        this._probationRemaining = (this._probationRemaining || 3) - 1;
+        if (this._probationRemaining === 0) this._consecutiveTrips = 0;
+        return { tripped: false, pauseMs: 0 };
+    }
+
+    cancelRecovery() { this._recoveryInFlight = false; }
 
     /**
      * A scrape that produced posts, or positively reached known ground.
@@ -175,6 +212,7 @@ export class SearchQuotaTracker {
      * unbounded — a healthy host pinned at the ceiling indefinitely.
      */
     recordServed() {
+        if (this._probationRemaining > 0 || this._recoveryInFlight) return;
         this._consecutiveEmpty = 0;
         const now = this._now();
         this._lastServedAt = now;
@@ -240,6 +278,8 @@ export class SearchQuotaTracker {
         const now = this._now();
         const pausedNow = this._pausedUntil !== null && now < this._pausedUntil;
         return {
+            recoveryInFlight: this._recoveryInFlight,
+            probationRemaining: this._probationRemaining,
             consecutiveEmpty: this._consecutiveEmpty,
             consecutiveTrips: this._consecutiveTrips,
             threshold: this._threshold,

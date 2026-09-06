@@ -21,3 +21,8 @@ chrome-debug-profile/
 # package-lock.json is COMMITTED: every script and doc uses npm, so the
 # lockfile has to be in git for reproducible installs. A pnpm-lock.yaml
 # used to live here instead, which made the documented `npm ci` impossible.
+
+# Host-local scrape coverage and refresh state
+config/linkedin-query-state.json
+config/linkedin-query-state.json.*.tmp
+config/linkedin-highwater.json

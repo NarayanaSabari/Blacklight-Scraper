@@ -103,6 +103,8 @@ export function registerScrapeRoute(app, deps = {}) {
             try {
                 const jobs = await scraper.execute(jobTitle, location, null, {
                     searchQueries: adhocSearchQueries,
+                    candidateQuery: platformName === 'linkedin' ? params.candidateQuery : null,
+                    scheduledRefresh: false,
                 });
                 payload = { success: true, count: jobs.length, jobs };
             } catch (error) {

@@ -131,3 +131,20 @@ test('POST /scrape: a per-platform save failure does not fail the response', asy
     assert.equal(body.summary.savedFiles.length, 0);
     assert.equal(body.results.platforms.dice.success, true);
 });
+
+test('manual LinkedIn candidate query is an explicit full search', async () => {
+    let options;
+    const app = inject({ getScraper: () => ({ execute: async (_title, _location, _session, opts) => {
+        options = opts; return [];
+    } }), saveResultsToDisk: () => false });
+    const result = await post(app, '/scrape', { platform: 'linkedin', jobTitle: 'Engineer', location: 'US', candidateQuery: '"Java" AND W2' });
+    assert.equal(result.status, 200);
+    assert.equal(options.candidateQuery, '"Java" AND W2');
+    assert.equal(options.scheduledRefresh, false);
+});
+
+test('manual query validation rejects non-text query before executing', async () => {
+    const app = inject({ getScraper: () => { throw new Error('must not execute'); } });
+    const result = await post(app, '/scrape', { platform: 'linkedin', jobTitle: 'Engineer', location: 'US', candidateQuery: { bad: true } });
+    assert.equal(result.status, 400);
+});

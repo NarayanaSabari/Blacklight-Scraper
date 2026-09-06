@@ -113,34 +113,22 @@ export async function buildStatus(deps) {
     const login = loginController ? loginController.status() : {
         state: 'idle', profileKey: null, profileDir: null, startedAt: null, lastVerdict: null, lastError: null,
     };
-    // `sessionAlive` is a CACHE reading, not an auth check. It reports whether a
-    // cookie jar was read within the last 30 minutes (LINKEDIN_RSC_COOKIE_TTL_MIN),
-    // and only a scrape refreshes it. So any window where LinkedIn is not being
-    // scraped ages the cache out and reports a perfectly healthy account as dead.
-    //
-    // A quota pause is exactly such a window, and it is up to 4 hours against a
-    // 30-minute TTL, so this false alarm is guaranteed rather than unlucky.
-    // Observed 2026-08-24: `sessionAlive: false` and "needs re-login" showing as
-    // an ERROR while scripts/linkedin-search-scope.js proved the account was
-    // logged in and serving — 11 profiles on `all` search, with only the content
-    // vertical blocked. The host had scraped 25,209 LinkedIn posts that run.
-    //
-    // Suppressing the alarm during a cooldown is the honest reading: we have no
-    // fresh evidence either way, and "no evidence" must not be presented as
-    // "confirmed dead" — that is the same mistake the template check made
-    // (see template-health.js `liveUnknown`). A genuinely dead session still
-    // surfaces the moment the cooldown lifts and the next scrape fails to
-    // establish cookies.
-    const linkedinCooled = Boolean(cooldowns?.linkedin?.onCooldown);
+    // A cookie-cache TTL expiring is not an authentication verdict. Only a
+    // credential-specific AuthError warrants a login alert, whether the host
+    // is cooled down or simply waiting for a scheduled refresh.
+    const authentication = linkedInSession?.authenticationStatus?.() ?? { cookieCacheFresh: sessionAlive, failedProfiles: 0 };
     const linkedin = {
         sessionAlive,
         profileDir,
         profileDirExists,
-        needsRelogin: profileDirExists && !sessionAlive && !linkedinCooled,
+        authentication,
+        needsRelogin: authentication.failedProfiles > 0,
         // True when we simply cannot tell: the cookie cache has aged out only
         // because nothing has been allowed to scrape. Distinct from a confirmed
         // dead session, and rendered differently.
-        sessionUnknown: profileDirExists && !sessionAlive && linkedinCooled,
+        sessionUnknown: profileDirExists && !sessionAlive && authentication.failedProfiles === 0,
+        refresh: deps.refreshStatus?.() ?? null,
+        archive: deps.archiveStats ? await deps.archiveStats() : null,
         login,
         // Request-template freshness. Surfaced because the failure it describes
         // is otherwise invisible AND actively misleading: a stale template makes
@@ -168,15 +156,13 @@ export async function buildStatus(deps) {
 
     const alerts = [];
     if (linkedin.needsRelogin) {
-        alerts.push({ level: 'error', message: 'LinkedIn needs re-login — profile exists but the session is not alive.' });
+        alerts.push({ level: 'error', message: 'LinkedIn reported an authentication failure for a credential; check whether it needs re-login.' });
     }
     if (linkedin.sessionUnknown) {
         alerts.push({
             level: 'info',
-            message: 'LinkedIn session state is unknown while the platform is cooled down — the cookie '
-                + 'cache ages out when nothing is scraping. This is NOT a re-login signal; it resolves '
-                + 'itself on the first scrape after the cooldown lifts. To check the account now: '
-                + 'node scripts/linkedin-search-scope.js',
+            message: 'LinkedIn authentication is unknown because the cookie cache is idle. '
+                + 'This is NOT a re-login signal. The next due search refreshes the cache.',
         });
     }
     // Ranked above the delivery alerts on purpose: when this one is firing, the
@@ -220,9 +206,9 @@ export async function buildStatus(deps) {
     if (quotaStatus?.paused) {
         alerts.push({
             level: 'warn',
-            message: `LinkedIn search quota hit — backed off until ${quotaStatus.pausedUntil ?? '?'} `
-                + `(${quotaStatus.consecutiveTrips ?? 1} consecutive). The accounts are fine; `
-                + 'LinkedIn is metering search. Repeated trips mean the sweep cadence is still too high.',
+            message: `LinkedIn search quota suspected; backed off until ${quotaStatus.pausedUntil ?? '?'} `
+                + `(${quotaStatus.consecutiveTrips ?? 1} consecutive). A bounded recovery probe runs next; `
+                + 'empty search results alone do not prove account health.',
         });
     }
     // Two DIFFERENT conditions, deliberately not merged into "spool is non-empty".

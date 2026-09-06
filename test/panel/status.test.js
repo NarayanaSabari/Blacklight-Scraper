@@ -36,10 +36,10 @@ test('buildStatus: clean state produces no alerts', async () => {
     assert.equal(status.linkedin.needsRelogin, false);
 });
 
-test('buildStatus: needsRelogin fires when the profile exists but the session is dead', async () => {
+test('buildStatus: needsRelogin fires for an observed authentication failure', async () => {
     const status = await buildStatus(baseDeps({
         bootInfo: { ...BOOT_INFO, profileDir: import.meta.filename }, // a real file — existsSync() true
-        getLinkedInSession: () => ({ isAlive: () => false, lease: null }),
+        getLinkedInSession: () => ({ isAlive: () => false, lease: null, authenticationStatus: () => ({ failedProfiles: 1 }) }),
     }));
     assert.equal(status.linkedin.profileDirExists, true);
     assert.equal(status.linkedin.needsRelogin, true);
@@ -168,7 +168,7 @@ test('buildStatus: a search-quota pause warns, and blames the platform not the a
     const alert = status.alerts.find((a) => /search quota/i.test(a.message));
     assert.ok(alert, 'a quota pause must be visible');
     assert.equal(alert.level, 'warn', 'this is the system working, not a fault');
-    assert.match(alert.message, /accounts are fine/, 'must redirect away from the credentials');
+    assert.match(alert.message, /do not prove account health/, 'must not turn a quota heuristic into an authentication verdict');
     assert.match(alert.message, /2026-08-19T06:00:00.000Z/, 'says when it lifts');
     assert.equal(status.linkedin.searchQuota.consecutiveTrips, 2);
 });
@@ -291,18 +291,26 @@ describe('LinkedIn session state during a platform cooldown', () => {
         );
     });
 
-    it('DOES claim a re-login is needed when nothing is blocking a scrape', async () => {
-        // The real signal must survive. With no cooldown, an aged-out cache
-        // means scrapes are running and failing to establish cookies.
+    it('idle cookie cache alone never proves re-login is needed', async () => {
+        // A scheduled refresh can legitimately leave the cookie cache idle.
         const status = await buildStatus({
             ...base,
             cooldownSnapshot: () => ({ linkedin: { onCooldown: false, until: null } }),
         });
 
-        assert.equal(status.linkedin.needsRelogin, true);
-        assert.equal(status.linkedin.sessionUnknown, false);
+        assert.equal(status.linkedin.needsRelogin, false);
+        assert.equal(status.linkedin.sessionUnknown, true);
         assert.equal(
-            status.alerts.filter((a) => a.level === 'error' && /re-login/.test(a.message)).length, 1,
+            status.alerts.filter((a) => a.level === 'error' && /re-login/.test(a.message)).length, 0,
         );
     });
+});
+
+test('panel reports refresh yield and archive storage without raw post bodies', async () => {
+    const status = await buildStatus(baseDeps({
+        refreshStatus: () => ({ queries: 3, requests: 5, newPosts: 2 }),
+        archiveStats: async () => ({ count: 10, bytes: 9000 }),
+    }));
+    assert.equal(status.linkedin.refresh.requests, 5);
+    assert.equal(status.linkedin.archive.count, 10);
 });

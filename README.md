@@ -121,6 +121,15 @@ file. The scraper pulls them on demand via the `scraperCredentials` API config
 above. LinkedIn's authenticated session itself lives in the host's persistent
 profile, configured with `npm run linkedin:login`.
 
+## Local scraping history
+
+LinkedIn page and completed-result archives are retained in `results/linkedin-archive/`.
+Exact API request bodies for every platform are saved in `results/submission-archive/` before delivery.
+Structured runtime logs are appended to daily UTC files in `results/logs/YYYY-MM-DD.jsonl` at the configured log level, with credential metadata masked.
+These local archives and logs have no automatic deletion.
+Use `LINKEDIN_ARCHIVE_DIR`, `SCRAPER_SUBMISSION_ARCHIVE_DIR` or `SCRAPER_LOG_DIR` to choose another persistent local disk, and preserve these directories during updates.
+See [M1 retention and SSH analysis](../docs/analysis/linkedin-reliability-rollout.md#ssh-analysis) for commands and storage monitoring.
+
 ## After updating
 
 Node does NOT hot-reload imported source files. After `git pull` you

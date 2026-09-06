@@ -66,9 +66,13 @@ function format(level, scope, message, meta) {
 // Optional side-sinks — wired up lazily at runtime so this module has zero
 // import cycles with src/metrics/* or src/logger/loki-transport.js.
 // Both sinks MUST be exception-safe; logging must never crash the caller.
+let localSink = null;
 let lokiSink = null;
 let metricsSink = null;
 
+export function attachLocalSink(transport) {
+    localSink = transport;
+}
 export function attachLokiSink(transport) {
     lokiSink = transport;
 }
@@ -85,6 +89,10 @@ function write(level, scope, message, meta) {
 
     // Fan out to side sinks. Each sink is guarded so a failure in one
     // doesn't take down the logger (and therefore the whole scraper).
+    if (localSink) {
+        try { localSink.enqueue(level, scope || 'root', line); }
+        catch { /* swallow - sink is best-effort */ }
+    }
     if (lokiSink) {
         try { lokiSink.enqueue(level, scope || 'root', line); }
         catch { /* swallow — sink is best-effort */ }

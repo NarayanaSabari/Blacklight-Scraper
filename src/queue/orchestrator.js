@@ -509,18 +509,23 @@ export class QueueOrchestrator {
                 // candidate and, when present, is the exact string to search —
                 // it wins over the role's random variant pick. LinkedIn-only,
                 // because it is the only platform that takes a free-text query.
-                const { jobs, emptyConfirmed } = await scraper.executeWithMeta(
+                const { jobs, emptyConfirmed, searchOutcome, nextRefreshAt } = await scraper.executeWithMeta(
                     role.name, location, sessionId, {
                         searchQueries: role.search_queries || null,
                         candidateQuery: assignment.candidate_query?.query || null,
+                        candidateQueryId: assignment.candidate_query?.id || null,
+                        queryFeedback: assignment.candidate_query || null,
+                        scheduledRefresh: true,
                     },
                 );
                 const formatted = jobs.map((job) => formatJobForBlacklight(job, platformName));
                 const submitResponse = await this.client.submitJobs(
-                    sessionId, platformName, formatted, 'success', null, { emptyConfirmed },
+                    sessionId, platformName, formatted, 'success', null, { emptyConfirmed, searchOutcome, nextRefreshAt },
                 );
 
-                if (formatted.length === 0) {
+                if (searchOutcome === 'deferred') {
+                    log.info('Search refresh deferred', { platform: platformName, nextRefreshAt });
+                } else if (formatted.length === 0) {
                     // SCR-20 (#403): the wire status stays 'success', but it now
                     // carries `empty_confirmed` so the backend can tell a
                     // positively-verified empty result from the silent-block
