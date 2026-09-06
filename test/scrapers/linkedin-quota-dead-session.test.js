@@ -1,29 +1,4 @@
-// Regression: a DEAD SESSION must never be read as a platform search quota.
-//
-// PRODUCTION INCIDENT (2026-08-19/20, m1)
-//   08-19 11:09  sessionAlive false, lastServedAt null, 26 empties, 3 trips
-//                — all within 3.4h of boot, i.e. the host had NEVER worked
-//   08-20 10:21  9 trips, pinned at the 4h ceiling, 8.6h since a real scrape
-//
-//   The session was simply not logged in. An unauthenticated session answers
-//   every query with a confirmed empty, which is byte-identical on the wire to
-//   LinkedIn metering content search, so the quota tracker convicted the
-//   platform for the host's own broken login. A pause cannot fix a dead
-//   session, so every expiry re-tripped and doubled. The quota pause also
-//   overwrote the auth cooldown marker, taking the "run npm run linkedin:login"
-//   instruction with it.
-//
-// THE TWO INVARIANTS, which must hold AT ONCE:
-//   dead session + empties                     -> NEVER trips
-//   live session + real block + never served   -> STILL trips
-//
-// The second is not hypothetical. On 2026-08-20 11:12 the host was freshly
-// restarted (lastServedAt null, no success yet this process) while LinkedIn was
-// genuinely refusing every content query — confirmed independently by
-// scripts/linkedin-search-scope.js, which saw 12 profiles on `all` search and
-// zero on every content search. A gate that required a prior success would
-// never back off in exactly that situation, which is the opposite failure.
-
+// Cached cookies or missing health capabilities cannot establish a quota restriction.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { scrapeLinkedInRsc } from '../../src/scrapers/linkedin-rsc/scraper.js';
@@ -84,20 +59,20 @@ test('a dead session never trips the platform quota, however long the streak', a
     assert.equal(snap.paused, false);
 });
 
-test('a LIVE session still trips on a real block, even with no prior success', async () => {
-    // The 2026-08-20 11:12 state: freshly restarted, never served, real block.
+test('cached cookies alone cannot confirm a search restriction', async () => {
+    // Freshly loaded cookies have not established live authentication.
     const tracker = new SearchQuotaTracker();
     assert.equal(tracker.snapshot().lastServedAt, null, 'precondition: never served');
 
     const pauses = await run(fakeSession({ alive: true }), tracker, 25);
 
-    assert.equal(pauses, 1, 'a genuine platform block must still back off');
-    assert.equal(tracker.snapshot().paused, true);
+    assert.equal(pauses, 0, 'cached cookies are not live authentication evidence');
+    assert.equal(tracker.snapshot().paused, false);
 });
 
-test('a session that cannot report liveness keeps the previous behaviour', async () => {
-    // No opinion must not silently disable quota detection.
+test('unknown session health cannot trigger a platform pause', async () => {
+    // Unknown health requires diagnosis, not a quota verdict.
     const tracker = new SearchQuotaTracker();
     const pauses = await run(capabilityLessSession(), tracker, 25);
-    assert.equal(pauses, 1);
+    assert.equal(pauses, 0);
 });

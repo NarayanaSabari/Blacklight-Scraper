@@ -10,10 +10,10 @@ export class ScrapeArchive {
         this._statsAt = 0;
     }
 
-    async save({ sessionId, keywords, location, datePosted, posts = [], jobs = [], pages = [], outcome, candidateScoped, budgetExhausted }) {
+    async save({ sessionId, keywords, location, datePosted, posts = [], jobs = [], pages = [], outcome, candidateScoped, budgetExhausted, diagnostic }) {
         return writeArchiveRecord(this.directory, {
             version: 1, archivedAt: new Date().toISOString(), sessionId,
-            keywords, location, datePosted, posts, jobs, pages, outcome,
+            keywords, location, datePosted, posts, jobs, pages, outcome, diagnostic,
             candidateScoped: Boolean(candidateScoped), budgetExhausted: Boolean(budgetExhausted),
         });
     }

@@ -314,3 +314,14 @@ test('panel reports refresh yield and archive storage without raw post bodies', 
     assert.equal(status.linkedin.refresh.requests, 5);
     assert.equal(status.linkedin.archive.count, 10);
 });
+
+test('buildStatus: account cooldown identifies the affected account and retry time', async () => {
+    const status = await buildStatus(baseDeps({ quotaStatus: () => ({ scope: 'account', accounts: {
+        'id:15': { paused: true, pausedUntil: '2026-09-06T11:00:00.000Z', lastOutcome: 'empty' },
+        'id:17': { paused: false, diagnosticDue: false },
+    } }) }));
+    const alert = status.alerts.find((a) => /id:15/.test(a.message));
+    assert.ok(alert);
+    assert.match(alert.message, /2026-09-06T11:00:00.000Z/);
+    assert.ok(!status.alerts.some((a) => /id:17/.test(a.message)));
+});

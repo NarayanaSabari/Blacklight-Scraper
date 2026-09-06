@@ -322,14 +322,7 @@ test('a lease with no reportSuccess at all is tolerated', async () => {
     assert.deepEqual(result.jobs, []);
 });
 
-// ─── platform-wide search quota ─────────────────────────────────────────
-
-// The quota back-off and the ban canary read the SAME observation and must
-// reach OPPOSITE conclusions from it. A confirmed-empty on a marked query means
-// "this account is fine" (no ban) but also "search returned nothing" (feeds the
-// quota streak). Getting that backwards is not theoretical: the first version
-// of the quota feature shipped to production reusing the canary's health test,
-// and was completely inert as a result.
+// Marked empties request a diagnostic but never directly pause the platform.
 test('a marked-query refusal feeds the quota streak while still NOT banning the account', async () => {
     const body = await noResultsBody();
     const { SearchQuotaTracker } = await import('../../src/scrapers/linkedin-rsc/search-quota.js');
@@ -363,10 +356,10 @@ test('a marked-query refusal feeds the quota streak while still NOT banning the 
         });
     }
 
-    // The quota side must have noticed. On the broken version this array was
-    // empty because the streak reset on every single scrape.
-    assert.equal(pauses.length, 1, 'the quota back-off must fire exactly once');
-    assert.ok(pauses[0] > 0, 'and request a real pause');
+    // The streak requests a diagnostic; missing health capabilities cannot
+    // establish an account restriction.
+    assert.equal(pauses.length, 0, 'marked empties require verified diagnostics, never a platform pause');
+    assert.equal(quotaTracker.snapshot().diagnosticDue, true);
 
     // The ban side must NOT have. This is the 2026-08-18 invariant, still held.
     assert.deepEqual(bans, [], 'a marked-query refusal must never ban the account');

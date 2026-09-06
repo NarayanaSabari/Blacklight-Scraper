@@ -136,10 +136,8 @@ export async function buildStatus(deps) {
         // otherwise show as a healthy scraper quietly finding nothing, while the
         // canary cools credentials for a ban that never happened.
         template: templateStatus ?? null,
-        // Search-quota state. Distinct from `template` above and from any
-        // credential cooldown: this says "LinkedIn is refusing search for the
-        // whole host right now", which is the one reading that should stop an
-        // operator from investigating the accounts.
+        // Account-scoped diagnostic evidence and retry times. This does not
+        // assert a platform-wide restriction or authenticate idle accounts.
         searchQuota: quotaStatus ?? null,
     };
 
@@ -210,6 +208,15 @@ export async function buildStatus(deps) {
                 + `(${quotaStatus.consecutiveTrips ?? 1} consecutive). A bounded recovery probe runs next; `
                 + 'empty search results alone do not prove account health.',
         });
+    }
+    for (const [account, state] of Object.entries(quotaStatus?.accounts ?? {})) {
+        if (state.paused) {
+            alerts.push({ level: 'warn', message: `LinkedIn account ${account} search cooldown until ${state.pausedUntil}. `
+                + `Evidence: ${state.lastOutcome}. Other accounts keep their own schedules.` });
+        } else if (state.diagnosticDue && state.nextRetryAt) {
+            alerts.push({ level: 'warn', message: `LinkedIn account ${account} diagnostic pending (${state.lastOutcome}); `
+                + `next check after ${state.nextRetryAt}. No quota restriction confirmed.` });
+        }
     }
     // Two DIFFERENT conditions, deliberately not merged into "spool is non-empty".
     // That single test is why the panel warned "backend delivery is failing" for

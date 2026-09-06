@@ -1,3 +1,5 @@
+import { BlockedError } from '../../core/errors.js';
+import { diagnoseSearch } from './search-diagnostic.js';
 // LinkedIn scraper, RSC transport.
 //
 // Same signature and return contract as the former LinkedIn scraper, so
@@ -21,21 +23,19 @@ import { paginate as defaultPaginate, countPerRequest } from './client.js';
 import { getLinkedInRscSession } from './session.js';
 import { getScrapeArchive } from './archive.js';
 import { getQueryState } from './query-state.js';
-import { CanaryTracker, runCanary } from './canary.js';
+import { runCanary } from './canary.js';
 import { getRequestPacer } from './pacer.js';
 import { fetchForCredential } from './egress.js';
-import { SearchQuotaTracker, applyQuotaPause } from './search-quota.js';
-import * as linkedinCooldown from '../../core/linkedin-cooldown.js';
+import { SearchQuotaRegistry } from './search-quota.js';
 import { getMetrics } from '../../metrics/registry.js';
 import { titleFromPost, locationFromPost, companyFromPost } from './post-fields.js';
 
 // One tracker per process: streaks are per-credential inside it, and the
 // canary's whole job is to observe across consecutive scrapes.
-const defaultCanaryTracker = new CanaryTracker();
+// Production uses one account diagnostic path; legacy injected canaries remain testable.
 
-// Also one per process, but for the opposite reason: this signal is a property
-// of the PLATFORM, so every credential's result feeds the same counter.
-const defaultQuotaTracker = new SearchQuotaTracker({ startupProbe: true });
+// One process registry, with independent evidence and admission for each account.
+const defaultQuotaTracker = new SearchQuotaRegistry();
 
 /** Live search-quota state, for the control panel. Pure read. */
 export function searchQuotaStatus() {
@@ -169,7 +169,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         queryFeedback = null,
         archive = paginateImpl === defaultPaginate ? getScrapeArchive() : null,
         queryState = paginateImpl === defaultPaginate ? getQueryState() : null,
-        canaryTracker = defaultCanaryTracker,
+        canaryTracker = null,
         runCanaryImpl = runCanary,
         // Null disables pacing. The default is the process-wide pacer; callers
         // that inject their own `paginateImpl` are not touching LinkedIn at all
@@ -177,14 +177,10 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // sleeps — otherwise a suite that exercises the scrape path would sit
         // through a 20s floor per call.
         pacer = paginateImpl === defaultPaginate ? getRequestPacer() : null,
-        // Platform-wide search-quota back-off. Same injection rule as the
-        // pacer: a caller supplying its own paginateImpl is not talking to
-        // LinkedIn, so it must not be able to write a real cooldown marker into
-        // the operator's home directory as a side effect of a unit test.
-        quotaTracker = defaultQuotaTracker,
-        quotaAdmission = paginateImpl === defaultPaginate,
-        quotaCooldown = linkedinCooldown,
-        applyQuotaPauseImpl = paginateImpl === defaultPaginate ? applyQuotaPause : () => false,
+        // Replays use isolated state; production retains each account's gate.
+        quotaTracker: injectedQuotaTracker = null,
+        quotaRegistry = paginateImpl === defaultPaginate ? defaultQuotaTracker : new SearchQuotaRegistry({ startupProbe: false }),
+        quotaAdmission = paginateImpl === defaultPaginate || injectedQuotaTracker !== null,
         metrics = getMetrics(),
     } = options;
 
@@ -228,336 +224,214 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         candidateScoped: scoped,
     });
 
-    const admission = quotaAdmission ? quotaTracker.beginSearch() : { allowed: true, recovery: false };
-    if (!admission.allowed) {
-        metrics?.recordLinkedInSearch?.(mode, 'deferred', 0, 0, 0);
-        return { jobs: [], emptyConfirmed: false, searchOutcome: 'deferred',
-            nextRefreshAt: new Date(admission.retryAt).toISOString() };
-    }
-    // A completed probe releases its reservation before the requested query
-    // runs. That query must never cancel a later assignment's reservation.
-    let recoveryPending = admission.recovery;
     return session.withCookies(sessionId, async (cookies, lease) => {
-        const requestTemplate = template ?? await session.template();
+        const quotaTracker = injectedQuotaTracker ?? quotaRegistry.forAccount(lease);
+        const admission = quotaAdmission ? quotaTracker.beginSearch() : { allowed: true, recovery: false };
+        if (!admission.allowed) {
+            metrics?.recordLinkedInSearch?.(mode, 'deferred', 0, 0, 0);
+            return { jobs: [], emptyConfirmed: false, searchOutcome: 'deferred',
+                nextRefreshAt: new Date(admission.retryAt).toISOString() };
+        }
+        try {
+            const requestTemplate = template ?? await session.template();
+            const sessionAlive = session.isAlive?.();
 
-        // Is this session actually authenticated? Read BEFORE the scrape, so a
-        // failure during the walk cannot retroactively change the answer.
-        //
-        // Tri-state on purpose, and consumed as such by the quota block below:
-        //   true      -> authenticated; an empty result is about the PLATFORM
-        //   false     -> not authenticated; an empty result is about US
-        //   undefined -> the session cannot answer; no opinion, behave as before
-        //
-        // A session without `isAlive` must not silently disable quota
-        // detection, which is why this resolves to undefined rather than false.
-        const sessionAlive = typeof session.isAlive === 'function'
-            ? Boolean(session.isAlive())
-            : undefined;
+            // A diagnostic uses the held account's egress and pacing too.
+            const boundFetch = fetchForCredential(lease?.credential);
 
-        // Space this scrape from the previous one on the SAME credential. The
-        // backend's 15-minute floor (#493) is per queue row: it bounds how often
-        // one search repeats and cannot see how close together DIFFERENT
-        // searches land on one account. Prod 2026-08-18 fired 12 sessions in 27
-        // seconds that way. Held inside the lease so the wait is attributed to
-        // the credential it protects, and after template load so a cold start
-        // does not pay twice.
-        await pacer?.pace?.(lease);
-
-        // Bind egress to the credential's own proxy. A LinkedIn cookie is
-        // issued to the IP that logged in; the login path routes through
-        // `credential.proxy` (linkedin-browser.js) while this transport used
-        // plain global fetch, so an account with a proxy scraped from a
-        // different IP than it authenticated from. Prod 2026-08-18: Link1 had a
-        // proxy set and was the hardest-hit account; Link2 had none and its
-        // login and scrape agreed. No proxy on the credential still means
-        // direct egress, unchanged.
-        const boundFetch = fetchForCredential(lease?.credential);
-
-        if (admission.recovery) {
-            // A broad, one-page probe avoids using a thin recruiter query as
-            // evidence that search is unavailable. Retain probe results too.
-            let probe;
-            try {
-                probe = await paginateImpl({ template: requestTemplate, cookies,
-                    keywords: 'hiring', datePosted, count, maxPosts: count, maxPages: 1,
-                    timeBudgetMs: 30_000, fetchImpl: boundFetch });
-            } catch (error) {
-                const recovery = quotaTracker.finishRecovery(false);
-                recoveryPending = false;
-                applyQuotaPauseImpl({ cooldown: quotaCooldown, pauseMs: recovery.pauseMs, now: new Date() });
-                metrics?.recordLinkedInQuotaPause?.(recovery.pauseMs);
-                metrics?.recordLinkedInSearch?.('recovery', 'failed', 1, 0, 0);
-                await archive?.save({ sessionId, keywords: 'hiring', location, datePosted,
-                    outcome: 'recovery_failed' });
-                throw error;
-            }
-            const served = probe.posts.length > 0;
-            metrics?.recordLinkedInSearch?.('recovery', served ? 'served' : 'unavailable', probe.pages?.length ?? 0, probe.posts.length, 0);
-            await archive?.save({ sessionId, keywords: 'hiring', location, datePosted,
-                posts: probe.rawPosts ?? probe.posts, pages: probe.pages,
-                outcome: served ? 'recovery_served' : 'recovery_unavailable' });
-            const recovery = quotaTracker.finishRecovery(served);
-            recoveryPending = false;
-            if (!served) {
-                applyQuotaPauseImpl({ cooldown: quotaCooldown, pauseMs: recovery.pauseMs, now: new Date() });
-                metrics?.recordLinkedInQuotaPause?.(recovery.pauseMs);
-                return { jobs: [], emptyConfirmed: false, searchOutcome: 'deferred',
-                    nextRefreshAt: quotaTracker.snapshot().pausedUntil };
+            const diagnostic = (trigger, observedError) => diagnoseSearch({ tracker: quotaTracker, session, lease,
+                template: requestTemplate, cookies, paginateImpl, fetchImpl: boundFetch,
+                pacer, archive, sessionId, metrics, trigger, observedError });
+            if (admission.recovery) {
+                const result = await diagnostic('startup_or_recovery');
+                if (!result.served) return { jobs: [], emptyConfirmed: false, searchOutcome: 'deferred',
+                    nextRefreshAt: quotaTracker.snapshot().nextRetryAt };
             }
             await pacer?.pace?.(lease);
-        }
 
-        const {
-            posts, rawPosts, emptyConfirmed, upToDate, newestActivityId: newestSeen, pages, budgetExhausted, exhausted,
-        } = await paginateImpl({
-            template: requestTemplate,
-            cookies,
-            keywords,
-            datePosted,
-            maxPosts: effectiveMaxPosts,
-            count,
-            ...(effectiveMaxPages ? { maxPages: effectiveMaxPages } : {}),
-            timeBudgetMs,
-            sinceActivityId,
-            ...(refresh ? { seenPostIds: refresh.seenPostIds, knownPageLimit: refresh.reconcile ? Number.MAX_SAFE_INTEGER : 3 } : {}),
-            fetchImpl: boundFetch,
-            onPage: archive ? (page) => archive.save({ sessionId, keywords, location, datePosted,
-                ...page, outcome: 'page', candidateScoped: scoped }) : null,
-        });
-
-        if (budgetExhausted) {
-            // Should never fire: measured exhaustion is ~3 minutes against a
-            // 7-minute budget. If it does, the result is incomplete AND the
-            // scrape is approaching the backend's 600s orphan window, which
-            // would let a second scraper claim the same platform.
-            log.error('Full search hit its time budget; result is incomplete', {
-                keywords,
-                posts: posts.length,
-                requests: pages?.length ?? 0,
-                budgetMs: CANDIDATE_TIME_BUDGET_MS,
-                scraper_alert: scoped ? 'candidate_query_time_budget' : 'role_reconciliation_time_budget',
-            });
-        }
-
-        const jobs = posts.map((post) => postToJob(post, location));
-        const observedPosts = rawPosts ?? posts;
-        const newPostCount = refresh
-            ? observedPosts.filter((post) => !refresh.knownPostIds.has(post.activity_id || post.post_url)).length
-            : posts.length;
-        const searchOutcome = jobs.length ? 'served' : upToDate ? 'up_to_date' : emptyConfirmed ? 'empty' : 'unavailable';
-        metrics?.recordLinkedInSearch?.(mode, searchOutcome, pages?.length ?? 0, observedPosts.length, newPostCount);
-        await archive?.save({ sessionId, keywords, location, datePosted, posts: observedPosts,
-            jobs, pages, outcome: searchOutcome, candidateScoped: scoped, budgetExhausted });
-        const nextRefresh = refresh ? queryState.record(queryKey, {
-            posts: observedPosts, newPosts: newPostCount, requests: pages?.length ?? 0,
-            reconciled: refresh.reconcile && exhausted === true && !budgetExhausted,
-        }) : null;
-
-        // Advance only after the walk succeeded — a throw skips this and the
-        // next run re-covers the same ground, which is the safe direction.
-        // The store itself refuses to move a mark backward.
-        if (!scoped && newestSeen) highWater?.advance?.(keywords, datePosted, newestSeen);
-
-        log.info('RSC scrape complete', {
-            posts: posts.length,
-            withText: posts.filter((p) => (p.text_length ?? 0) > 80).length,
-            withEmail: posts.filter((p) => (p.contact_emails ?? []).length > 0).length,
-            requests: pages?.length ?? 0,
-            emptyConfirmed,
-            upToDate: Boolean(upToDate),
-            sinceActivityId,
-            candidateScoped: scoped,
-            budgetExhausted,
-        });
-
-        // Shadow-ban canary. Three things prove the account is being served
-        // normally, and none of them may feed the ban counter:
-        //
-        //   • posts came back;
-        //   • `upToDate` — LinkedIn positively served posts we already hold;
-        //   • a CONFIRMED empty for a search that carries a high-water mark.
-        //
-        // That third one is the 2026-08-18 outage. #492 made every steady-state
-        // sweep ask for "posts newer than <mark>", and LinkedIn answers a
-        // repeated identical search with its positive "no results" flag and no
-        // rows. No rows means paginate() cannot set `upToDate` (that needs to
-        // have SEEN a known post), so a perfectly healthy up-to-date sweep wore
-        // the exact shape of a shadow-banned account's polite empty. At ~154
-        // marked queue rows this reached the streak threshold in seconds:
-        // Link2 reported success at 06:29:29 and was banned 4.2s later, and
-        // with both accounts cooled the pipeline went to a hard zero.
-        //
-        // A confirmed empty with NO mark is still counted — that is a genuine
-        // "nothing in the last 24h at all", which is the signature the canary
-        // exists to catch.
-        const refusedRepeat = emptyConfirmed && sinceActivityId !== null;
-
-        // PLATFORM-WIDE search quota, tracked across every credential.
-        //
-        // Distinct from the per-credential canary below, and checked first,
-        // because it describes a different thing: LinkedIn metering content
-        // search for the whole host rather than restricting one account.
-        // Production 2026-08-18/19 lost search on BOTH accounts within the same
-        // minute, twice, recovering on its own after ~2-3h each time — while we
-        // kept issuing ~285 scrapes an hour into the wall.
-        //
-        // Ordering matters. During a quota window every account looks banned,
-        // so this must stop the platform BEFORE the canary starts convicting
-        // individual credentials for something that is not their fault.
-        //
-        // ⚠️ THE HEALTH SIGNAL HERE IS DELIBERATELY NARROWER THAN THE CANARY'S.
-        //
-        // The canary treats `refusedRepeat` — a confirmed empty for a search
-        // carrying a high-water mark — as proof of health, and for its purpose
-        // that is right: LinkedIn refusing a REPEATED query says nothing about
-        // whether the account is banned.
-        //
-        // For a quota it is worse than useless, because a refused search and an
-        // up-to-date search produce byte-identical responses. Measured on the
-        // live host during the 2026-08-19 refusal window: of 60 consecutive
-        // zero-yield scrapes, exactly 30 carried a mark. Counting those as
-        // "served" reset the counter every other scrape, so the longest streak
-        // the tracker could ever reach was 5 against a threshold of 25 — the
-        // back-off could not fire at all, which is precisely what happened.
-        //
-        // `posts > 0 || upToDate` is the signal that actually separates the two
-        // states, because `upToDate` requires having SEEN a known post, which a
-        // refused search never returns. Verified across 3,867 scrapes spanning
-        // both regimes: it is non-zero in every serving hour and exactly zero in
-        // every refusing hour, with no overlap.
-        const searchServed = jobs.length > 0 || upToDate;
-        if (searchServed) {
-            session.noteSearchServed?.(lease);
-            quotaTracker.recordServed();
-        } else if (sessionAlive === false) {
-            // A DEAD SESSION IS NOT A QUOTA WINDOW.
-            //
-            // An unauthenticated session answers every query with a confirmed
-            // empty, which is byte-identical on the wire to LinkedIn metering
-            // search. Feeding those empties to a PLATFORM-wide verdict lets a
-            // host manufacture a quota window out of its own broken login, and
-            // because a pause cannot fix a dead session, every expiry re-trips
-            // and doubles.
-            //
-            // Production 2026-08-19: `sessionAlive: false`, `lastServedAt:
-            // null`, 26 empties, 3 trips within 3.4h of boot, then 9 trips and
-            // a permanent 4h pause by the next morning — 8.6 hours idle for
-            // want of a re-login nobody was told to run, because the quota
-            // pause had overwritten the auth cooldown marker that carries that
-            // instruction.
-            //
-            // Skipped entirely rather than counted: the observation is not
-            // evidence about the platform, so it should not move a
-            // platform-scoped counter in either direction. The dead session
-            // has its own alert path (`needsRelogin`), which is where an
-            // operator should be sent.
-            //
-            // `undefined` (a session that cannot answer) deliberately falls
-            // through to the normal path — no opinion must not disable quota
-            // detection, which is the same rule the canary's
-            // `verifyRequestHealth` gate follows.
-            log.warn('Zero-yield scrape on a dead session — not counting it toward the search quota', {
-                keywords,
-                scraper_alert: 'linkedin_quota_skipped_dead_session',
-            });
-        } else {
-            const { tripped, pauseMs, streak } = quotaTracker.recordEmpty();
-            if (tripped) {
-                const paused = applyQuotaPauseImpl({
-                    cooldown: quotaCooldown,
-                    pauseMs,
-                    now: new Date(),
-                });
-                log.error('LinkedIn is refusing search platform-wide — pausing to let the quota recover', {
-                    consecutiveEmpty: streak,
-                    pauseMinutes: Math.round(pauseMs / 60000),
-                    markerWritten: paused,
-                    scraper_alert: 'linkedin_search_quota',
-                });
-                try { metrics?.recordLinkedInQuotaPause?.(pauseMs); } catch { /* never break a scrape */ }
-            }
-        }
-
-        // A zero-yield scrape feeds the credential's streak; at the threshold,
-        // one extra request on a query that always has results settles whether
-        // the account is banned or the queries were thin.
-        //
-        // MUST run BEFORE reportSuccess: reportSuccess releases the lease, and
-        // the canary's ban report needs the lease alive to land. Observed in
-        // production 2026-08-17: the canary fired twice (11:20, 11:54), and
-        // both ban reports were dropped with "No active credential to report
-        // failure for" because the lease had already been released. The
-        // credential stayed `available` and kept being leased for four more
-        // hours of zero-yield sessions.
-        //
-        // NOTE the health test differs from the quota block's above, and must.
-        // `refusedRepeat` belongs HERE and only here: for judging whether an
-        // ACCOUNT is banned, LinkedIn refusing a repeated query is genuine
-        // evidence of health (that is the 2026-08-18 fix). For judging whether
-        // the PLATFORM is serving search at all, it is indistinguishable from
-        // the refusal itself. Same observation, opposite meaning, depending on
-        // the question being asked.
-        let canaryVerdict = null;
-        if (searchServed || refusedRepeat) {
-            canaryTracker?.recordHealthy(lease);
-        } else if (canaryTracker?.recordEmpty(lease)) {
-            canaryVerdict = await runCanaryImpl({
-                tracker: canaryTracker,
-                lease,
-                template: requestTemplate,
-                cookies,
-                paginateImpl,
-                fetchImpl: boundFetch,
-                // Before blaming the ACCOUNT, rule out our own request. A
-                // template that has fallen behind LinkedIn's client version
-                // makes every search answer "no results", which is exactly the
-                // evidence the canary treats as proof of a ban (2026-08-18:
-                // both credentials falsely cooled, five hours at zero).
-                //
-                // Checked lazily and only at the point of conviction, so the
-                // ordinary healthy path never pays for it.
-                //
-                // Passed as undefined when the session cannot answer, rather
-                // than as a function that throws. A session without this
-                // capability means NO OPINION, and the canary must fall back to
-                // its previous behaviour — treating "cannot ask" as "request is
-                // broken" would silently disable ban detection everywhere the
-                // capability is absent.
-                verifyRequestHealth: typeof session.isRequestHealthy === 'function'
-                    ? () => session.isRequestHealthy()
-                    : undefined,
-            });
-        }
-
-        // Per-role liveness against the held lease, as the DOM path does.
-        // Skipped after a confirmed shadow-ban: the canary already reported
-        // the credential failed with a cooldown, and that report released the
-        // lease — a success ping here would land on the dead lease and, worse,
-        // contradict the verdict.
-        if (canaryVerdict !== 'shadow_banned') {
-            // Best-effort. The jobs are ALREADY SCRAPED by this point, and the
-            // caller submits them after we return, so letting a failed liveness
-            // ping propagate would discard completed work over a bookkeeping
-            // call. Verified: with reportSuccess throwing "backend down", a
-            // scrape carrying a real post threw and the post never reached the
-            // backend.
-            //
-            // The same reasoning the HTTP client already applies to submitJobs,
-            // which is exempted from the circuit breaker precisely so an
-            // unrelated outage cannot bin scraped jobs.
+            let walk;
             try {
-                await lease?.reportSuccess?.(`RSC scrape: ${posts.length} posts`);
+                walk = await paginateImpl({
+                    template: requestTemplate,
+                    cookies,
+                    keywords,
+                    datePosted,
+                    maxPosts: effectiveMaxPosts,
+                    count,
+                    ...(effectiveMaxPages ? { maxPages: effectiveMaxPages } : {}),
+                    timeBudgetMs,
+                    sinceActivityId,
+                    ...(refresh ? { seenPostIds: refresh.seenPostIds, knownPageLimit: refresh.reconcile ? Number.MAX_SAFE_INTEGER : 3 } : {}),
+                    fetchImpl: boundFetch,
+                    onPage: archive ? (page) => archive.save({ sessionId, keywords, location, datePosted,
+                        ...page, outcome: 'page', candidateScoped: scoped }) : null,
+                });
             } catch (error) {
-                log.warn('Liveness ping failed — scrape result kept', {
-                    err: error?.message,
+                if (!(error instanceof BlockedError) || error.kind !== 'rate_limit') throw error;
+                await diagnostic('http_rate_limit', error);
+                return { jobs: [], emptyConfirmed: false, searchOutcome: 'deferred',
+                    nextRefreshAt: quotaTracker.snapshot().nextRetryAt };
+            }
+            const { posts, rawPosts, emptyConfirmed, upToDate, newestActivityId: newestSeen,
+                pages, budgetExhausted, exhausted } = walk;
+
+            if (budgetExhausted) {
+                // Should never fire: measured exhaustion is ~3 minutes against a
+                // 7-minute budget. If it does, the result is incomplete AND the
+                // scrape is approaching the backend's 600s orphan window, which
+                // would let a second scraper claim the same platform.
+                log.error('Full search hit its time budget; result is incomplete', {
+                    keywords,
                     posts: posts.length,
+                    requests: pages?.length ?? 0,
+                    budgetMs: CANDIDATE_TIME_BUDGET_MS,
+                    scraper_alert: scoped ? 'candidate_query_time_budget' : 'role_reconciliation_time_budget',
                 });
             }
-        }
 
-        return { jobs, emptyConfirmed, upToDate: Boolean(upToDate), searchOutcome,
-            nextRefreshAt: nextRefresh ? new Date(nextRefresh.nextDueAt).toISOString() : null };
-    }).finally(() => {
-        if (recoveryPending) quotaTracker.cancelRecovery();
+            const jobs = posts.map((post) => postToJob(post, location));
+            const observedPosts = rawPosts ?? posts;
+            const newPostCount = refresh
+                ? observedPosts.filter((post) => !refresh.knownPostIds.has(post.activity_id || post.post_url)).length
+                : posts.length;
+            const searchOutcome = jobs.length ? 'served' : upToDate ? 'up_to_date' : emptyConfirmed ? 'empty' : 'unavailable';
+            metrics?.recordLinkedInSearch?.(mode, searchOutcome, pages?.length ?? 0, observedPosts.length, newPostCount);
+            await archive?.save({ sessionId, keywords, location, datePosted, posts: observedPosts,
+                jobs, pages, outcome: searchOutcome, candidateScoped: scoped, budgetExhausted });
+            const nextRefresh = refresh ? queryState.record(queryKey, {
+                posts: observedPosts, newPosts: newPostCount, requests: pages?.length ?? 0,
+                reconciled: refresh.reconcile && exhausted === true && !budgetExhausted,
+            }) : null;
+
+            // Advance only after the walk succeeded — a throw skips this and the
+            // next run re-covers the same ground, which is the safe direction.
+            // The store itself refuses to move a mark backward.
+            if (!scoped && newestSeen) highWater?.advance?.(keywords, datePosted, newestSeen);
+
+            log.info('RSC scrape complete', {
+                posts: posts.length,
+                withText: posts.filter((p) => (p.text_length ?? 0) > 80).length,
+                withEmail: posts.filter((p) => (p.contact_emails ?? []).length > 0).length,
+                requests: pages?.length ?? 0,
+                emptyConfirmed,
+                upToDate: Boolean(upToDate),
+                sinceActivityId,
+                candidateScoped: scoped,
+                budgetExhausted,
+            });
+
+            // Shadow-ban canary. Three things prove the account is being served
+            // normally, and none of them may feed the ban counter:
+            //
+            //   • posts came back;
+            //   • `upToDate` — LinkedIn positively served posts we already hold;
+            //   • a CONFIRMED empty for a search that carries a high-water mark.
+            //
+            // That third one is the 2026-08-18 outage. #492 made every steady-state
+            // sweep ask for "posts newer than <mark>", and LinkedIn answers a
+            // repeated identical search with its positive "no results" flag and no
+            // rows. No rows means paginate() cannot set `upToDate` (that needs to
+            // have SEEN a known post), so a perfectly healthy up-to-date sweep wore
+            // the exact shape of a shadow-banned account's polite empty. At ~154
+            // marked queue rows this reached the streak threshold in seconds:
+            // Link2 reported success at 06:29:29 and was banned 4.2s later, and
+            // with both accounts cooled the pipeline went to a hard zero.
+            //
+            // A confirmed empty with NO mark is still counted — that is a genuine
+            // "nothing in the last 24h at all", which is the signature the canary
+            // exists to catch.
+            const refusedRepeat = emptyConfirmed && sinceActivityId !== null;
+
+            const searchServed = jobs.length > 0 || upToDate;
+            let diagnosticResult = null;
+            if (searchServed) {
+                session.noteSearchServed?.(lease);
+                quotaTracker.recordServed();
+            } else if (sessionAlive !== false && quotaTracker.recordEmpty().probeDue) {
+                diagnosticResult = await diagnostic('empty_query_threshold');
+            }
+
+            // A zero-yield scrape feeds the credential's streak; at the threshold,
+            // one extra request on a query that always has results settles whether
+            // the account is banned or the queries were thin.
+            //
+            // MUST run BEFORE reportSuccess: reportSuccess releases the lease, and
+            // the canary's ban report needs the lease alive to land. Observed in
+            // production 2026-08-17: the canary fired twice (11:20, 11:54), and
+            // both ban reports were dropped with "No active credential to report
+            // failure for" because the lease had already been released. The
+            // credential stayed `available` and kept being leased for four more
+            // hours of zero-yield sessions.
+            //
+            // NOTE the health test differs from the quota block's above, and must.
+            // `refusedRepeat` belongs HERE and only here: for judging whether an
+            // ACCOUNT is banned, LinkedIn refusing a repeated query is genuine
+            // evidence of health (that is the 2026-08-18 fix). For judging whether
+            // the PLATFORM is serving search at all, it is indistinguishable from
+            // the refusal itself. Same observation, opposite meaning, depending on
+            // the question being asked.
+            let canaryVerdict = null;
+            if (searchServed || refusedRepeat) {
+                canaryTracker?.recordHealthy(lease);
+            } else if (canaryTracker?.recordEmpty(lease)) {
+                canaryVerdict = await runCanaryImpl({
+                    tracker: canaryTracker,
+                    lease,
+                    template: requestTemplate,
+                    cookies,
+                    paginateImpl,
+                    fetchImpl: boundFetch,
+                    // Before blaming the ACCOUNT, rule out our own request. A
+                    // template that has fallen behind LinkedIn's client version
+                    // makes every search answer "no results", which is exactly the
+                    // evidence the canary treats as proof of a ban (2026-08-18:
+                    // both credentials falsely cooled, five hours at zero).
+                    //
+                    // Checked lazily and only at the point of conviction, so the
+                    // ordinary healthy path never pays for it.
+                    //
+                    // Passed as undefined when the session cannot answer, rather
+                    // than as a function that throws. A session without this
+                    // capability means NO OPINION, and the canary must fall back to
+                    // its previous behaviour — treating "cannot ask" as "request is
+                    // broken" would silently disable ban detection everywhere the
+                    // capability is absent.
+                    verifyRequestHealth: typeof session.isRequestHealthy === 'function'
+                        ? () => session.isRequestHealthy()
+                        : undefined,
+                });
+            }
+
+            // Per-role liveness against the held lease, as the DOM path does.
+            // Skipped after a confirmed shadow-ban: the canary already reported
+            // the credential failed with a cooldown, and that report released the
+            // lease — a success ping here would land on the dead lease and, worse,
+            // contradict the verdict.
+            if (canaryVerdict !== 'shadow_banned' && !diagnosticResult?.tripped) {
+                // Best-effort. The jobs are ALREADY SCRAPED by this point, and the
+                // caller submits them after we return, so letting a failed liveness
+                // ping propagate would discard completed work over a bookkeeping
+                // call. Verified: with reportSuccess throwing "backend down", a
+                // scrape carrying a real post threw and the post never reached the
+                // backend.
+                //
+                // The same reasoning the HTTP client already applies to submitJobs,
+                // which is exempted from the circuit breaker precisely so an
+                // unrelated outage cannot bin scraped jobs.
+                try {
+                    await lease?.reportSuccess?.(`RSC scrape: ${posts.length} posts`);
+                } catch (error) {
+                    log.warn('Liveness ping failed — scrape result kept', {
+                        err: error?.message,
+                        posts: posts.length,
+                    });
+                }
+            }
+
+            return { jobs, emptyConfirmed, upToDate: Boolean(upToDate), searchOutcome,
+                nextRefreshAt: nextRefresh ? new Date(nextRefresh.nextDueAt).toISOString() : null };
+        } finally {
+            if (quotaAdmission) quotaTracker.endSearch();
+        }
     });
 }

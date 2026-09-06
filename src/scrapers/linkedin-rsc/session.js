@@ -22,6 +22,7 @@ import * as linkedinCooldown from '../../core/linkedin-cooldown.js';
 import * as defaultTemplateHealth from './template-health.js';
 import { captureTemplate as captureTemplateImpl } from './capture-template.js';
 import { getMetrics } from '../../metrics/registry.js';
+import { buildHeaders } from './client.js';
 
 const log = createLogger('linkedin-rsc-session');
 
@@ -316,23 +317,23 @@ export class LinkedInRscSession {
      *
      * @returns {Promise<boolean>} false when the template looks stale/refused
      */
-    async isRequestHealthy() {
-        if (!this._templateHealth) return true;      // no checker → no opinion
+    async isRequestHealthy({ strict = false, fetchImpl } = {}) {
+        if (!this._templateHealth) return !strict;      // no checker → no opinion
         if (!this._template) {
             try {
                 this._template = this._loadTemplate();
             } catch {
-                return true;    // cannot assess; do not block the caller
+                return !strict; // unknown is not proof of a valid request
             }
         }
         const { assessTemplate, fetchLiveClientVersion } = this._templateHealth;
         const liveVersion = await fetchLiveClientVersion({
             userAgent: this._template?.headers?.['user-agent'],
+            ...(fetchImpl ? { fetchImpl } : {}),
         });
-        // Could not read LinkedIn's version at all. Report HEALTHY so a
-        // network blip cannot indefinitely block a genuine ban verdict: the
-        // canary must still be able to do its job when this check is blind.
-        if (liveVersion === null) return true;
+        // Legacy callers tolerate unknown versions. Diagnostic decisions require
+        // positive evidence, so strict mode never equates unknown with healthy.
+        if (liveVersion == null) return !strict;
 
         const verdict = assessTemplate({
             template: this._template,
@@ -353,7 +354,26 @@ export class LinkedInRscSession {
             await this.#ensureTemplateFresh();
             return false;
         }
-        return true;
+        return !strict || Number.isFinite(verdict.lag);
+    }
+
+    // A cached jar proves only that cookies were loaded, not that LinkedIn
+    // still accepts them. Verify the held account without spending search quota.
+    async verifySearchSession({ cookies, template, fetchImpl = fetch }) {
+        const headers = buildHeaders(template, cookies, { keywords: 'hiring' });
+        const response = await fetchImpl('https://www.linkedin.com/voyager/api/me', {
+            headers: { accept: 'application/json', cookie: headers.cookie,
+                'csrf-token': headers['csrf-token'], 'user-agent': headers['user-agent'] },
+            redirect: 'manual', signal: AbortSignal.timeout(15_000),
+        });
+        if ([401, 403].includes(response.status)) {
+            throw new AuthError('LinkedIn rejected the account diagnostic; re-login required',
+                { platform: 'linkedin', code: 'NEEDS_RELOGIN' });
+        }
+        if (response.status !== 200) return false;
+        const body = await response.json();
+        // Unknown shapes remain inconclusive rather than validating a login wall.
+        return /^urn:li:(?:fs|fsd)_miniProfile:/.test(body?.miniProfile?.entityUrn ?? '');
     }
 
     #cookiesFresh(profileKey) {
