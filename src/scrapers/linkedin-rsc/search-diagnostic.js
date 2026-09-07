@@ -1,6 +1,7 @@
 import { AuthError, BlockedError } from '../../core/errors.js';
 import { createLogger } from '../../logger/index.js';
 import { accountKey } from './search-quota.js';
+import { diagnosticPages } from './response-evidence.js';
 
 const log = createLogger('linkedin-rsc:diagnostic');
 
@@ -13,6 +14,9 @@ export async function diagnoseSearch({ tracker, session, lease, template, cookie
     let probe;
     let outcome;
     let authError;
+    let probeError;
+    let authVerified = false;
+    let templateFresh = null;
     try {
         if (observedError) throw observedError;
         await pacer?.pace?.(lease);
@@ -24,16 +28,20 @@ export async function diagnoseSearch({ tracker, session, lease, template, cookie
             session.noteSearchServed?.(lease);
         } else if (!probe.emptyConfirmed) {
             outcome = 'response_unknown';
-        } else if (typeof session.verifySearchSession !== 'function'
-            || await session.verifySearchSession({ cookies, template, fetchImpl }) !== true) {
-            outcome = 'session_unknown';
-        } else if (typeof session.isRequestHealthy !== 'function'
-            || await session.isRequestHealthy({ strict: true, fetchImpl }) !== true) {
-            outcome = 'request_unhealthy';
         } else {
-            outcome = 'empty';
+            authVerified = typeof session.verifySearchSession === 'function'
+                && await session.verifySearchSession({ cookies, template, fetchImpl }) === true;
+            if (!authVerified) {
+                outcome = 'session_unknown';
+            } else {
+                // A matching client version proves freshness, not working search.
+                templateFresh = typeof session.isRequestHealthy === 'function'
+                    ? await session.isRequestHealthy({ strict: true, fetchImpl }) === true : null;
+                outcome = templateFresh === true ? 'empty' : 'request_unhealthy';
+            }
         }
     } catch (error) {
+        probeError = error;
         if (error instanceof AuthError) {
             outcome = error.code === 'NEEDS_TEMPLATE' ? 'request_unhealthy' : 'auth_failed';
             authError = error;
@@ -44,8 +52,12 @@ export async function diagnoseSearch({ tracker, session, lease, template, cookie
         }
     }
     const decision = tracker.finishRecovery(outcome);
+    const pages = diagnosticPages(probe?.pages ?? probeError?.pages);
     const evidence = { account, trigger, outcome, keywords,
         posts: probe?.posts?.length ?? 0, emptyConfirmed: probe?.emptyConfirmed === true,
+        searchVerified: (probe?.posts?.length ?? 0) > 0, authVerified,
+        templateFresh, templateCheck: 'freshness_only',
+        responses: pages.flatMap((page) => page.response ? [page.response] : []),
         cooldownMs: decision.tripped ? decision.pauseMs : 0,
         nextRetryAt: tracker.snapshot().nextRetryAt,
         corroboratingEmpties: tracker.snapshot().corroboratingEmpties };
@@ -56,7 +68,7 @@ export async function diagnoseSearch({ tracker, session, lease, template, cookie
     let archiveError;
     try {
         await archive?.save({ sessionId, keywords, datePosted: 'past-24h',
-            posts: probe?.rawPosts ?? probe?.posts ?? [], pages: probe?.pages ?? [],
+            posts: probe?.rawPosts ?? probe?.posts ?? [], pages,
             outcome: `diagnostic_${outcome}`, diagnostic: evidence });
     } catch (error) {
         archiveError = error;

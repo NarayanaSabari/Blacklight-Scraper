@@ -14,6 +14,7 @@ import path from 'path';
 import { createLogger } from '../../logger/index.js';
 import { launchPersistentProfile } from '../../core/linkedin-browser.js';
 import { AuthError } from '../../core/errors.js';
+import { extractPosts } from './extract.js';
 
 const log = createLogger('linkedin-rsc:capture');
 
@@ -28,6 +29,7 @@ export const DEFAULT_PROBE_QUERY = process.env.RSC_TEMPLATE_QUERY || 'data engin
 const SETTLE_MS = 6000;
 const SCROLL_TRIES = 6;
 const SCROLL_PAUSE_MS = 3000;
+const MAX_PENDING_RESPONSES = 8;
 
 // Session state and hop-by-hop headers: never persisted. Cookies and the CSRF
 // token are derived per-request from the live jar, so the file on disk holds no
@@ -63,15 +65,38 @@ export async function captureTemplate({
 } = {}) {
     const context = await launch({ profileKey });
     let captured = null;
+    let active = true;
+    let pendingResponses = 0;
 
-    // Listen on the CONTEXT, not the page: the pagination request can be issued
-    // from a worker or a prefetch that a page-scoped listener would miss.
-    context.on('request', (req) => {
-        if (captured) return;
-        const url = req.url();
-        if (!PAGINATION_RE.test(url) || !CONTENT_SEARCH_RE.test(url)) return;
-        captured = { url, headers: req.headers(), postData: req.postData() };
-    });
+    // An outgoing request alone proves nothing: it may return a challenge or
+    // an empty result. Only a response our production parser can extract posts
+    // from may replace the saved template. Context scope also catches workers.
+    const onResponse = async (response) => {
+        if (!active || captured || pendingResponses >= MAX_PENDING_RESPONSES) return;
+        let reading = false;
+        try {
+            const req = response.request();
+            const url = req.url();
+            if (!PAGINATION_RE.test(url) || !CONTENT_SEARCH_RE.test(url)) return;
+            const status = response.status();
+            if (status < 200 || status >= 300 || !req.postData()) return;
+            const postData = req.postData();
+            JSON.parse(postData);
+            // A slow prefetch must not hide a later working response. Bound
+            // concurrent body reads while accepting the first proven result.
+            pendingResponses++;
+            reading = true;
+            const posts = [...extractPosts(await response.text())].length;
+            if (active && !captured && posts > 0) captured = { url, headers: req.headers(), postData,
+                validation: { status, posts, checkedAt: new Date().toISOString() } };
+        } catch {
+            // Response bodies can disappear on navigation. Keep the old
+            // template and let later scroll responses provide evidence.
+        } finally {
+            if (reading) pendingResponses--;
+        }
+    };
+    context.on('response', onResponse);
 
     try {
         const jar = await context.cookies();
@@ -102,7 +127,7 @@ export async function captureTemplate({
         }
 
         if (!captured?.postData) {
-            log.warn('No pagination request observed — template not captured', { query });
+            log.warn('No pagination response with extractable posts observed; template preserved', { query });
             return null;
         }
 
@@ -111,6 +136,7 @@ export async function captureTemplate({
             headers: sanitizeHeaders(captured.headers),
             postData: captured.postData,
             capturedAt: new Date().toISOString(),
+            validation: captured.validation,
         };
 
         if (outPath) {
@@ -125,6 +151,8 @@ export async function captureTemplate({
 
         return template;
     } finally {
+        active = false;
+        context.off('response', onResponse);
         await context.close().catch(() => {});
     }
 }

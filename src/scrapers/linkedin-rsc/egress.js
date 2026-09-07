@@ -30,7 +30,7 @@
 // No proxy on the credential means direct egress, which is correct and
 // unchanged for accounts that also logged in direct (Link2).
 
-import { ProxyAgent } from 'undici';
+import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import { createLogger } from '../../logger/index.js';
 import { parseProxyLine } from '../../core/proxy-pool.js';
 
@@ -125,7 +125,7 @@ export function redactProxy(proxy) {
  *
  * @param {{proxy?: string|null}|null|undefined} credential
  */
-export function fetchForCredential(credential, { baseFetch = fetch, ...opts } = {}) {
+export function fetchForCredential(credential, { baseFetch, ...opts } = {}) {
     // A proxy is only honoured when the credential ALSO carries a profile_key.
     //
     // This mirrors the login path exactly, and the asymmetry is not cosmetic:
@@ -145,8 +145,11 @@ export function fetchForCredential(credential, { baseFetch = fetch, ...opts } = 
     // that happens this correctly leaves it direct.
     const usesProxy = Boolean(credential?.profile_key) && Boolean(credential?.proxy);
     const agent = usesProxy ? agentFor(credential.proxy, opts) : null;
-    if (!agent) return baseFetch;
-    return (url, init = {}) => baseFetch(url, { ...init, dispatcher: agent });
+    if (!agent) return baseFetch ?? globalThis.fetch;
+    // Node's bundled fetch can use a different dispatcher interface from the
+    // installed undici. Keep the proxied fetch and ProxyAgent on one version.
+    const proxyFetch = baseFetch ?? undiciFetch;
+    return (url, init = {}) => proxyFetch(url, { ...init, dispatcher: agent });
 }
 
 /** Test seam: drop cached agents. */

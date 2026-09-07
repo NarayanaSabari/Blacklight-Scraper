@@ -302,20 +302,19 @@ export class LinkedInRscSession {
     }
 
     /**
-     * Is the request we are sending still one LinkedIn will honour?
+     * Does the request template pass the version/age freshness heuristic?
+     * This does not prove LinkedIn accepts the request or will serve posts.
      *
-     * Answers the question the canary cannot answer for itself: when a probe
-     * comes back empty, is that the ACCOUNT being restricted or our REQUEST
-     * being refused? A template whose client version has fallen far behind
-     * produces a well-formed "no results" for every query, which is
-     * indistinguishable from a ban at the transport level.
+     * A stale template previously produced well-formed empty responses. Check
+     * for that known failure before escalating an empty diagnostic, while
+     * leaving account restrictions and upstream failures unconfirmed.
      *
      * Forces a check rather than reusing the interval-gated one: this is called
      * at the moment of conviction, where a stale cached answer could cost a
      * healthy credential four hours offline. One extra page fetch is trivial
      * against that.
      *
-     * @returns {Promise<boolean>} false when the template looks stale/refused
+     * @returns {Promise<boolean>} whether the freshness heuristic passes
      */
     async isRequestHealthy({ strict = false, fetchImpl } = {}) {
         if (!this._templateHealth) return !strict;      // no checker → no opinion
@@ -341,7 +340,7 @@ export class LinkedInRscSession {
             now: this._now(),
         });
         if (verdict.stale) {
-            log.error('Request template is stale — LinkedIn is refusing our request, not the account', {
+            log.error('Request template failed freshness checks; search availability remains unverified', {
                 capturedVersion: verdict.captured,
                 liveVersion: verdict.live,
                 versionLag: verdict.lag,

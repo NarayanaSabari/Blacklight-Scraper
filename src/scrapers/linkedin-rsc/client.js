@@ -11,6 +11,8 @@
 // The browser is only needed to mint the template and read cookies; every
 // request here is plain HTTP.
 
+import { createHash } from 'node:crypto';
+import { responseEvidence } from './response-evidence.js';
 import { AuthError, BlockedError, NetworkError } from '../../core/errors.js';
 import { extractPosts, isConfirmedEmpty } from './extract.js';
 import { isNewerThan, newestActivityId } from './high-water.js';
@@ -124,7 +126,7 @@ export function buildHeaders(template, cookies, params) {
  * it surfaces as AuthError (cool the credential, rotate). A 429 is the platform
  * pushing back, so it surfaces as BlockedError.
  */
-export async function fetchPage({ template, cookies, params, fetchImpl = fetch, timeoutMs = 30_000 }) {
+export async function fetchPage({ template, cookies, params, fetchImpl = fetch, timeoutMs = 30_000, onResponse = null }) {
     const headers = buildHeaders(template, cookies, params);
     const body = buildPaginationBody(template, params);
 
@@ -137,6 +139,13 @@ export async function fetchPage({ template, cookies, params, fetchImpl = fetch, 
         });
     }
 
+    const evidence = responseEvidence(response);
+    onResponse?.(evidence);
+    // Status failures remain immediate. Do not consume an unbounded error body
+    // for diagnostics; cancel it so the connection does not linger until timeout.
+    if (response.status < 200 || response.status >= 300) {
+        try { void response.body?.cancel?.().catch(() => {}); } catch { /* best effort */ }
+    }
     if (response.status === 403) {
         throw new AuthError(
             'LinkedIn rejected the RSC request (403) — session cookies dead, needs re-login',
@@ -154,7 +163,12 @@ export async function fetchPage({ template, cookies, params, fetchImpl = fetch, 
         });
     }
     try {
-        return await response.text();
+        const text = await response.text();
+        // Hash the decoded UTF-8 text consumed by the parser, not wire encoding.
+        evidence.bodyBytes = Buffer.byteLength(text);
+        evidence.bodySha256 = createHash('sha256').update(text).digest('hex');
+        onResponse?.(evidence);
+        return text;
     } catch (cause) {
         throw new NetworkError(`LinkedIn RSC response deadline or body failure: ${cause?.message ?? cause}`, {
             platform: 'linkedin', cause,
@@ -230,18 +244,29 @@ export async function paginate({
         if (remainingMs <= 0) { budgetExhausted = true; break; }
 
         const startedAt = Date.now();
-        const body = await fetchPage({
-            template,
-            cookies,
-            params: { keywords, datePosted, startIndex: page * count, count },
-            fetchImpl,
-            timeoutMs: Math.min(30_000, remainingMs),
-        });
+        let response;
+        let body;
+        try {
+            body = await fetchPage({
+                template,
+                cookies,
+                params: { keywords, datePosted, startIndex: page * count, count },
+                fetchImpl,
+                timeoutMs: Math.min(30_000, remainingMs),
+                onResponse: (evidence) => { response = evidence; },
+            });
+        } catch (error) {
+            error.pages = [...pages, { page: page + 1, start_index: page * count,
+                latency_ms: Date.now() - startedAt, response }];
+            throw error;
+        }
 
-        if (isConfirmedEmpty(body)) sawNoResultsSignal = true;
+        const noResultsSignal = isConfirmedEmpty(body);
+        response.noResultsSignal = noResultsSignal;
+        if (noResultsSignal) sawNoResultsSignal = true;
 
         const pagePosts = [...extractPosts(body)];
-        await onPage?.({ posts: pagePosts, pages: [{ page: page + 1, bytes: body.length }] });
+        await onPage?.({ posts: pagePosts, pages: [{ page: page + 1, bytes: body.length, response }] });
         let added = 0;
         // Counts posts this page returned at all, new or not. A page that
         // returned rows but added nothing NEW is the stop condition; a page
@@ -277,6 +302,7 @@ export async function paginate({
             bytes: body.length,
             latency_ms: Date.now() - startedAt,
             posts_added: added,
+            response,
         });
 
         // LinkedIn re-serves overlapping windows; a page adding nothing means the

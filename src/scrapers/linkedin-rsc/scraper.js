@@ -1,5 +1,6 @@
 import { BlockedError } from '../../core/errors.js';
 import { diagnoseSearch } from './search-diagnostic.js';
+import { diagnosticPages } from './response-evidence.js';
 // LinkedIn scraper, RSC transport.
 //
 // Same signature and return contract as the former LinkedIn scraper, so
@@ -272,7 +273,22 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
                         ...page, outcome: 'page', candidateScoped: scoped }) : null,
                 });
             } catch (error) {
-                if (!(error instanceof BlockedError) || error.kind !== 'rate_limit') throw error;
+                if (!(error instanceof BlockedError) || error.kind !== 'rate_limit') {
+                    // Successful pages are already retained by onPage. Keep the
+                    // failed response metadata before the session handles the error.
+                    const pages = diagnosticPages(error?.pages);
+                    if (pages.length) {
+                        try {
+                            await archive?.save({ sessionId, keywords, location, datePosted,
+                                pages, outcome: 'request_failed', candidateScoped: scoped });
+                        } catch {
+                            // Storage failure must not hide authentication or network
+                            // classification, and remote error text is never evidence.
+                            log.error('Failed to retain LinkedIn request failure evidence');
+                        }
+                    }
+                    throw error;
+                }
                 await diagnostic('http_rate_limit', error);
                 return { jobs: [], emptyConfirmed: false, searchOutcome: 'deferred',
                     nextRefreshAt: quotaTracker.snapshot().nextRetryAt };

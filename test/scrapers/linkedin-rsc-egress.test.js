@@ -9,6 +9,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { createServer, request } from 'node:http';
 import {
     proxyUrlFor, agentFor, fetchForCredential, redactProxy, __resetEgressAgentsForTest,
 } from '../../src/scrapers/linkedin-rsc/egress.js';
@@ -78,6 +80,70 @@ test('a credential WITH a proxy AND a profile_key uses that proxy', async () => 
     assert.equal(seen[0].init.body, '{}');
 });
 
+test('the default proxied fetch sends a request through a real HTTP proxy', async (t) => {
+    // Pairing the installed ProxyAgent with Node's bundled fetch can fail
+    // before reaching the proxy when their dispatcher interfaces differ.
+    __resetEgressAgentsForTest();
+    const sockets = new Set();
+    const target = createServer(async (request, response) => {
+        let body = '';
+        for await (const chunk of request) body += chunk;
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({
+            method: request.method,
+            path: request.url,
+            cookie: request.headers.cookie,
+            body,
+        }));
+    });
+    const proxiedUrls = [];
+    const proxy = createServer((incoming, response) => {
+        proxiedUrls.push(incoming.url);
+        const upstream = request(incoming.url, {
+            method: incoming.method,
+            headers: incoming.headers,
+        }, (result) => {
+            response.writeHead(result.statusCode, result.headers);
+            result.pipe(response);
+        });
+        upstream.on('socket', (socket) => sockets.add(socket));
+        upstream.on('error', () => response.destroy());
+        incoming.pipe(upstream);
+    });
+    let agent;
+    t.after(async () => {
+        if (agent) await agent.destroy();
+        for (const socket of sockets) socket.destroy();
+        await Promise.all([target, proxy].map((server) => new Promise((resolve) => server.close(resolve))));
+        __resetEgressAgentsForTest();
+    });
+    for (const server of [target, proxy]) {
+        server.on('connection', (socket) => sockets.add(socket));
+        server.listen(0, '127.0.0.1');
+        await once(server, 'listening');
+    }
+    const credential = {
+        profile_key: 'local-proxy-account',
+        proxy: `http://127.0.0.1:${proxy.address().port}`,
+    };
+    agent = agentFor(credential.proxy);
+    const boundFetch = fetchForCredential(credential);
+    const response = await boundFetch(`http://127.0.0.1:${target.address().port}/search?start=0`, {
+        method: 'POST',
+        headers: { cookie: 'li_at=test-session' },
+        body: '{"keywords":"engineer"}',
+        signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+        method: 'POST',
+        path: '/search?start=0',
+        cookie: 'li_at=test-session',
+        body: '{"keywords":"engineer"}',
+    });
+    assert.deepEqual(proxiedUrls, [`http://127.0.0.1:${target.address().port}/search?start=0`]);
+});
+
 test('a credential with NO proxy uses the base fetch untouched', async () => {
     __resetEgressAgentsForTest();
     const baseFetch = async () => ({ ok: true });
@@ -86,6 +152,8 @@ test('a credential with NO proxy uses the base fetch untouched', async () => {
     assert.equal(fetchForCredential({ proxy: null }, { baseFetch }), baseFetch);
     assert.equal(fetchForCredential(null, { baseFetch }), baseFetch);
     assert.equal(fetchForCredential(undefined, { baseFetch }), baseFetch);
+    assert.equal(fetchForCredential({ proxy: null }), globalThis.fetch);
+    assert.equal(fetchForCredential({ proxy: 'host:8080', profile_key: null }), globalThis.fetch);
 });
 
 test('a proxy WITHOUT a profile_key is ignored — that account logged in direct', () => {
