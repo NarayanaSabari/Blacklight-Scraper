@@ -185,14 +185,19 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
     } = options;
 
     // A recruiter-authored query is used EXACTLY as written — no random pick.
-    // Randomising across variants is right for a role (it broadens recall and
-    // varies the request pattern), but a human asked for this specific boolean
-    // and would have no way to tell why it only ran some of the time.
-    //
-    // One variant per session, chosen at random so repeated cycles cover them all.
+    // Scheduled role searches choose among due variants so a recently run
+    // variant cannot defer work that has not been searched yet.
     const variants = Array.isArray(searchQueries) && searchQueries.length > 0 ? searchQueries : null;
+    const keyFor = (query) => JSON.stringify([datePosted, location, candidateQueryId, query]);
+    let eligibleVariants = variants;
+    if (!candidateQuery && scheduledRefresh && queryState && variants) {
+        const plans = [...new Set(variants)].map((query) => ({ query, ...queryState.plan(keyFor(query)) }));
+        const due = plans.filter((plan) => plan.due);
+        eligibleVariants = due.length ? due.map((plan) => plan.query)
+            : [plans.reduce((earliest, plan) => plan.nextDueAt < earliest.nextDueAt ? plan : earliest).query];
+    }
     const keywords = candidateQuery
-        || pickSessionQuery(variants, rng)
+        || pickSessionQuery(eligibleVariants, rng)
         || buildBooleanSearchQuery(jobTitle);
 
     // Candidate-scoped runs lift the post cap entirely and add a wall-clock
@@ -201,7 +206,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
     // approach, and the account is worth more than the saved requests.
     const scoped = Boolean(candidateQuery);
     const mode = scoped ? 'candidate' : 'role';
-    const queryKey = JSON.stringify([datePosted, location, candidateQueryId, keywords]);
+    const queryKey = keyFor(keywords);
     if (scheduledRefresh && queryFeedback) queryState?.applyFeedback(queryKey, queryFeedback);
     const refresh = scheduledRefresh ? queryState?.plan(queryKey) : null;
     if (refresh && !refresh.due) {

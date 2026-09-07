@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import { ScrapeArchive } from '../../src/scrapers/linkedin-rsc/archive.js';
 import { QueryState } from '../../src/scrapers/linkedin-rsc/query-state.js';
 import { scrapeLinkedInRsc } from '../../src/scrapers/linkedin-rsc/scraper.js';
@@ -237,4 +238,58 @@ test('backend import feedback backs off noisy searches only once per completed r
     state.record('q', { posts: [post], newPosts: 1, requests: 1 });
     state.applyFeedback('q', { last_run_at: new Date(now).toISOString(), last_jobs_found: 1 });
     assert.equal(state.plan('q').nextDueAt, now + 30 * 60_000);
+});
+
+test('scheduled noisy query retains import backoff when the next scrape finds fresh posts', async () => {
+    let now = 1_000_000;
+    const state = new QueryState({ filePath: null, now: () => now });
+    const opts = options({ scheduledRefresh: true, queryState: state, candidateQuery: 'Business OR C2C',
+        candidateQueryId: 19, paginateImpl: async () => ({ posts: [{ ...post, activity_id: String(now) }],
+            pages: [{}], exhausted: true }) });
+    await scrapeLinkedInRsc('Analyst', 'US', 'first', opts);
+    const feedback = { last_run_at: new Date(now).toISOString(), last_jobs_found: 0 };
+    await scrapeLinkedInRsc('Analyst', 'US', 'feedback', { ...opts, queryFeedback: feedback });
+    now += 60 * 60_000;
+    const next = await scrapeLinkedInRsc('Analyst', 'US', 'second', { ...opts, queryFeedback: feedback });
+    assert.equal(next.jobs.length, 1);
+    assert.equal(Date.parse(next.nextRefreshAt), now + 60 * 60_000);
+    now += 30 * 60_000;
+    assert.equal((await scrapeLinkedInRsc('Analyst', 'US', 'too-soon', opts)).searchOutcome, 'deferred');
+});
+
+test('scheduled role searches cover a due variant before deferring and return the earliest retry', async (t) => {
+    let now = 1_000_000;
+    let requests = 0;
+    const server = http.createServer((request, response) => {
+        request.resume();
+        response.end(++requests % 2 ? flightPage(requests)
+            : '0:{"HasNoresultsBindingKey":{"booleanValue":true}}\n');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const state = new QueryState({ filePath: null, now: () => now });
+    const opts = options({ scheduledRefresh: true, queryState: state,
+        searchQueries: ['query A', 'query B'], rng: () => 0,
+        template: { url: `http://127.0.0.1:${server.address().port}`, headers: {}, postData: '{}' },
+        paginateImpl: (args) => paginate({ ...args, delay: async () => {}, fetchImpl: fetch,
+            cookies: [{ name: 'li_at', value: 'fixture' }, { name: 'JSESSIONID', value: 'fixture' }] }),
+    });
+    await scrapeLinkedInRsc('Engineer', 'US', 'first', opts);
+    now += 5 * 60_000;
+    const second = await scrapeLinkedInRsc('Engineer', 'US', 'second', opts);
+    assert.equal(second.jobs.length, 1, 'query B is due even though RNG chooses A');
+    const deferred = await scrapeLinkedInRsc('Engineer', 'US', 'third', { ...opts, rng: () => 0.99 });
+    assert.equal(deferred.searchOutcome, 'deferred');
+    assert.equal(Date.parse(deferred.nextRefreshAt), 1_000_000 + 30 * 60_000);
+    assert.equal(requests, 4, 'two full searches and no request for the deferred assignment');
+});
+
+test('explicit query cadence survives fresh posts and empty scrapes', () => {
+    let now = 1_000_000;
+    const state = new QueryState({ filePath: null, now: () => now });
+    state.record('q', { posts: [post], newPosts: 1, requests: 1, reconciled: true });
+    state.applyFeedback('q', { last_run_at: new Date(now).toISOString(), last_jobs_found: 0, interval_minutes: 45 });
+    now += 45 * 60_000;
+    state.record('q', { posts: [], newPosts: 0, requests: 1 });
+    assert.equal(state.plan('q').nextDueAt, now + 45 * 60_000);
 });

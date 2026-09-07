@@ -48,7 +48,8 @@ export class QueryState {
         const now = this.now();
         const previous = this.entries[key];
         const emptyRuns = newPosts > 0 ? 0 : Math.min((previous?.emptyRuns || 0) + 1, 4);
-        const interval = Math.min(BASE_INTERVAL_MS * (2 ** emptyRuns), MAX_INTERVAL_MS);
+        const interval = previous?.intervalMs
+            ?? Math.min(BASE_INTERVAL_MS * (2 ** Math.max(emptyRuns, previous?.lowYieldRuns || 0)), MAX_INTERVAL_MS);
         const ids = new Set(previous?.ids || []);
         for (const post of posts) {
             const id = post.activity_id || post.post_url;
@@ -57,6 +58,7 @@ export class QueryState {
         const entries = Object.fromEntries(Object.entries(this.entries).filter(([, value]) => now - value.updatedAt < TTL_MS));
         entries[key] = {
             lowYieldRuns: previous?.lowYieldRuns || 0, feedbackAt: previous?.feedbackAt, imported: previous?.imported || 0,
+            intervalMs: previous?.intervalMs ?? null,
             ids: [...ids].slice(-MAX_IDS), updatedAt: now, nextDueAt: now + interval, emptyRuns,
             reconciledAt: reconciled ? now : previous?.reconciledAt ?? null,
             runs: (previous?.runs || 0) + 1,
@@ -74,9 +76,10 @@ export class QueryState {
             || ranAt <= (entry.feedbackAt ?? -1)) return;
         const lowYieldRuns = feedback.last_jobs_found > 0 ? 0 : Math.min((entry.lowYieldRuns || 0) + 1, 3);
         const explicitInterval = Number(feedback.interval_minutes);
-        const interval = explicitInterval > 0 ? explicitInterval * 60_000
-            : Math.min(BASE_INTERVAL_MS * (2 ** lowYieldRuns), MAX_INTERVAL_MS);
-        this.#persist({ ...this.entries, [key]: { ...entry, feedbackAt: ranAt, lowYieldRuns,
+        const intervalMs = Number.isFinite(explicitInterval) && explicitInterval > 0 ? explicitInterval * 60_000 : null;
+        const interval = intervalMs
+            ?? Math.min(BASE_INTERVAL_MS * (2 ** lowYieldRuns), MAX_INTERVAL_MS);
+        this.#persist({ ...this.entries, [key]: { ...entry, feedbackAt: ranAt, lowYieldRuns, intervalMs,
             imported: (entry.imported || 0) + feedback.last_jobs_found,
             nextDueAt: ranAt + interval } });
     }
