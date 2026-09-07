@@ -3,6 +3,7 @@
 export const DEFAULT_EMPTY_THRESHOLD = 25;
 export const DEFAULT_BASE_PAUSE_MS = 5 * 60_000;
 export const DEFAULT_MAX_PAUSE_MS = 60 * 60_000;
+export const DEFAULT_EMPTY_MAX_PAUSE_MS = 15 * 60_000;
 const CONTROL_QUERIES = ['hiring', 'jobs', 'recruiting'];
 
 export function emptyThreshold(env = process.env) {
@@ -89,7 +90,7 @@ export class SearchQuotaTracker {
             // retry interval apart, corroborate an otherwise ambiguous empty.
             if (this._strikes >= 2 || outcome === 'rate_limited') {
                 this._consecutiveTrips++;
-                pauseMs = Math.min(this._basePause * 2 ** (this._consecutiveTrips - 1), this._maxPause);
+                pauseMs = this._pauseMs(outcome, this._consecutiveTrips - 1);
                 this._lastTripAt = this._now();
                 this._pausedUntil = this._now() + pauseMs;
                 tripped = true;
@@ -105,6 +106,13 @@ export class SearchQuotaTracker {
         return { tripped, pauseMs, outcome, retryAt: this._retryAt };
     }
 
+    _pauseMs(outcome, exponent) {
+        // Empty controls still cannot distinguish account restrictions from
+        // upstream search failures. Keep checking without weakening 429 backoff.
+        const cap = outcome === 'empty' ? Math.min(this._maxPause, DEFAULT_EMPTY_MAX_PAUSE_MS) : this._maxPause;
+        return Math.min(this._basePause * 2 ** exponent, cap);
+    }
+
     snapshot() {
         return {
             consecutiveEmpty: this._consecutiveEmpty, consecutiveTrips: this._consecutiveTrips,
@@ -116,7 +124,7 @@ export class SearchQuotaTracker {
             lastServedAt: this._lastServedAt === null ? null : new Date(this._lastServedAt).toISOString(),
             lastOutcome: this._lastOutcome, diagnosticDue: this._needsProbe,
             corroboratingEmpties: this._strikes,
-            nextPauseMs: Math.min(this._basePause * 2 ** this._consecutiveTrips, this._maxPause),
+            nextPauseMs: this._pauseMs(this._lastOutcome, this._consecutiveTrips),
         };
     }
 }

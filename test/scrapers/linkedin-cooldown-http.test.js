@@ -66,3 +66,56 @@ test('real HTTP empty responses cannot pause a healthy scraper after 25 narrow q
         await rm(directory, { recursive: true, force: true });
     }
 });
+
+// Session health and the credential pool are external boundaries; HTTP search
+// transport, response parsing, diagnostic decisions and admission remain real.
+for (const [status, expectedPauses] of [
+    [200, [0, 5, 10, 15, 15, 15]],
+    [429, [5, 10, 20, 40, 60, 60]],
+]) {
+    test(`HTTP ${status} recovery reports the correct cooldown and admits a retry at expiry`, async () => {
+        const empty = await readFile(new URL('../fixtures/linkedin-rsc-no-results.txt', import.meta.url), 'utf8');
+        let requests = 0, now = 1_000_000;
+        const reports = [];
+        const server = http.createServer(async (req, res) => {
+            for await (const chunk of req) { /* consume the search request */ }
+            requests++;
+            res.writeHead(status);
+            res.end(status === 200 ? empty : 'Too many requests');
+        });
+        server.listen(0, '127.0.0.1');
+        await once(server, 'listening');
+        try {
+            const tracker = new SearchQuotaTracker({ startupProbe: true, now: () => now });
+            const lease = { credential: { id: 15 },
+                reportFailure: async (_, minutes) => reports.push(minutes) };
+            const options = {
+                session: { isAlive: () => true, withCookies: async (_, fn) => fn([
+                    { name: 'li_at', value: 'test-secret' },
+                    { name: 'JSESSIONID', value: '"ajax:test"' },
+                ], lease),
+                    isRequestHealthy: async () => true, verifySearchSession: async () => true },
+                template: { url: `http://127.0.0.1:${server.address().port}/pagination`, headers: {},
+                    postData: JSON.stringify({ clientArguments: { payload: {} } }) },
+                quotaTracker: tracker, quotaAdmission: true, pacer: null,
+                queryState: null, canaryTracker: null, metrics: null,
+            };
+            const scrape = () => scrapeLinkedInRsc('Rare specialist', 'US', 'http-recovery', options);
+            for (const [index, minutes] of expectedPauses.entries()) {
+                assert.equal((await scrape()).searchOutcome, 'deferred');
+                assert.equal(requests, index + 1, 'one control request per admitted recovery');
+                if (minutes > 0) assert.equal(reports.at(-1), minutes);
+                else assert.equal(reports.length, 0, 'one empty does not report a cooldown');
+                const pauseMs = minutes === 0 ? 60_000 : minutes * 60_000;
+                assert.equal(tracker.snapshot().nextRetryAt, new Date(now + pauseMs).toISOString());
+                now += pauseMs - 1;
+                assert.equal((await scrape()).searchOutcome, 'deferred');
+                assert.equal(requests, index + 1, 'the account gate holds until cooldown expiry');
+                now++;
+            }
+            assert.deepEqual(reports, expectedPauses.filter((minutes) => minutes > 0));
+        } finally {
+            server.close();
+        }
+    });
+}

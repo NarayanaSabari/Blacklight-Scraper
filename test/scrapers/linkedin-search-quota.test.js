@@ -11,11 +11,11 @@ test('empty queries request a diagnostic without creating a cooldown', () => {
     assert.equal(q.beginSearch().recovery, true);
 });
 
-test('verified failures escalate with a cap and a successful recovery retires escalation', () => {
+test('corroborated empties retry within fifteen minutes and healthy recovery retires escalation', () => {
     let now = 1_000_000;
     const q = new SearchQuotaTracker({ now: () => now });
     assert.equal(q.finishRecovery('empty').tripped, false);
-    for (const expected of [5, 10, 20, 40, 60, 60]) {
+    for (const expected of [5, 10, 15, 15, 15, 15]) {
         now += 60 * 60_000;
         assert.equal(q.finishRecovery('empty').pauseMs, expected * 60_000);
     }
@@ -64,4 +64,40 @@ test('expired cooldown admits one diagnostic and releases the slot after failure
     assert.equal(q.beginSearch().allowed, false);
     q.endSearch();
     assert.equal(q.beginSearch().allowed, true);
+});
+
+test('explicit rate limits retain exponential backoff and the configured maximum', () => {
+    for (const [maxPause, expected] of [
+        [60 * 60_000, [5, 10, 20, 40, 60, 60]],
+        [90 * 60_000, [5, 10, 20, 40, 80, 90]],
+    ]) {
+        const q = new SearchQuotaTracker({ maxPause });
+        for (const minutes of expected) {
+            assert.equal(q.finishRecovery('rate_limited').pauseMs, minutes * 60_000);
+        }
+        assert.equal(q.snapshot().nextPauseMs, maxPause);
+    }
+});
+
+test('empty recovery stays bounded after a large rate-limit trip count without weakening later rate limits', () => {
+    let now = 1_000_000;
+    const q = new SearchQuotaTracker({ now: () => now });
+    for (let n = 0; n < 100; n++) q.finishRecovery('rate_limited');
+    const result = q.finishRecovery('empty');
+    assert.equal(result.pauseMs, 15 * 60_000);
+    assert.equal(q.snapshot().nextPauseMs, 15 * 60_000);
+    now += 15 * 60_000 - 1;
+    assert.equal(q.beginSearch().allowed, false);
+    now++;
+    assert.equal(q.beginSearch().allowed, true);
+    q.endSearch();
+    assert.equal(q.finishRecovery('rate_limited').pauseMs, 60 * 60_000);
+});
+
+test('empty recovery respects a configured maximum shorter than fifteen minutes', () => {
+    const q = new SearchQuotaTracker({ maxPause: 8 * 60_000 });
+    q.finishRecovery('empty');
+    assert.equal(q.finishRecovery('empty').pauseMs, 5 * 60_000);
+    assert.equal(q.finishRecovery('empty').pauseMs, 8 * 60_000);
+    assert.equal(q.snapshot().nextPauseMs, 8 * 60_000);
 });
