@@ -123,7 +123,8 @@ test('archive persists full posts privately without credentials and survives a n
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.equal(data.posts[0].text, post.text);
     assert.equal(JSON.stringify(data).includes('secret'), false);
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    // Windows access is governed by ACLs, not POSIX mode bits.
+    if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal((await new ScrapeArchive({ directory }).stats()).count, 1);
 });
 
