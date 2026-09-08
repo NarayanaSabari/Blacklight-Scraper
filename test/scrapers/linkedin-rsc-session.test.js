@@ -467,7 +467,7 @@ test('withCookies: concurrent roles share ONE cookie read', async () => {
     assert.equal(started, 1, 'single-flight refresh should read cookies once');
 });
 
-test('withCookies: concurrent roles with different profiles do not share a cookie read', async () => {
+test('withCookies: queued roles with different profiles read their own cookies in sequence', async () => {
     let started = 0;
     let release;
     const gate = new Promise((resolve) => { release = resolve; });
@@ -490,9 +490,10 @@ test('withCookies: concurrent roles with different profiles do not share a cooki
         session.withCookies('b', async () => 'beta'),
     ]);
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(started, 2);
+    assert.equal(started, 1, 'the second account waits until the first lease finishes');
     release();
     assert.deepEqual(await both, ['alpha', 'beta']);
+    assert.equal(started, 2, 'each account reads its own profile cookies');
 });
 
 test('withCookies: a profile with no li_at asks for a re-login', async () => {

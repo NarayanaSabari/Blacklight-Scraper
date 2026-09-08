@@ -479,3 +479,46 @@ test('runAssignment passes candidateQuery: null for an ordinary role sweep', asy
     assert.ok(seen.length >= 1);
     assert.equal(seen[0].candidateQuery, null);
 });
+
+for (const preflightFails of [false, true]) {
+    test(`LinkedIn is excluded from overlapping claims until its work settles (preflight fails: ${preflightFails})`, async () => {
+        const claims = [];
+        let releaseLinkedIn;
+        const heldLinkedIn = new Promise((resolve) => { releaseLinkedIn = resolve; });
+        const c = fakeClient({
+            checkCredentialAvailability: async () => {
+                if (preflightFails) throw new Error('availability unavailable');
+                return { linkedin: 2, indeed: 1 };
+            },
+            getNextRole: async ({ platforms }) => {
+                claims.push(platforms);
+                return { assignments: claims.length === 1 ? [{
+                    session_id: 'sess-LINKEDIN',
+                    role: { name: 'Backend Engineer', search_queries: null },
+                    platforms: [{ name: 'linkedin' }],
+                }] : [] };
+            },
+        });
+        const o = new QueueOrchestrator({
+            queueConfig: {},
+            client: c,
+            metrics: fakeMetrics(),
+            cooldownCheck: () => [],
+            platformOverrides: { pausedList: () => [] },
+            scraperResolver: () => ({ executeWithMeta: () => heldLinkedIn }),
+        });
+        try {
+            await o.runOnce();
+            await o.runOnce();
+            assert.ok(claims[0].includes('linkedin'));
+            assert.ok(!claims[1].includes('linkedin'), 'pending LinkedIn work must prevent another LinkedIn claim');
+            assert.ok(claims[1].includes('indeed'), 'other platforms must remain claimable');
+        } finally {
+            releaseLinkedIn({ jobs: [], emptyConfirmed: true });
+            await new Promise((resolve) => setImmediate(resolve));
+        }
+        await o.runOnce();
+        assert.ok(claims.at(-1).includes('linkedin'), 'settled LinkedIn work must allow the next claim');
+        assert.deepEqual(c.calls.completeSession, ['sess-LINKEDIN']);
+    });
+}

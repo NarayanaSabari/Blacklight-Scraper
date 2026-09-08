@@ -53,6 +53,7 @@ export class QueueOrchestrator {
         this._lastPollAt = null;
         this._lastPollOutcome = null;
         this._autoCheckIntervalMs = queueConfig?.checkIntervalMs ?? null;
+        // Tracks panel status and prevents overlapping LinkedIn claims.
         // sessionId -> { role, startedAt, platforms: { name: 'pending'|'success'|'failed' } }
         this._activeSessions = new Map();
         // Injection seams (default to the production singletons). Behavior-
@@ -294,6 +295,17 @@ export class QueueOrchestrator {
             usablePlatforms = [...PLATFORM_NAMES];
         }
 
+        // LinkedIn uses one active account at a time across roles.
+        // Spare backend credentials must not let another poll claim LinkedIn
+        // while this host is still scraping or submitting its current work.
+        if ([...this._activeSessions.values()].some((session) => session.platforms.linkedin === 'pending')) {
+            usablePlatforms = usablePlatforms.filter((platform) => platform !== 'linkedin');
+            if (usablePlatforms.length === 0) {
+                metrics.recordQueueCheck('skipped_busy');
+                return { assignments: [] };
+            }
+        }
+
         // Exclude platforms on a LOCAL cooldown (Cloudflare/DataDome
         // back-off markers). Without this the orchestrator keeps claiming work
         // for a cooled-down platform that then instant-fails at scrape time,
@@ -463,10 +475,8 @@ export class QueueOrchestrator {
             },
         };
 
-        // Panel-only bookkeeping (read via snapshot()) — tracks this
-        // in-flight session so the control panel can show "what's running
-        // right now" without touching the workflow itself. Removed in the
-        // `finally` below regardless of outcome.
+        // Track in-flight work for the panel and LinkedIn claim exclusion.
+        // Removed in the `finally` below regardless of outcome.
         this._activeSessions.set(sessionId, {
             role: role.name,
             startedAt: Date.now(),
@@ -484,8 +494,8 @@ export class QueueOrchestrator {
         // After EACH platform task settles (success or fail), we kick a
         // fresh poll cycle so that platform's slot doesn't sit idle
         // waiting for siblings. The mutex short-circuits if a poll is
-        // already in flight, and the backend's in-flight filter excludes
-        // platforms still mid-scrape — so over-claiming is impossible.
+        // already in flight. The backend filters in-flight work, and the
+        // local LinkedIn guard excludes its shared session while pending.
         const tasks = platforms.map(async (platformInfo) => {
             const platformName = platformInfo.name.toLowerCase();
             const scraper = this._resolveScraper(platformName);
@@ -639,7 +649,7 @@ export class QueueOrchestrator {
         }
     }
 
-    // Panel-only: record a platform's terminal state on its tracked session.
+    // Record a platform's terminal state for panel status and claim exclusion.
     // A no-op if the session isn't tracked (shouldn't happen — set at the top
     // of #runAssignment — but this must never throw into the scrape path).
     #markPlatform(sessionId, platformName, state) {

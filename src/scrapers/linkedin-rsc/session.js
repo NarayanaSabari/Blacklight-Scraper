@@ -183,6 +183,8 @@ export class LinkedInRscSession {
         // epoch", or an injected clock starting at 0 would skip the first check.
         this._templateCheckedAt = null;
         this._templateStatus = null;
+        this._preferredCredentialId = null;
+        this._accountWork = Promise.resolve();
     }
 
     /** Last observed template-freshness verdict, for the control panel. */
@@ -531,9 +533,18 @@ export class LinkedInRscSession {
      * still taken even though no browser is held for the scrape itself.
      */
     async withCookies(sessionId, fn) {
+        // Serialize the complete lease lifetime, including release and error
+        // handling. A failed search must not poison the next queued operation.
+        const operation = this._accountWork.then(() => this.#withAccount(sessionId, fn));
+        this._accountWork = operation.catch(() => {});
+        return operation;
+    }
+
+    async #withAccount(sessionId, fn) {
         let lease;
         try {
-            lease = await this._apiClient.acquire(this._platform, sessionId);
+            lease = await this._apiClient.acquire(this._platform, sessionId,
+                { preferredCredentialId: this._preferredCredentialId });
         } catch (cause) {
             throw new NetworkError(`LinkedIn credential pool unreachable: ${cause?.message ?? cause}`, {
                 platform: 'linkedin', cause,
@@ -544,6 +555,9 @@ export class LinkedInRscSession {
             err.skipNoCreds = true;
             throw err;
         }
+        // Preference never reserves or bypasses a cooldown: the backend chooses
+        // an eligible replacement, which becomes sticky until it too is unavailable.
+        this._preferredCredentialId = lease.credential?.id ?? null;
         const stopHeartbeat = this.#startHeartbeat(lease);
         try {
             const profileKey = lease.credential?.profile_key ?? null;

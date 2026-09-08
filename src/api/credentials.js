@@ -147,7 +147,7 @@ export class CredentialsClient {
 
     // ----- acquire ----------------------------------------------------------
 
-    async acquire(platform, sessionId = null) {
+    async acquire(platform, sessionId = null, { preferredCredentialId = null } = {}) {
         const metrics = getMetrics();
         if (this.isLocal) {
             const raw = getConfig().rawCredentials ?? {};
@@ -163,7 +163,12 @@ export class CredentialsClient {
             return this.#wrapLease(lease);
         }
 
-        const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+        const params = new URLSearchParams();
+        if (sessionId) params.set('session_id', sessionId);
+        if (Number.isSafeInteger(preferredCredentialId) && preferredCredentialId > 0) {
+            params.set('preferred_credential_id', String(preferredCredentialId));
+        }
+        const query = params.size ? `?${params}` : '';
         const url = `${this.apiUrl}/api/scraper-credentials/queue/${platform}/next${query}`;
 
         log.info('Fetching credential from API', { platform });
@@ -196,6 +201,8 @@ export class CredentialsClient {
         const lease = this.#issueLease(platform, credential.id, credential, sessionId);
         log.info('Credential acquired', {
             platform,
+            credentialId: credential.id,
+            sessionId,
             name: credential.name ?? credential.email ?? `id=${credential.id}`,
         });
         metrics.recordCredentialsFetch(platform, 'found');
