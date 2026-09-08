@@ -64,7 +64,7 @@ function fakeScheduler() {
 
 function makeSession({
     lease = fakeLease(), cookieReader, ttlMs = 60000, now = () => 1000,
-    templateLoader, cooldown, heartbeatMs, scheduler, isLocal,
+    templateLoader, cooldown = fakeCooldown(), heartbeatMs, scheduler, isLocal,
 } = {}) {
     const reads = { count: 0 };
     const session = new LinkedInRscSession({
@@ -301,6 +301,7 @@ test('withCookies: no credential available surfaces as a skip, not a platform fa
     // The orchestrator distinguishes this from a real scrape failure so dashboards
     // do not conflate "pool busy" with "platform broken".
     const session = new LinkedInRscSession({
+        cooldown: fakeCooldown(),
         apiClient: { acquire: async () => null },
         cookieReader: async () => JAR,
         templateLoader: () => TEMPLATE,
@@ -313,6 +314,7 @@ test('withCookies: no credential available surfaces as a skip, not a platform fa
 
 test('withCookies: an unreachable pool surfaces as NetworkError', async () => {
     const session = new LinkedInRscSession({
+        cooldown: fakeCooldown(),
         apiClient: { acquire: async () => { throw new Error('ECONNREFUSED'); } },
         cookieReader: async () => JAR,
         templateLoader: () => TEMPLATE,
@@ -363,6 +365,7 @@ test('withCookies: cookie caches are isolated by profile key', async () => {
     ];
     const reads = [];
     const session = new LinkedInRscSession({
+        cooldown: fakeCooldown(),
         apiClient: { acquire: async () => leases.shift() },
         cookieReader: async ({ profileKey }) => {
             reads.push(profileKey);
@@ -386,6 +389,7 @@ test('withCookies: a fresh cache for one profile does not satisfy another profil
     ];
     const reads = [];
     const session = new LinkedInRscSession({
+        cooldown: fakeCooldown(),
         apiClient: { acquire: async () => leases.shift() },
         cookieReader: async ({ profileKey }) => {
             reads.push(profileKey);
@@ -412,6 +416,7 @@ test('withCookies: auth failure invalidates only the affected profile cache', as
     ];
     const reads = [];
     const session = new LinkedInRscSession({
+        cooldown: fakeCooldown(),
         apiClient: { acquire: async () => leases.shift() },
         cookieReader: async ({ profileKey }) => {
             reads.push(profileKey);
@@ -476,6 +481,7 @@ test('withCookies: queued roles with different profiles read their own cookies i
         fakeLease({ credential: { id: 2, profile_key: 'beta' } }),
     ];
     const session = new LinkedInRscSession({
+        cooldown: fakeCooldown(),
         apiClient: { acquire: async () => leases.shift() },
         cookieReader: async ({ profileKey }) => {
             started++;
