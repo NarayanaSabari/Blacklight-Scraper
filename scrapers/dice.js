@@ -13,7 +13,7 @@ import { Semaphore } from '../src/core/semaphore.js';
 import { createLogger } from '../src/logger/index.js';
 import { normalizeJobData } from '../src/core/normalize.js';
 import { stripHtmlTags } from '../src/core/html.js';
-import { BlockedError, DomChangedError, NetworkError } from '../src/core/errors.js';
+import { BlockedError, BrowserError, DomChangedError, NetworkError } from '../src/core/errors.js';
 import { applyResourceBlocking } from '../src/core/resource-blocking.js';
 import { getMetrics } from '../src/metrics/registry.js';
 
@@ -223,13 +223,18 @@ const CONFIG = {
 // page.content() and the parse below have none, so without this one wedged
 // page holds a concurrency slot forever.
 const DETAIL_JOB_TIMEOUT_MS = 180_000;
+// Page.close() is the cancellation boundary for a timed-out Playwright job.
+// Keep cleanup bounded so a broken browser does not hold the detail pool
+// forever, while still waiting for normal closes before releasing a slot.
+const DETAIL_CLEANUP_TIMEOUT_MS = 5_000;
 
 /**
  * Run `worker` over every item with at most `limit` in flight.
  *
  * Rejections are contained per item: one bad detail page must not abort the
  * other 39. The worker is expected to do its own error accounting, so this
- * returns nothing.
+ * returns nothing. A worker that leaves a page pending must quarantine its
+ * shared context before returning so the semaphore cannot hide that resource.
  */
 export async function mapWithConcurrency(items, limit, worker) {
     const sem = new Semaphore(limit);
@@ -243,13 +248,137 @@ export async function mapWithConcurrency(items, limit, worker) {
     }));
 }
 
-/** Reject after `ms`, so a wedged page cannot hold its slot indefinitely. */
-export function withDeadline(promise, ms, label) {
-    let timer;
-    const deadline = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} exceeded ${ms}ms`)), ms);
+/**
+ * Round-robin selector for the shared detail contexts.
+ *
+ * A context can host more than one page, but a page whose close operation is
+ * still pending makes that context unsafe for new work. Quarantine tokens are
+ * reference-counted so two stuck pages on one context cannot release it when
+ * only the first one eventually settles.
+ */
+export function createContextPool(contexts) {
+    const entries = Array.from(contexts ?? [], (context) => ({
+        context,
+        quarantineTokens: new Set(),
+    }));
+    let nextIndex = 0;
+
+    const entryFor = (context) => entries.find((entry) => entry.context === context) ?? null;
+    const next = () => {
+        for (let i = 0; i < entries.length; i++) {
+            const entry = entries[nextIndex];
+            nextIndex = (nextIndex + 1) % entries.length;
+            if (entry.quarantineTokens.size === 0) return entry.context;
+        }
+        return null;
+    };
+    const quarantine = (context, until) => {
+        const entry = entryFor(context);
+        if (!entry) return;
+        const token = Promise.resolve(until);
+        entry.quarantineTokens.add(token);
+        token.then(
+            () => entry.quarantineTokens.delete(token),
+            () => entry.quarantineTokens.delete(token),
+        );
+    };
+    const isQuarantined = (context) => {
+        const entry = entryFor(context);
+        return Boolean(entry?.quarantineTokens.size);
+    };
+
+    return { next, quarantine, isQuarantined };
+}
+
+function boundedCleanup(cleanup, timeoutMs, label, onError = null) {
+    if (typeof cleanup !== 'function') return Promise.resolve(true);
+    const limit = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) >= 0
+        ? Number(timeoutMs)
+        : DETAIL_CLEANUP_TIMEOUT_MS;
+    return new Promise((resolve) => {
+        let settled = false;
+        let timer;
+        const finish = (completed) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(completed);
+        };
+        timer = setTimeout(() => {
+            logProgress('Dice', `Detail cleanup timed out: ${label}`);
+            finish(false);
+        }, limit);
+        Promise.resolve()
+            .then(cleanup)
+            .catch((error) => {
+                logProgress('Dice', `Detail cleanup failed: ${label} - ${error.message}`);
+                try { onError?.(error); } catch { /* cleanup reporting must not throw */ }
+            })
+            .then(() => finish(true));
     });
-    return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Close every Dice resource without allowing one wedged target to prevent the
+ * browser close attempt. Context and browser closes start together, and every
+ * target has its own bounded wait.
+ */
+export async function closeDiceResources(contexts, browser, cleanupTimeoutMs = DETAIL_CLEANUP_TIMEOUT_MS) {
+    const targets = Array.from(contexts ?? []);
+    const closeTarget = async (target, label, kind) => {
+        if (!target || typeof target.close !== 'function') return;
+        let reported = false;
+        const reportFailure = (message) => {
+            if (reported) return;
+            reported = true;
+            log.warn(`Failed to close ${kind}: ${message}`);
+            getMetrics().recordBrowserCleanupFailure('dice');
+        };
+        const completed = await boundedCleanup(
+            () => target.close(),
+            cleanupTimeoutMs,
+            label,
+            (error) => reportFailure(error?.message ?? String(error)),
+        );
+        if (!completed) reportFailure(`timed out after ${cleanupTimeoutMs}ms`);
+    };
+
+    await Promise.all([
+        ...targets.map((context, index) => closeTarget(
+            context,
+            `Dice context ${index + 1}`,
+            'context',
+        )),
+        closeTarget(browser, 'Dice browser', 'browser'),
+    ]);
+}
+
+/**
+ * Reject after `ms`, waiting for bounded timeout cleanup first. Callers that
+ * share the resource being cleaned up must keep it quarantined until its
+ * cleanup promise settles, even when this bound is reached.
+ */
+export function withDeadline(promise, ms, label, onTimeout = null, cleanupTimeoutMs = DETAIL_CLEANUP_TIMEOUT_MS) {
+    let timer;
+    let timedOut = false;
+    const timeoutError = () => new Error(`${label} exceeded ${ms}ms`);
+    const guarded = Promise.resolve(promise).then(
+        (value) => {
+            if (timedOut) return new Promise(() => {});
+            return value;
+        },
+        (error) => {
+            if (timedOut) return new Promise(() => {});
+            throw error;
+        },
+    );
+    const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            timedOut = true;
+            boundedCleanup(onTimeout, cleanupTimeoutMs, label).then(() => reject(timeoutError()));
+        }, ms);
+    });
+    return Promise.race([guarded, deadline]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -371,11 +500,11 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
             contextsToCleanup.push(ctx);
             await applyResourceBlocking(ctx);
         }
-        let ctxRR = 0;
-        const getCtx = () => { const c = jobContexts[ctxRR]; ctxRR = (ctxRR + 1) % jobContexts.length; return c; };
+        const contextPool = createContextPool(jobContexts);
 
         let domChangedCount = 0;
         let processedCount = 0;
+        let contextUnavailable = false;
 
         // ─── Why this is a plain semaphore and not CheerioCrawler ─────────
         //
@@ -414,21 +543,70 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
             processedCount++;
             logProgress('Dice', `Detail ${processedCount}/${detailUrls.length}: ${url}`);
 
+            const jobContext = contextPool.next();
+            if (!jobContext) {
+                contextUnavailable = true;
+                logProgress('Dice', `Detail skipped: no healthy context remains for ${url}`);
+                return;
+            }
+
             let pageHtml = '';
+            let jobPage = null;
+            let closePromise = null;
+            let timedOut = false;
+            let pageLifecycleDone = false;
+            let finishPageLifecycle;
+            const pageLifecycle = new Promise((resolve) => { finishPageLifecycle = resolve; });
+            const markPageLifecycleDone = () => {
+                if (pageLifecycleDone) return;
+                pageLifecycleDone = true;
+                finishPageLifecycle();
+            };
+            const closePage = () => {
+                // If newPage() is still pending, the lifecycle promise keeps
+                // this context quarantined until the late page is created and
+                // closed by the timedOut branch below.
+                if (!jobPage) return pageLifecycle;
+                if (!closePromise) {
+                    closePromise = Promise.resolve()
+                        .then(() => jobPage.close())
+                        .then(
+                            () => markPageLifecycleDone(),
+                            (error) => {
+                                // A failed close is not proof that the page is
+                                // gone. Keep the context quarantined so a
+                                // damaged target cannot receive new work.
+                                logProgress('Dice', `Detail page close failed: ${error?.message ?? String(error)}`);
+                            },
+                        );
+                }
+                return closePromise;
+            };
+            const quarantineContext = () => contextPool.quarantine(jobContext, pageLifecycle);
             try {
                 pageHtml = await withDeadline(
                     (async () => {
-                        const jobPage = await getCtx().newPage();
                         try {
+                            jobPage = await jobContext.newPage();
+                            if (timedOut) {
+                                await boundedCleanup(closePage, DETAIL_CLEANUP_TIMEOUT_MS, url);
+                                throw new Error(`Dice detail ${url} timed out before page setup`);
+                            }
                             await jobPage.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.DETAIL_NAV_TIMEOUT_MS });
                             if (CONFIG.DETAIL_RENDER_WAIT_MS > 0) await jobPage.waitForTimeout(CONFIG.DETAIL_RENDER_WAIT_MS);
                             return await jobPage.content();
-                        } finally {
-                            try { await jobPage.close(); } catch {}
+                        } catch (error) {
+                            if (!jobPage) markPageLifecycleDone();
+                            throw error;
                         }
                     })(),
                     DETAIL_JOB_TIMEOUT_MS,
                     `Dice detail ${url}`,
+                    () => {
+                        timedOut = true;
+                        quarantineContext();
+                        return closePage();
+                    },
                 );
             } catch (e) {
                 // The same disposition crawlee's handler chose: give up on this
@@ -437,6 +615,11 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
                 // domChangedCount would trip the batch gate on a bad network.
                 logProgress('Dice', `Detail nav failed: ${url} - ${e.message}`);
                 return;
+            } finally {
+                if (!timedOut) {
+                    quarantineContext();
+                    await boundedCleanup(closePage, DETAIL_CLEANUP_TIMEOUT_MS, url);
+                }
             }
 
             const $job = cheerio.load(pageHtml);
@@ -491,6 +674,13 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
             logProgress('Dice', `✅ ${row.title} at ${row.company} (total ${collectedJobs.length})`);
         });
 
+        if (contextUnavailable) {
+            throw new BrowserError(
+                'Dice detail contexts exhausted while a page was still pending cleanup',
+                { platform: 'dice' },
+            );
+        }
+
         // Batch-level DOM-changed gate.
         if (processedCount > 0) {
             const rate = domChangedCount / processedCount;
@@ -509,15 +699,6 @@ export async function scrapeDice(jobTitle, location, sessionId = null) {
         if (collectedJobs.length === 0) return { jobs: [], emptyConfirmed: true };
         return collectedJobs;
     } finally {
-        for (const ctx of contextsToCleanup) {
-            try { await ctx.close(); } catch (err) {
-                log.warn(`Failed to close context: ${err.message}`);
-                getMetrics().recordBrowserCleanupFailure('dice');  // feeds BrowserLeakDetected (audit H1)
-            }
-        }
-        try { await browser.close(); } catch (err) {
-            log.warn(`Failed to close browser: ${err.message}`);
-            getMetrics().recordBrowserCleanupFailure('dice');  // feeds BrowserLeakDetected (audit H1)
-        }
+        await closeDiceResources(contextsToCleanup, browser);
     }
 }

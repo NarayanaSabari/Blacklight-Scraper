@@ -5,7 +5,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { dedupeUrls, mapWithConcurrency, withDeadline } from '../../scrapers/dice.js';
+import {
+    closeDiceResources,
+    createContextPool,
+    dedupeUrls,
+    mapWithConcurrency,
+    withDeadline,
+} from '../../scrapers/dice.js';
 
 const tick = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -100,4 +106,171 @@ test('withDeadline: clears its timer so it cannot hold the event loop open', asy
     await withDeadline(Promise.resolve('done'), 60_000, 'x');
     const after = process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
     assert.equal(after, before);
+});
+
+test('withDeadline: waits for a timed-out page to close before releasing its slot', async () => {
+    const events = [];
+    const page = {
+        close: async () => {
+            events.push('close:start');
+            await tick(15);
+            events.push('close:end');
+        },
+    };
+
+    await mapWithConcurrency(['stuck', 'next'], 1, async (item) => {
+        if (item === 'stuck') {
+            await assert.rejects(
+                withDeadline(
+                    new Promise(() => {}),
+                    5,
+                    'Dice detail stuck',
+                    () => page.close(),
+                    100,
+                ),
+                /Dice detail stuck exceeded 5ms/,
+            );
+            events.push('stuck:released');
+            return;
+        }
+        events.push('next:started');
+    });
+
+    assert.deepEqual(events, ['close:start', 'close:end', 'stuck:released', 'next:started']);
+});
+
+test('withDeadline: a page rejection after timeout cannot bypass cleanup', async () => {
+    const events = [];
+    let rejectPage;
+    const pageOperation = new Promise((_, reject) => { rejectPage = reject; });
+
+    const result = withDeadline(
+        pageOperation,
+        5,
+        'Dice detail stuck',
+        async () => {
+            events.push('close:start');
+            await tick(15);
+            events.push('close:end');
+        },
+        100,
+    );
+    setTimeout(() => rejectPage(new Error('page closed')), 8);
+
+    await assert.rejects(result, /Dice detail stuck exceeded 5ms/);
+    assert.deepEqual(events, ['close:start', 'close:end']);
+});
+
+test('withDeadline: bounds a hung page cleanup instead of holding the slot forever', async () => {
+    const started = Date.now();
+    await assert.rejects(
+        withDeadline(
+            new Promise(() => {}),
+            5,
+            'Dice detail stuck',
+            () => new Promise(() => {}),
+            20,
+        ),
+        /Dice detail stuck exceeded 5ms/,
+    );
+    assert.ok(Date.now() - started < 100, 'hung page cleanup exceeded its bound');
+});
+
+test('a timed-out page quarantines its context until the page is gone', async () => {
+    const stuckContext = { name: 'stuck' };
+    const healthyContext = { name: 'healthy' };
+    const contexts = createContextPool([stuckContext, healthyContext]);
+    let releasePage;
+    const pageClosed = new Promise((resolve) => { releasePage = resolve; });
+    const selected = contexts.next();
+
+    contexts.quarantine(selected, pageClosed);
+    assert.equal(contexts.isQuarantined(stuckContext), true);
+    assert.equal(contexts.next(), healthyContext, 'healthy context remains available');
+    assert.equal(contexts.next(), healthyContext, 'quarantined context is not reused');
+
+    const singleContext = createContextPool([stuckContext]);
+    singleContext.quarantine(stuckContext, pageClosed);
+    assert.equal(singleContext.next(), null, 'a quarantined context supplies no replacement capacity');
+
+    releasePage();
+    await pageClosed;
+    await tick(0);
+    assert.equal(contexts.isQuarantined(stuckContext), false);
+    assert.equal(contexts.next(), stuckContext, 'context returns after the page closes');
+});
+
+test('the next detail job skips a context whose timed-out page is still alive', async () => {
+    const stuckContext = { name: 'stuck' };
+    const healthyContext = { name: 'healthy' };
+    const contexts = createContextPool([stuckContext, healthyContext]);
+    const started = [];
+    let releasePage;
+    const pageClosed = new Promise((resolve) => { releasePage = resolve; });
+    const stuckPage = { close: () => pageClosed };
+
+    await mapWithConcurrency(['stuck', 'next'], 1, async (item) => {
+        const context = contexts.next();
+        started.push([item, context.name]);
+        if (item !== 'stuck') return;
+
+        await assert.rejects(
+            withDeadline(
+                new Promise(() => {}),
+                5,
+                'Dice detail stuck',
+                () => {
+                    const cleanup = stuckPage.close();
+                    contexts.quarantine(context, cleanup);
+                    return cleanup;
+                },
+                10,
+            ),
+            /Dice detail stuck exceeded 5ms/,
+        );
+    });
+
+    assert.deepEqual(started, [['stuck', 'stuck'], ['next', 'healthy']]);
+    releasePage();
+    await pageClosed;
+    await tick(0);
+    assert.equal(contexts.next(), stuckContext, 'the recovered context is reusable');
+});
+
+test('a shared context stays quarantined until every pending page is gone', async () => {
+    const stuckContext = { name: 'stuck' };
+    const healthyContext = { name: 'healthy' };
+    const contexts = createContextPool([stuckContext, healthyContext]);
+    let releaseFirst;
+    let releaseSecond;
+    const firstPage = new Promise((resolve) => { releaseFirst = resolve; });
+    const secondPage = new Promise((resolve) => { releaseSecond = resolve; });
+
+    contexts.quarantine(stuckContext, firstPage);
+    contexts.quarantine(stuckContext, secondPage);
+    releaseFirst();
+    await firstPage;
+    await tick(0);
+
+    assert.equal(contexts.isQuarantined(stuckContext), true);
+    assert.equal(contexts.next(), healthyContext);
+
+    releaseSecond();
+    await secondPage;
+    await tick(0);
+    assert.equal(contexts.isQuarantined(stuckContext), false);
+});
+
+test('outer cleanup attempts the browser even when a context close hangs', async () => {
+    const events = [];
+    const hangingContext = { close: () => new Promise(() => {}) };
+    const healthyContext = { close: async () => { events.push('healthy-context'); } };
+    const browser = { close: async () => { events.push('browser'); } };
+
+    const started = Date.now();
+    await closeDiceResources([hangingContext, healthyContext], browser, 20);
+
+    assert.equal(events.includes('healthy-context'), true);
+    assert.equal(events.includes('browser'), true, 'browser close must be attempted independently');
+    assert.ok(Date.now() - started < 100, 'hung context cleanup exceeded its bound');
 });
