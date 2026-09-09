@@ -15,38 +15,69 @@ import { PLATFORM_NAMES } from '../scrapers/registry.js';
 
 const log = createLogger('panel:overrides');
 
-// Built-in sweep cadences, in minutes. Indeed was slowed first: measured
-// 2026-08-03 it re-scraped every role every ~5.1 min for a 0.29% import rate
-// (344 scraped records per import, vs Dice's 4), because 69.4% of what came
-// back was `duplicate_platform_id`. Import volume tracks how fast a board
-// publishes, not how often we ask.
+// Built-in sweep cadences, in minutes.
 //
-// Dice and TechFetch have since fallen into exactly the same hole. Measured
-// over 2026-08-05→08 on prod `session_platform_status`:
+// Indeed: measured 2026-08-03 it re-scraped every role every ~5.1 min for a
+// 0.29% import rate (344 scraped records per import, vs Dice's 4), because
+// 69.4% of what came back was `duplicate_platform_id`. Import volume tracks how
+// fast Indeed publishes, not how often we ask.
 //
-//   platform    runs    found     imported   yield
-//   dice        4,654   153,951   3,438      2.2%
-//   techfetch   2,424    93,460     930      1.0%
-//   indeed      1,444    53,274   14,715    27.6%   ← already on a cadence
+// LinkedIn: metered differently, and the constraint is not waste but ACCESS.
+// LinkedIn quotas content search and stops serving it entirely past some
+// volume. Production 2026-08-18/19 ran ~250-290 scrapes/hour and lost search
+// twice, for 2-3 hours each time, on both accounts simultaneously:
 //
-// Dice was at 24.9% when the Indeed cadence was written; it is at 2.2% now.
-// An hour between sweeps is the cadence that fixed Indeed, and hourly is well
-// inside how fast either board publishes, so the same number is used here
-// rather than inventing a second one. The cost of being wrong is bounded and
-// visible: a lower import count per day, adjustable from the control panel
-// with no restart.
+//   19:00  135 -> 1224 posts     00:00  208 -> 5689 posts
+//   20:00  231 ->  781           01:00  279 -> 1106
+//   21:00  285 ->    0           02:00  248 -> 2457
+//   22:00  285 ->    0           03:00  288 ->    0
+//   23:00  286 ->    0           04:00  131 ->    0
 //
-// LinkedIn is deliberately left on every-cycle - it serves candidate boolean
-// queries whose whole value is freshness, and it is seat-limited anyway.
+// Note 00:00: 208 scrapes returned 5689 posts, while 285-288 scrapes returned
+// nothing at all. Asking harder was not just wasteful, it was counterproductive
+// — the hours that yielded most were the ones that asked least.
+//
+// 30 minutes puts a full ~154-row sweep at roughly 2 passes/hour rather than
+// continuous re-claiming, which lands well under the level that tripped the
+// quota while still being far fresher than the 24h window LinkedIn's own
+// `past-24h` filter covers. The search-quota back-off
+// (scrapers/linkedin-rsc/search-quota.js) is the safety net beneath this; the
+// cadence is what should keep us from needing it.
 //
 // Precedence: an explicit value in platform-overrides.json (set from the
 // control panel) > env SCRAPE_INTERVAL_<PLATFORM>_MINUTES > this default.
 // A stored 0 means "the operator deliberately turned the cadence OFF" and is
-// NOT re-defaulted.
+// NOT re-defaulted — so raising a default here does NOT change a host that
+// already has an explicit 0 on disk. That host must be updated through the
+// panel, or the stored value removed.
+// Dice and TechFetch: browser platforms, and the constraint is the LICENCE
+// SEAT, not the site's tolerance. There are 2 CloakBrowser seats, and only
+// browser-bound platforms compete for them (Indeed is a plain HTTP API and
+// LinkedIn's RSC transport is HTTP after a brief cookie read).
+//
+// Left uncapped, a browser platform re-claims continuously. Measured on the
+// live host 2026-08-21 with dice HEALTHY: ~18s per session, i.e. ~200
+// sessions/hour, holding a seat for essentially all of it. The failure mode is
+// far worse: on 2026-08-20, while dice was being served empty pages, it turned
+// over a session every ~1.3s and burned 124 failed sessions in two minutes,
+// with techfetch relaunching its browser every ~3s. Between them they pinned
+// both seats, which starves every other browser platform AND the panel's
+// LinkedIn login, which needs a free seat to open a window.
+//
+// 20 minutes is derived from the seat budget, not picked for roundness. A full
+// pass over the ~154-row queue at ~18s/session is ~46 minutes of seat time per
+// platform; with two browser platforms sharing 2 seats, a 20-minute cadence
+// keeps each one's passes from overlapping continuously while still refreshing
+// well inside the 7-day `postedDate` window dice searches. Dice's import rate
+// is also the highest of any platform (~4 scraped records per import vs
+// Indeed's 344), so its results are worth refreshing more often than Indeed's
+// hourly sweep - hence 20 rather than 60.
+//
+// This is a floor on how often a sweep STARTS, not a rate limit on requests
+// within one. It does not replace per-platform backoff: it bounds the steady
+// state, and a platform that is genuinely failing still needs its own cooldown.
 export const DEFAULT_SWEEP_INTERVAL_MINUTES = Object.freeze({
-    indeed: 60,
-    dice: 60,
-    techfetch: 60,
+    indeed: 60, linkedin: 30, dice: 20, techfetch: 20,
 });
 
 function envInterval(platform, env = process.env) {

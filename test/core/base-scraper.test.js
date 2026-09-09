@@ -65,3 +65,36 @@ test('legacy two-arg constructor still works (backward compat)', () => {
     const s = new BaseScraper('monster', async () => []);
     assert.equal(s.platform, 'monster');
 });
+
+test('up-to-date empty → success, no zero-jobs alert, even under strictEmpty', async () => {
+    // A LinkedIn sweep that reached posts it already forwarded returns zero
+    // jobs. Without the upToDate signal that is indistinguishable from the
+    // silent-block signature, and strictEmpty would throw on every healthy
+    // incremental sweep — which would make higher cadence unusable.
+    const m = fakeMetrics();
+    const s = new BaseScraper('linkedin', async () => ({ jobs: [], upToDate: true }), {
+        metrics: m, strictEmpty: true,
+    });
+    const out = await s.execute('node', 'remote', 'sess-utd');
+    assert.deepEqual(out, []);
+    assert.equal(m.calls.session[0][1], 'success');
+    assert.equal(m.calls.zero.length, 0, 'up-to-date must not raise the zero-jobs alert');
+});
+
+test('up-to-date reports confirmed-empty on the wire so the backend trusts the zero', async () => {
+    const s = new BaseScraper('linkedin', async () => ({ jobs: [], upToDate: true }), {
+        metrics: fakeMetrics(),
+    });
+    const meta = await s.executeWithMeta('node', 'remote', 'sess-utd2');
+    assert.equal(meta.emptyConfirmed, true);
+    assert.equal(meta.upToDate, true);
+});
+
+test('upToDate is ignored when jobs came back', async () => {
+    const s = new BaseScraper('linkedin', async () => ({ jobs: [{ id: 1 }], upToDate: true }), {
+        metrics: fakeMetrics(),
+    });
+    const meta = await s.executeWithMeta('node', 'remote', 'sess-utd3');
+    assert.equal(meta.emptyConfirmed, false);
+    assert.equal(meta.upToDate, false);
+});

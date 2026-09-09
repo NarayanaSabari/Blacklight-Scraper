@@ -8,6 +8,7 @@ import {
     scrapeLinkedInRsc,
     postToJob,
 } from '../../src/scrapers/linkedin-rsc/scraper.js';
+import { CanaryTracker } from '../../src/scrapers/linkedin-rsc/canary.js';
 import { formatJobForBlacklight } from '../../src/core/format.js';
 
 const POST = {
@@ -207,6 +208,10 @@ test('scrapeLinkedInRsc: a candidate query beats the role variant pick', async (
             template: { url: 'https://x', headers: {}, postData: '{}' },
             searchQueries: ['variant one', 'variant two', 'variant three'],
             candidateQuery: CANDIDATE_QUERY,
+            // Pinned so the shared module-level tracker cannot reach its
+            // threshold and fire a canary probe mid-loop; the probe's control
+            // query is not a variant pick and would otherwise show up here.
+            canaryTracker: new CanaryTracker({ threshold: Number.MAX_SAFE_INTEGER }),
             paginateImpl: async ({ keywords }) => {
                 seen.push(keywords);
                 return { posts: [], emptyConfirmed: true, pages: [] };

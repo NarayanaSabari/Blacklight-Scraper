@@ -13,13 +13,15 @@ function fakePage({ finalUrl, gotoError } = {}) {
     };
 }
 
-function fakeContext({ page, cookies, cookiesError, closeError } = {}) {
+function fakeContext({ page, cookies, cookiesError, closeError, addCookiesError } = {}) {
     const p = page ?? fakePage();
     const ctx = {
         closed: false,
+        added: [],
         pages: () => [p],
         newPage: async () => p,
         cookies: async () => { if (cookiesError) throw cookiesError; return cookies ?? [{ name: 'li_at', value: 'x' }]; },
+        addCookies: async (list) => { if (addCookiesError) throw addCookiesError; ctx.added.push(...list); },
         close: async () => { if (closeError) throw closeError; ctx.closed = true; },
     };
     return ctx;
@@ -54,10 +56,56 @@ test('openLoginBrowser: a profileKey routes through the per-account profile laun
 
 test('captureSession: returns cookies on success, never throws on failure', async () => {
     const ok = await captureSession({ context: fakeContext({ cookies: [{ name: 'li_at' }] }) });
-    assert.deepEqual(ok, { cookies: [{ name: 'li_at' }], error: null });
+    assert.deepEqual(ok, { cookies: [{ name: 'li_at' }], persisted: 0, error: null });
 
     const failed = await captureSession({ context: fakeContext({ cookiesError: new Error('closed') }) });
-    assert.deepEqual(failed, { cookies: [], error: 'closed' });
+    assert.deepEqual(failed, { cookies: [], persisted: 0, error: 'closed' });
+});
+
+test('captureSession: a session-only JSESSIONID is re-added with an explicit expiry', async () => {
+    // docs/TROUBLESHOOTING.md: LinkedIn sometimes issues JSESSIONID with
+    // expires -1 and Chromium drops it on close. The RSC transport needs it
+    // as the csrf token, so a fresh onboarding would be dead on first scrape
+    // (observed live onboarding pool account #2, 2026-08-17).
+    const ctx = fakeContext({
+        cookies: [
+            { name: 'li_at', value: 'x', domain: '.www.linkedin.com', expires: 1e10 },
+            { name: 'JSESSIONID', value: '"ajax:1"', domain: '.www.linkedin.com', expires: -1 },
+        ],
+    });
+    const { error, persisted } = await captureSession({ context: ctx, now: () => 1_000_000_000_000 });
+    assert.equal(error, null);
+    assert.equal(persisted, 1, 'the response must report the persist so operators can verify without a profile read');
+    assert.equal(ctx.added.length, 1);
+    assert.equal(ctx.added[0].name, 'JSESSIONID');
+    assert.equal(ctx.added[0].value, '"ajax:1"');
+    assert.ok(ctx.added[0].expires > 1_000_000_000, 'must carry an explicit future expiry');
+});
+
+test('captureSession: an already-persistent JSESSIONID is left alone', async () => {
+    const ctx = fakeContext({
+        cookies: [{ name: 'JSESSIONID', value: '"ajax:1"', domain: '.www.linkedin.com', expires: 1e10 }],
+    });
+    await captureSession({ context: ctx });
+    assert.equal(ctx.added.length, 0);
+});
+
+test('captureSession: non-LinkedIn JSESSIONID is never touched', async () => {
+    const ctx = fakeContext({
+        cookies: [{ name: 'JSESSIONID', value: 'z', domain: '.other.example', expires: -1 }],
+    });
+    await captureSession({ context: ctx });
+    assert.equal(ctx.added.length, 0);
+});
+
+test('captureSession: a persist failure is reported without discarding the jar', async () => {
+    const ctx = fakeContext({
+        cookies: [{ name: 'JSESSIONID', value: 'v', domain: '.www.linkedin.com', expires: -1 }],
+        addCookiesError: new Error('context closing'),
+    });
+    const { cookies, error } = await captureSession({ context: ctx });
+    assert.equal(cookies.length, 1, 'jar survives');
+    assert.match(error, /persist failed/);
 });
 
 test('validateSession: landing on the feed is a pass', async () => {

@@ -95,6 +95,189 @@ node -e "import('./src/scrapers/linkedin-rsc/session.js').then(async m=>{ \
 with an explicit expiry before closing the context. Only the lifetime changes, not the value.
 Verify by reopening the profile cold and reading the jar again.
 
+## LinkedIn: search stops for a few hours, then comes back on its own
+
+**Symptom.** Every LinkedIn scrape returns 0, on **both** accounts, starting within the same
+minute. The template checks out as fresh. A few hours later it starts working again with no
+intervention.
+
+**This is a search quota, not a ban.** LinkedIn meters content search separately from the rest of
+the site. Past some volume it stops serving search while leaving the account otherwise completely
+functional. Confirm with `node scripts/linkedin-browser-check.js`: during a quota window the feed
+and notifications render normally and the account is clearly logged in, but search shows
+"No results found".
+
+Measured 2026-08-18/19 (scrapes issued per hour, and posts returned):
+
+| Hour (UTC) | Scrapes | Posts | |
+|---|---|---|---|
+| 19:00 | 135 | 1224 | serving |
+| 20:00 | 231 | 781 | serving |
+| 21-23 | ~285 | 0 | refusing |
+| 00:00 | 208 | 5689 | serving, recovered by itself |
+| 01:00 | 279 | 1106 | serving |
+| 02:00 | 248 | 2457 | serving |
+| 03-04 | ~288 | 0 | refusing |
+
+Note the shape: the hours that returned the **most** are the ones that asked **least**. 208
+scrapes returned 5,689 posts; 288 returned nothing. Pushing harder is not merely wasteful here,
+it is counterproductive.
+
+**How to tell it apart from the two lookalikes:**
+
+| Template fresh? | Browser sees posts? | Both accounts at once? | Cause |
+|---|---|---|---|
+| no | yes | yes | stale template (see the section above) |
+| yes | yes | no | that one account is restricted |
+| yes | **no** | **yes** | **search quota - this section** |
+
+**It handles itself now.** After 25 consecutive empty scrapes across all credentials, the scraper
+writes the LinkedIn platform cooldown marker and stops claiming work for 30 minutes, doubling on
+repeat trips up to 4 hours, decaying after a clean period. The control panel shows a warn alert
+naming the accounts as fine, and `scraper_linkedin_quota_pauses_total` counts the trips.
+
+**If it keeps tripping, lower the cadence — do not touch the accounts.** The sweep interval is the
+control that matters: `linkedin` defaults to 30 minutes
+(`DEFAULT_SWEEP_INTERVAL_MINUTES` in `src/panel/overrides.js`), but a stored value in
+`config/platform-overrides.json` overrides it, and a stored `0` means "no cadence limit at all",
+which is what produced the ~285 scrapes/hour above. Check that file first.
+
+## The quota pause keeps re-arming and never recovers
+
+**Symptom.** `searchQuota` on the panel shows a high `consecutiveTrips` (5, 9, ...), `pausedUntil`
+several hours out and `nextPauseMs` pinned at the 4-hour ceiling, and it does not clear on its own.
+Observed 2026-08-19/20: trips climbed 3 -> 9 overnight and the host sat idle for 8.6 hours.
+
+**Check `sessionAlive` first.** A dead session returns a *confirmed empty* for every query, which is
+byte-identical to a quota refusal. The quota tracker cannot tell them apart, so an unauthenticated
+host manufactures a platform-wide pause out of its own dead session, and each expiry re-trips and
+doubles again. The tell is **`lastServedAt: null`** - a genuine quota window follows a period of
+being served, so a tracker that has never once been served is describing a broken host, not a quota.
+
+Two alerts firing together is the giveaway, and they contradict each other:
+
+```
+ERROR  LinkedIn needs re-login - profile exists but the session is not alive.
+WARN   LinkedIn search quota hit ... "The accounts are fine; LinkedIn is metering search."
+```
+
+**Recovery.** Re-login, then clear the marker and restart - all three, in that order:
+
+```powershell
+Remove-Item $env:USERPROFILE\.blacklight-linkedin-cooldown -Force
+```
+
+The marker is on disk and outlives the process, and the trip count is in memory and outlives the
+marker, so neither a restart alone nor deleting the marker alone is enough.
+
+**Beware: two writers share that one marker file.** `search-quota.js` (quota back-off) and
+`session.js` (auth cooldown) both write `~/.blacklight-linkedin-cooldown`, and the write is
+last-one-wins. A quota pause can bury the auth cooldown, which is how the "run `npm run
+linkedin:login`" instruction goes missing while the host sits idle with a dead session.
+
+**`sessionAlive: false` immediately after a restart is normal.** `isAlive()` reads an in-memory
+cookie cache that is empty until the first LinkedIn scrape populates it. Judge it after a sweep has
+run, not at boot.
+
+## A platform fails every session and hammers the site
+
+**Symptom.** One platform's `sessions_total{result="failed"}` climbs by hundreds in minutes.
+Measured 2026-08-20: dice logged a fresh search every ~1.3 seconds and burned **124 failed sessions
+in about two minutes**, while techfetch relaunched CloakBrowser every ~3 seconds. Between them they
+held both licence seats, starving every other browser platform.
+
+**Cause.** `DEFAULT_SWEEP_INTERVAL_MINUTES` (`src/panel/overrides.js`) only defines `indeed` and
+`linkedin`. A platform with no cadence re-claims continuously, so a platform that fails fast retries
+as fast as it can fail.
+
+**Do not diagnose this as an IP block without testing.** Fetch the same URL three ways - it takes a
+minute and it eliminated the obvious wrong answer immediately:
+
+```powershell
+# on the host itself
+(Invoke-WebRequest "https://www.dice.com/jobs?q=Agile+Coach&location=United+States").Content `
+  | Select-String -Pattern "/job-detail/" -AllMatches
+```
+
+On 2026-08-20 that returned **103 job links from m1's own IP**, identical to a laptop on a different
+network, while the same search through CloakBrowser returned **zero anchors**. The IP was fine and
+the site was up; only the browser path was being served empty. That points at the browser
+fingerprint, not the network, and it is the opposite of what "every session fails" suggests.
+
+**Then wait before you fix anything.** Both platforms recovered on their own overnight with no code
+change: re-checked 2026-08-21, dice ran 12/12 successful sessions for 380 jobs and techfetch 2/2 for
+80, all accepted. The failure was transient - browser-side and self-clearing, the same shape as the
+LinkedIn content-search block a few sections up.
+
+So the ordering that actually works is: prove the IP is fine with the fetch above, pause the
+platform, and re-test in the morning. Only chase the fingerprint if it is *still* failing then. A
+day of "every session fails" is not by itself evidence of a defect, and dice's page classifier
+(`classifyDiceSearchPage`) already refuses to call a zero-anchor page a confirmed empty - it raises
+`dom_changed` or `network_error` instead, so a silent block does not reach the backend as truth.
+
+**Stopgap:** pause the platform from the panel. A platform that fails every session is worth less
+than idle, because it is also consuming the licence seats LinkedIn's login needs.
+
+## LinkedIn: every query is empty and the accounts get "shadow-banned"
+
+**This is the highest-cost failure in this file. Read it before you touch a credential.**
+
+**Symptom.** Every LinkedIn scrape returns `posts: 0, emptyConfirmed: true`, including searches
+that obviously have results. Shortly afterwards the canary reports one or both accounts as
+shadow-banned and cools them for hours, and the pipeline goes to zero.
+
+**It is almost certainly NOT a ban.** The captured RSC request template carries LinkedIn's client
+build number (`x-li-application-version`). LinkedIn ships new builds continuously, and once the
+captured one falls a few hundred builds behind, the pagination endpoint stops honouring the
+request. It does not return an error: it returns `200` with a well-formed "No results found" page
+carrying the positive no-results flag. That is byte-for-byte the shape of a genuine empty, so
+every layer above it draws the wrong conclusion.
+
+Measured 2026-08-18: template captured at `0.2.6546` on 07-31, LinkedIn live on `0.2.6815`, a lag
+of 269 builds. Every query empty from 15:00 UTC. Both credentials falsely cooled for four hours
+each. Five hours at zero ingest. A browser on the same profile, at the same moment, saw live
+posts.
+
+**Diagnose in one command:**
+
+```bash
+node scripts/linkedin-template-status.js     # captured vs live version + verdict
+```
+
+**If that is inconclusive, settle it definitively:**
+
+```bash
+node scripts/linkedin-browser-check.js       # what a REAL browser sees on this profile
+```
+
+The browser check is the tie-breaker, because it removes our request from the equation:
+
+| Browser sees | HTTP transport sees | Meaning | Action |
+|---|---|---|---|
+| posts | nothing | our REQUEST is refused | re-capture the template |
+| nothing | nothing | the ACCOUNT is restricted | quiet time; do not re-login |
+| login wall | nothing | the SESSION is dead | `npm run linkedin:login` |
+
+**Fix:**
+
+```bash
+npm run linkedin:rsc-template                # re-capture
+# then restart via the control panel so the new template is loaded
+```
+
+Then clear any cooldown the canary applied, because it was a false positive: set the affected
+`scraper_credentials` rows back to `available` with a null `cooldown_until`.
+
+**This should now self-heal.** The daemon checks template freshness every four hours and
+re-captures automatically, the canary refuses to report a ban while the template looks stale, and
+the control panel raises an explicit alert naming both versions. The manual steps above are the
+fallback for when that machinery itself fails - watch for
+`scraper_alert: linkedin_template_recapture_failed`.
+
+**Why the cost is asymmetric.** Re-capturing a healthy template costs one browser launch. Wrongly
+cooling a healthy account costs four hours of that account's throughput and sends every
+subsequent diagnosis in the wrong direction. When in doubt, re-capture first.
+
 ## Everything returns 0 and the profile looks logged in
 
 Cookies can be *present* and still be dead. `li_at` in the jar proves nothing on its own.

@@ -49,6 +49,7 @@ function sendLoginError(res, error, fallbackLogMessage) {
  * @param {{list: () => Array}} deps.recent
  * @param {() => Promise<void>} deps.requestRestart - the SAME graceful shutdown server.js wires to SIGINT/SIGTERM
  * @param {import('./linkedin-login-controller.js').LinkedInLoginController} deps.loginController
+ * @param {() => object} [deps.quotaStatus] - live LinkedIn search-quota state
  */
 export function registerPanelRoutes(app, deps) {
     const statusDeps = () => ({
@@ -62,6 +63,7 @@ export function registerPanelRoutes(app, deps) {
         overrides: deps.overrides,
         recent: deps.recent,
         loginController: deps.loginController,
+        quotaStatus: deps.quotaStatus,
     });
 
     app.get('/panel', panelAccessGuard, (_req, res) => {

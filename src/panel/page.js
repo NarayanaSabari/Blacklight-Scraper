@@ -56,6 +56,7 @@ header .muted { color: var(--muted); font-size: 12px; }
 }
 .alert.error { background: rgba(232, 85, 90, 0.12); border-color: var(--error); color: #ffb0b3; }
 .alert.warn { background: rgba(232, 179, 57, 0.12); border-color: var(--warn); color: #f2cd7c; }
+.alert.info { background: rgba(139, 147, 163, 0.12); border-color: var(--muted); color: #c3c9d6; }
 main {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -281,15 +282,57 @@ function renderLinkedin(linkedin) {
             : pill('FAILED: ' + (login.lastVerdict.reason || 'unknown reason'), 'error');
     }
 
+    // Template freshness. Three distinct states an operator must be able to
+    // tell apart:
+    //
+    //   1. checked AND healthy (stale: false, liveUnknown: false)
+    //      -> green pill, show lag and live version
+    //   2. checked but BLIND   (stale: false, liveUnknown: true)
+    //      -> amber pill, age is the only guard
+    //   3. stale               (stale: true)
+    //      -> red pill, re-capture needed
+    //   4. never checked yet   (template === null)
+    //      -> muted pill
+    //
+    // State 2 is the one that caused the 2026-08-20 production confusion: it
+    // looked identical to state 1 in the old rendering (both showed "fresh").
+    let templatePill;
+    let templateDetail = '';
+    const t = linkedin.template;
+    if (!t) {
+        templatePill = pill('not yet checked', 'muted');
+    } else if (t.stale) {
+        templatePill = pill('STALE', 'error');
+        templateDetail = esc(t.captured || '?') + ' vs live ' + esc(t.live || '?')
+            + ' (' + esc(t.lag != null ? t.lag + ' builds behind' : 'unknown lag') + ')';
+    } else if (t.liveUnknown) {
+        templatePill = pill('blind — cannot measure', 'warn');
+        templateDetail = 'captured ' + esc(t.captured || '?')
+            + ', age ' + (t.ageMs != null ? esc(Math.round(t.ageMs / 3_600_000) + 'h') : '?')
+            + ' (live version unavailable)';
+    } else {
+        templatePill = pill('current', 'ok');
+        templateDetail = 'captured ' + esc(t.captured || '?')
+            + ', live ' + esc(t.live || '?')
+            + (t.lag != null ? ', ' + esc(t.lag) + ' builds behind' : '');
+    }
+
     el('linkedin').innerHTML =
         '<dt>Session</dt><dd>' + (linkedin.sessionAlive ? pill('alive', 'ok') : pill('dead', 'error')) + '</dd>' +
         '<dt>Profile dir</dt><dd>' + esc(linkedin.profileDir || '—') + '</dd>' +
         '<dt>Profile exists</dt><dd>' + esc(linkedin.profileDirExists) + '</dd>' +
-        '<dt>Needs relogin</dt><dd>' + (linkedin.needsRelogin ? pill('yes', 'error') : pill('no', 'ok')) + '</dd>' +
+        // Three states, not two. An unknown state means the cookie cache aged
+        // out during a cooldown, which says nothing about the account - showing
+        // that as a confident 'no' is as wrong as showing it as 'yes'.
+        '<dt>Needs relogin</dt><dd>' + (linkedin.needsRelogin
+            ? pill('yes', 'error')
+            : linkedin.sessionUnknown ? pill('unknown (cooled down)', 'muted') : pill('no', 'ok')) + '</dd>' +
         '<dt>Login state</dt><dd>' + loginStatePill(state) + '</dd>' +
         '<dt>Login profile</dt><dd>' + esc(login.profileDir || '—') + (login.profileKey ? ' (' + esc(login.profileKey) + ')' : '') + '</dd>' +
         '<dt>Last verdict</dt><dd>' + verdict + '</dd>' +
-        '<dt>Last error</dt><dd>' + esc(login.lastError || '—') + '</dd>';
+        '<dt>Last error</dt><dd>' + esc(login.lastError || '—') + '</dd>' +
+        '<dt>Template</dt><dd>' + templatePill + (templateDetail ? ' ' + templateDetail : '') + '</dd>' +
+        '<dt>Template checked</dt><dd>' + esc(t ? fmtDate(t.checkedAt) : '—') + '</dd>';
 
     const actions = el('linkedinActions');
     let html = '';

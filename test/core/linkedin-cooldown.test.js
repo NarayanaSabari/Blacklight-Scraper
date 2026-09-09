@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     cooldownPath,
@@ -87,4 +87,74 @@ test('isOnCooldown: future → true; past → false; equal-to-now → false', ()
     assert.equal(isOnCooldown({ blockedUntil: new Date('2026-06-21T12:30:00.000Z') }, NOW), true);
     assert.equal(isOnCooldown({ blockedUntil: new Date('2026-06-21T11:00:00.000Z') }, NOW), false);
     assert.equal(isOnCooldown({ blockedUntil: NOW }, NOW), false);
+});
+
+// ── Two writers, one marker file (production 2026-08-19/20) ────────────────
+//
+// search-quota.js and session.js both write ~/.blacklight-linkedin-cooldown and
+// cannot see each other. A last-one-wins write truncated a 4h quota pause to
+// 30 minutes, and separately buried the auth cooldown that carries the
+// "run npm run linkedin:login" instruction.
+describe('writeCooldownMarker never moves an expiry backward', () => {
+    const NOW = new Date('2026-08-20T10:00:00.000Z');
+    const markerPath = '/tmp/marker';
+
+    function harness(existing) {
+        const written = {};
+        return {
+            written,
+            writeFile: (p, d) => { written.tmp = d; },
+            rename: () => { written.final = written.tmp; },
+            readFile: existing === null
+                ? () => { const e = new Error('nope'); e.code = 'ENOENT'; throw e; }
+                : () => existing,
+        };
+    }
+
+    it('keeps the LONGER existing claim when the new one is shorter', () => {
+        // A 4h quota pause is already in force; the auth path writes 30 min.
+        const existing = '2026-08-20T14:00:00.000Z';
+        const h = harness(existing);
+        writeCooldownMarker({
+            writeFile: h.writeFile, rename: h.rename, readFile: h.readFile,
+            now: NOW, cooldownMs: 30 * 60 * 1000, path: markerPath,
+        });
+        assert.equal(h.written.final, existing, 'the 4h quota pause must survive a 30-min auth write');
+    });
+
+    it('extends when the new claim is longer', () => {
+        const h = harness('2026-08-20T10:30:00.000Z');   // 30 min left
+        writeCooldownMarker({
+            writeFile: h.writeFile, rename: h.rename, readFile: h.readFile,
+            now: NOW, cooldownMs: 4 * 60 * 60 * 1000, path: markerPath,
+        });
+        assert.equal(h.written.final, '2026-08-20T14:00:00.000Z');
+    });
+
+    it('writes normally when no marker exists', () => {
+        const h = harness(null);
+        writeCooldownMarker({
+            writeFile: h.writeFile, rename: h.rename, readFile: h.readFile,
+            now: NOW, cooldownMs: 30 * 60 * 1000, path: markerPath,
+        });
+        assert.equal(h.written.final, '2026-08-20T10:30:00.000Z');
+    });
+
+    it('still writes when readFile is omitted (back-compat with other callers)', () => {
+        const h = harness(null);
+        writeCooldownMarker({
+            writeFile: h.writeFile, rename: h.rename,
+            now: NOW, cooldownMs: 30 * 60 * 1000, path: markerPath,
+        });
+        assert.equal(h.written.final, '2026-08-20T10:30:00.000Z');
+    });
+
+    it('falls back to the new expiry when the existing marker is unreadable', () => {
+        const h = harness('not-a-date');
+        writeCooldownMarker({
+            writeFile: h.writeFile, rename: h.rename, readFile: h.readFile,
+            now: NOW, cooldownMs: 30 * 60 * 1000, path: markerPath,
+        });
+        assert.equal(h.written.final, '2026-08-20T10:30:00.000Z');
+    });
 });

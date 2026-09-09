@@ -464,6 +464,23 @@ resumes unattended.
 
 ## 9. Updating
 
+**Quickest path — one command:**
+
+```bash
+C:\scraper\deploy\update-scraper.cmd     # Windows; double-clicking works too
+```
+
+It detects which clone style this host uses, applies the right git command,
+runs `npm ci` only when the lockfile actually changed, and tells you how to
+restart. Safe to run when already current: it stops early and changes nothing.
+
+It deliberately does **not** restart the process — the control panel's restart
+button exits cleanly first, releasing credential leases and flushing telemetry,
+whereas killing the process mid-scrape abandons a live lease.
+
+<details>
+<summary>Doing it by hand</summary>
+
 Use the command that matches how this host was cloned (§1):
 
 ```bash
@@ -480,6 +497,8 @@ then:
 npm ci               # only if package.json or the lockfile changed
 # then restart the service
 ```
+
+</details>
 
 > **Node does not hot-reload. After updating you MUST restart.**
 >

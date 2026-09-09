@@ -13,6 +13,7 @@
 
 import { AuthError, BlockedError, NetworkError } from '../../core/errors.js';
 import { extractPosts, isConfirmedEmpty } from './extract.js';
+import { isNewerThan, newestActivityId } from './high-water.js';
 
 // LinkedIn silently refuses to serve more than 50 results in one request: it
 // answers 200 with its no-results flag and zero posts.
@@ -180,6 +181,11 @@ export async function paginate({
     // Wall-clock ceiling in ms; 0 disables it. This is a SAFETY VALVE, not a
     // result limit — see the note on CANDIDATE_TIME_BUDGET_MS in scraper.js.
     timeBudgetMs = 0,
+    // Newest activity id already forwarded for this exact search. Posts at or
+    // below it are known ground: they are dropped, and a page that contains
+    // nothing above it ends the walk. Null disables the behaviour entirely,
+    // which is the first-run and candidate-query case.
+    sinceActivityId = null,
     fetchImpl = fetch,
     delay = defaultDelay,
     rng = Math.random,
@@ -190,6 +196,12 @@ export async function paginate({
     const pages = [];
     let sawNoResultsSignal = false;
     let budgetExhausted = false;
+    // Distinguishes "LinkedIn had results, we already had all of them" from
+    // "LinkedIn had nothing". Both yield zero posts; only the latter is an
+    // empty result set, and neither is a block.
+    let sawKnownPost = false;
+    let reachedKnownGround = false;
+    let newestSeen = null;
     // NOT `startedAt` — the loop body declares its own `startedAt` for per-page
     // latency, and shadowing it puts this reference in the temporal dead zone.
     const runStartedAt = now();
@@ -214,10 +226,24 @@ export async function paginate({
         if (isConfirmedEmpty(body)) sawNoResultsSignal = true;
 
         let added = 0;
+        // Counts posts this page returned at all, new or not. A page that
+        // returned rows but added nothing NEW is the stop condition; a page
+        // that returned no rows at all is ordinary exhaustion.
+        let pageRows = 0;
         for (const post of extractPosts(body)) {
+            pageRows++;
             const key = post.activity_id || post.post_url;
             if (seen.has(key)) continue;
             seen.add(key);
+            if (post.activity_id) newestSeen = newestActivityId([newestSeen, post.activity_id]);
+            // Known ground. Skip rather than break: LinkedIn orders content
+            // search by relevance as well as recency, so a single old post can
+            // sit above newer ones. The page-level check below is what stops
+            // the walk, which tolerates that interleaving.
+            if (sinceActivityId && !isNewerThan(post.activity_id, sinceActivityId)) {
+                sawKnownPost = true;
+                continue;
+            }
             posts.push(post);
             added++;
             if (posts.length >= maxPosts) break;
@@ -232,8 +258,13 @@ export async function paginate({
         });
 
         // LinkedIn re-serves overlapping windows; a page adding nothing means the
-        // result set is exhausted.
-        if (added === 0) break;
+        // result set is exhausted. With a mark set, a page that returned rows
+        // but nothing above the mark means we have reached known ground — the
+        // whole point of the mark, and where the request saving comes from.
+        if (added === 0) {
+            if (sinceActivityId && pageRows > 0) reachedKnownGround = true;
+            break;
+        }
     }
 
     return {
@@ -242,6 +273,13 @@ export async function paginate({
         // result with no signal is the silent-block signature and must stay
         // unconfirmed so it surfaces as a failure rather than a clean zero.
         emptyConfirmed: posts.length === 0 && sawNoResultsSignal,
+        // Zero NEW posts, but LinkedIn positively served posts we already hold.
+        // A third outcome alongside "empty" and "blocked": callers must not
+        // read it as a block, and must not read it as an empty result set.
+        upToDate: posts.length === 0 && (reachedKnownGround || sawKnownPost),
+        // Newest id observed this run, mark-eligible or not. The caller stores
+        // it so the next run starts from here.
+        newestActivityId: newestSeen,
         pages,
         // True when we stopped on the clock rather than because LinkedIn ran
         // out. The caller alerts on this: it should never happen in practice,

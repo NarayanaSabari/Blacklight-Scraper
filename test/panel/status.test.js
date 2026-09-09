@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildStatus } from '../../src/panel/status.js';
 
@@ -114,6 +114,120 @@ test('buildStatus: orchestrator absent (no Blacklight config) does not fire the 
     assert.ok(!status.alerts.some((a) => /not running/.test(a.message)));
 });
 
+test('buildStatus: a stale RSC template fires an error alert naming the versions', async () => {
+    // The 2026-08-18 outage was invisible on this panel: every field looked
+    // healthy while LinkedIn refused every request and the canary cooled two
+    // good credentials. The operator needs to see the CAUSE here, not just the
+    // downstream shadow-ban symptoms.
+    const status = await buildStatus(baseDeps({
+        templateStatus: () => ({
+            stale: true, reason: 'version_lag', lag: 269,
+            captured: '0.2.6546', live: '0.2.6815',
+        }),
+    }));
+    const alert = status.alerts.find((a) => /template is STALE/.test(a.message));
+    assert.ok(alert, 'a stale template must raise an alert');
+    assert.equal(alert.level, 'error');
+    assert.match(alert.message, /0\.2\.6546/, 'names the captured version');
+    assert.match(alert.message, /0\.2\.6815/, 'names the live version');
+    assert.match(alert.message, /269 builds behind/, 'quantifies the lag');
+    assert.match(alert.message, /linkedin:rsc-template/, 'states the remedy');
+    assert.equal(status.linkedin.template.lag, 269, 'and is readable as structured data');
+});
+
+test('buildStatus: a fresh RSC template fires no template alert', async () => {
+    const status = await buildStatus(baseDeps({
+        templateStatus: () => ({
+            stale: false, reason: null, lag: 12,
+            captured: '0.2.6820', live: '0.2.6832',
+        }),
+    }));
+    assert.ok(!status.alerts.some((a) => /template is STALE/.test(a.message)));
+});
+
+test('buildStatus: an unknown template status is not treated as stale', async () => {
+    // Before the first freshness check there is simply no verdict. Reporting
+    // that as a problem would train the operator to ignore the alert.
+    const status = await buildStatus(baseDeps({ templateStatus: () => null }));
+    assert.ok(!status.alerts.some((a) => /template is STALE/.test(a.message)));
+    assert.equal(status.linkedin.template, null);
+});
+
+test('buildStatus: a search-quota pause warns, and blames the platform not the accounts', async () => {
+    // The whole point of surfacing this: when LinkedIn meters search, every
+    // account looks dead and the instinct is to go investigate the credentials.
+    // The alert has to say plainly that they are fine.
+    const status = await buildStatus(baseDeps({
+        quotaStatus: () => ({
+            paused: true,
+            pausedUntil: '2026-08-19T06:00:00.000Z',
+            consecutiveTrips: 2,
+            consecutiveEmpty: 25,
+        }),
+    }));
+    const alert = status.alerts.find((a) => /search quota/i.test(a.message));
+    assert.ok(alert, 'a quota pause must be visible');
+    assert.equal(alert.level, 'warn', 'this is the system working, not a fault');
+    assert.match(alert.message, /accounts are fine/, 'must redirect away from the credentials');
+    assert.match(alert.message, /2026-08-19T06:00:00.000Z/, 'says when it lifts');
+    assert.equal(status.linkedin.searchQuota.consecutiveTrips, 2);
+});
+
+test('buildStatus: no quota pause fires no quota alert', async () => {
+    const status = await buildStatus(baseDeps({
+        quotaStatus: () => ({ paused: false, pausedUntil: null, consecutiveTrips: 0, consecutiveEmpty: 3 }),
+    }));
+    assert.ok(!status.alerts.some((a) => /search quota/i.test(a.message)));
+});
+
+test('buildStatus: liveUnknown:true raises a warn alert about the observability gap', async () => {
+    // The 2026-08-20 production failure: the version check ran but could not
+    // read LinkedIn's current build. stale:false was the age-based fallback,
+    // not a measured confirmation. The panel must not present this as an
+    // all-clear.
+    const status = await buildStatus(baseDeps({
+        templateStatus: () => ({
+            stale: false, reason: null, lag: null,
+            captured: '0.2.6815', live: null, ageMs: 138_748_819,
+            liveUnknown: true, checkedAt: '2026-08-20T10:05:53.666Z',
+        }),
+    }));
+    const alert = status.alerts.find((a) => /BLIND/.test(a.message));
+    assert.ok(alert, 'a blind version check must raise an alert');
+    assert.equal(alert.level, 'warn', 'degraded observability is a warn, not an error');
+    assert.match(alert.message, /0\.2\.6815/, 'names the captured version');
+    assert.match(alert.message, /39h/, 'quantifies the template age (138748819ms rounds to 39h)');
+    assert.match(alert.message, /linkedin:rsc-template/, 'states the remedy');
+});
+
+test('buildStatus: liveUnknown:true does not fire blind alert when template is already stale', async () => {
+    // The stale error is the definitive alert; the observability-gap warn
+    // would be redundant and confusing alongside it.
+    const status = await buildStatus(baseDeps({
+        templateStatus: () => ({
+            stale: true, reason: 'age_unverifiable_version', lag: null,
+            captured: '0.2.6815', live: null, ageMs: 300_000_000,
+            liveUnknown: true,
+        }),
+    }));
+    assert.ok(status.alerts.some((a) => /template is STALE/.test(a.message)), 'stale error fires');
+    assert.ok(!status.alerts.some((a) => /BLIND/.test(a.message)), 'blind warn must not double-fire');
+});
+
+test('buildStatus: liveUnknown:false on a fresh check fires no blind alert', async () => {
+    // A successful version read must not produce any template alerts.
+    const status = await buildStatus(baseDeps({
+        templateStatus: () => ({
+            stale: false, reason: null, lag: 41,
+            captured: '0.2.6815', live: '0.2.6856', ageMs: 138_748_819,
+            liveUnknown: false, checkedAt: '2026-08-20T10:05:53.666Z',
+        }),
+    }));
+    assert.ok(!status.alerts.some((a) => /BLIND/.test(a.message)),
+        'a successful version read must not raise the blind alert');
+    assert.ok(!status.alerts.some((a) => /template is STALE/.test(a.message)));
+});
+
 test('buildStatus: a long-remaining cooldown fires a warn alert; a short one does not', async () => {
     const status = await buildStatus(baseDeps({
         cooldownSnapshot: () => ({
@@ -141,4 +255,54 @@ test('buildStatus: picks the most recently started active session', async () => 
     }));
     assert.equal(status.session.sessionId, 's2');
     assert.equal(status.poll.mutexLocked, true);
+});
+
+// ── A cooldown must not be reported as a dead session (2026-08-24) ─────────
+//
+// `sessionAlive` reads a 30-minute cookie CACHE that only a scrape refreshes,
+// so a quota pause of up to 4h guarantees it ages out. Production showed
+// "LinkedIn needs re-login" at ERROR level while the account was provably fine:
+// scripts/linkedin-search-scope.js returned 11 profiles on `all` search, only
+// the content vertical was blocked, and that same run had scraped 25,209 posts.
+describe('LinkedIn session state during a platform cooldown', () => {
+    const base = {
+        bootInfo: { profileDir: process.cwd(), gitSha: 'x', pkgVersion: '1', nodeVersion: 'v1', pid: 1, bootedAt: 'now', knownPlatforms: [] },
+        getLinkedInSession: () => ({ isAlive: () => false }),
+        orchestrator: null,
+        licensePool: null,
+        proxyPool: null,
+        spoolStats: async () => ({ count: 0, recent: 0, oldest: null, newest: null, deliveryFailingNow: false, backlog: false }),
+        overrides: { pausedList: () => [] },
+        recent: { list: () => [] },
+        loginController: null,
+    };
+
+    it('does NOT claim a re-login is needed while LinkedIn is cooled down', async () => {
+        const status = await buildStatus({
+            ...base,
+            cooldownSnapshot: () => ({ linkedin: { onCooldown: true, until: '2026-08-24T14:50:29.050Z' } }),
+        });
+
+        assert.equal(status.linkedin.needsRelogin, false, 'a cooled-down platform proves nothing about the session');
+        assert.equal(status.linkedin.sessionUnknown, true);
+        assert.equal(
+            status.alerts.filter((a) => a.level === 'error' && /re-login/.test(a.message)).length, 0,
+            'no ERROR alert: we have no evidence the session is dead',
+        );
+    });
+
+    it('DOES claim a re-login is needed when nothing is blocking a scrape', async () => {
+        // The real signal must survive. With no cooldown, an aged-out cache
+        // means scrapes are running and failing to establish cookies.
+        const status = await buildStatus({
+            ...base,
+            cooldownSnapshot: () => ({ linkedin: { onCooldown: false, until: null } }),
+        });
+
+        assert.equal(status.linkedin.needsRelogin, true);
+        assert.equal(status.linkedin.sessionUnknown, false);
+        assert.equal(
+            status.alerts.filter((a) => a.level === 'error' && /re-login/.test(a.message)).length, 1,
+        );
+    });
 });

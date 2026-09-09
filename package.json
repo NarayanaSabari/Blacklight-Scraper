@@ -14,7 +14,10 @@
     "linkedin:reset": "node scripts/linkedin-reset.js",
     "creds:clean": "node scripts/clean-credentials.js",
     "test": "node --test",
-    "linkedin:rsc-template": "node scripts/linkedin-rsc-template.js"
+    "linkedin:rsc-template": "node scripts/linkedin-rsc-template.js",
+    "linkedin:template-status": "node scripts/linkedin-template-status.js",
+    "linkedin:diagnose": "node scripts/linkedin-diagnose.js",
+    "linkedin:browser-check": "node scripts/linkedin-browser-check.js"
   },
   "keywords": [
     "job-scraper",

@@ -38,6 +38,7 @@ function pickLatestSession(activeSessions) {
  * @param {import('./overrides.js').PlatformOverrides} deps.overrides
  * @param {{list: () => Array}} deps.recent
  * @param {import('./linkedin-login-controller.js').LinkedInLoginController} [deps.loginController]
+ * @param {() => (object|null)} [deps.templateStatus] - last known RSC template freshness
  * @param {() => Date} [deps.now]
  * @returns {Promise<object>}
  */
@@ -53,6 +54,12 @@ export async function buildStatus(deps) {
         overrides,
         recent,
         loginController,
+        // A pure read of whatever the session last observed. Deliberately NOT a
+        // live check: buildStatus runs on every 3s panel poll, and issuing a
+        // LinkedIn request per poll would be its own automation signal.
+        templateStatus: templateStatusFn,
+        // Pure read of the process-wide search-quota tracker.
+        quotaStatus: quotaStatusFn,
         now = () => new Date(),
     } = deps;
 
@@ -90,6 +97,12 @@ export async function buildStatus(deps) {
 
     const linkedInSession = getLinkedInSession ? getLinkedInSession() : null;
     const sessionAlive = !!linkedInSession?.isAlive?.();
+    // Pure read of the last observed verdict; null until the session has run
+    // its first freshness check.
+    const templateStatus = templateStatusFn
+        ? templateStatusFn()
+        : (linkedInSession?.templateStatus?.() ?? null);
+    const quotaStatus = quotaStatusFn ? quotaStatusFn() : null;
     const profileDir = bootInfo.profileDir ?? null;
     const profileDirExists = !!(profileDir && profileDir !== 'unknown' && existsSync(profileDir));
     // `login` is the two-step control-panel flow's OWN state (see
@@ -100,12 +113,46 @@ export async function buildStatus(deps) {
     const login = loginController ? loginController.status() : {
         state: 'idle', profileKey: null, profileDir: null, startedAt: null, lastVerdict: null, lastError: null,
     };
+    // `sessionAlive` is a CACHE reading, not an auth check. It reports whether a
+    // cookie jar was read within the last 30 minutes (LINKEDIN_RSC_COOKIE_TTL_MIN),
+    // and only a scrape refreshes it. So any window where LinkedIn is not being
+    // scraped ages the cache out and reports a perfectly healthy account as dead.
+    //
+    // A quota pause is exactly such a window, and it is up to 4 hours against a
+    // 30-minute TTL, so this false alarm is guaranteed rather than unlucky.
+    // Observed 2026-08-24: `sessionAlive: false` and "needs re-login" showing as
+    // an ERROR while scripts/linkedin-search-scope.js proved the account was
+    // logged in and serving — 11 profiles on `all` search, with only the content
+    // vertical blocked. The host had scraped 25,209 LinkedIn posts that run.
+    //
+    // Suppressing the alarm during a cooldown is the honest reading: we have no
+    // fresh evidence either way, and "no evidence" must not be presented as
+    // "confirmed dead" — that is the same mistake the template check made
+    // (see template-health.js `liveUnknown`). A genuinely dead session still
+    // surfaces the moment the cooldown lifts and the next scrape fails to
+    // establish cookies.
+    const linkedinCooled = Boolean(cooldowns?.linkedin?.onCooldown);
     const linkedin = {
         sessionAlive,
         profileDir,
         profileDirExists,
-        needsRelogin: profileDirExists && !sessionAlive,
+        needsRelogin: profileDirExists && !sessionAlive && !linkedinCooled,
+        // True when we simply cannot tell: the cookie cache has aged out only
+        // because nothing has been allowed to scrape. Distinct from a confirmed
+        // dead session, and rendered differently.
+        sessionUnknown: profileDirExists && !sessionAlive && linkedinCooled,
         login,
+        // Request-template freshness. Surfaced because the failure it describes
+        // is otherwise invisible AND actively misleading: a stale template makes
+        // LinkedIn answer every search "no results", which the panel would
+        // otherwise show as a healthy scraper quietly finding nothing, while the
+        // canary cools credentials for a ban that never happened.
+        template: templateStatus ?? null,
+        // Search-quota state. Distinct from `template` above and from any
+        // credential cooldown: this says "LinkedIn is refusing search for the
+        // whole host right now", which is the one reading that should stop an
+        // operator from investigating the accounts.
+        searchQuota: quotaStatus ?? null,
     };
 
     // Per-platform sweep cadence + the last sweep's counters, so the -83%
@@ -122,6 +169,61 @@ export async function buildStatus(deps) {
     const alerts = [];
     if (linkedin.needsRelogin) {
         alerts.push({ level: 'error', message: 'LinkedIn needs re-login — profile exists but the session is not alive.' });
+    }
+    if (linkedin.sessionUnknown) {
+        alerts.push({
+            level: 'info',
+            message: 'LinkedIn session state is unknown while the platform is cooled down — the cookie '
+                + 'cache ages out when nothing is scraping. This is NOT a re-login signal; it resolves '
+                + 'itself on the first scrape after the cooldown lifts. To check the account now: '
+                + 'node scripts/linkedin-search-scope.js',
+        });
+    }
+    // Ranked above the delivery alerts on purpose: when this one is firing, the
+    // scraper is returning zero for everything and the shadow-ban alerts below
+    // it are downstream symptoms, not independent problems.
+    if (templateStatus?.stale) {
+        alerts.push({
+            level: 'error',
+            message: `LinkedIn request template is STALE (captured ${templateStatus.captured ?? '?'}, `
+                + `live ${templateStatus.live ?? '?'}, ${templateStatus.lag ?? '?'} builds behind) — `
+                + 'searches will return phantom empties. Re-capture: npm run linkedin:rsc-template',
+        });
+    }
+    // `liveUnknown: true` means the freshness check ran but could not read
+    // LinkedIn's current build number — so `stale: false` above is the
+    // age-based fallback, NOT a measured confirmation that the template is
+    // current. This is the exact state that appeared on the 2026-08-20
+    // production panel: `stale: false, live: null, lag: null`, presented as
+    // "template is fine" while in fact we had no idea.
+    //
+    // Warn, not error: the age-based guard is still active, so this is a
+    // degraded-observability condition rather than a confirmed failure. But it
+    // must be visible: an operator who only sees "no alerts" here cannot tell
+    // that the version check is blind and the panel's all-clear is hollow.
+    //
+    // Not raised when the template is already stale (the error above says
+    // everything that needs to be said) or when no freshness check has run
+    // yet at all (templateStatus === null, before the first 4-hour interval).
+    if (templateStatus && !templateStatus.stale && templateStatus.liveUnknown) {
+        alerts.push({
+            level: 'warn',
+            message: `LinkedIn template version check is BLIND — could not read LinkedIn's current build `
+                + `(captured ${templateStatus.captured ?? '?'}, age ${templateStatus.ageMs != null ? Math.round(templateStatus.ageMs / 3_600_000) + 'h' : '?'}). `
+                + 'Staleness cannot be measured; re-capture proactively if the age is approaching 3 days: '
+                + 'npm run linkedin:rsc-template',
+        });
+    }
+    // A warn, not an error: this is the system working as intended. The alert
+    // exists so "LinkedIn looks dead" has a visible, self-resolving explanation
+    // rather than sending someone to look at the accounts, which are fine.
+    if (quotaStatus?.paused) {
+        alerts.push({
+            level: 'warn',
+            message: `LinkedIn search quota hit — backed off until ${quotaStatus.pausedUntil ?? '?'} `
+                + `(${quotaStatus.consecutiveTrips ?? 1} consecutive). The accounts are fine; `
+                + 'LinkedIn is metering search. Repeated trips mean the sweep cadence is still too high.',
+        });
     }
     // Two DIFFERENT conditions, deliberately not merged into "spool is non-empty".
     // That single test is why the panel warned "backend delivery is failing" for

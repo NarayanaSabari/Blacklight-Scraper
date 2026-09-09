@@ -20,6 +20,9 @@ function fakeCooldown() {
         writes: [],
         defaultWriteFile: () => () => {},
         defaultRename: () => () => {},
+        // Extend-only marker: the writer reads any existing claim so a quota
+        // pause and an auth cooldown cannot truncate each other.
+        defaultReadFile: () => () => { const e = new Error('none'); e.code = 'ENOENT'; throw e; },
         cooldownMs: () => 30 * 60 * 1000,
         cooldownPath: () => '/tmp/marker',
         writeCooldownMarker(opts) { this.writes.push(opts); },

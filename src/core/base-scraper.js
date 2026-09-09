@@ -19,19 +19,34 @@ import { ScraperError, BlockedError } from './errors.js';
 import { getProxyPool } from './proxy-pool.js';
 import { getMetrics } from '../metrics/registry.js';
 import { classifyError } from '../metrics/classify.js';
-import { classifyUrl } from './url-quality.js';
+import { classifyUrl, evaluateUrlQuality } from './url-quality.js';
+
+// Every platform scraper funnels its jobs through normalizeJobData()
+// (core/normalize.js) before they reach here, which nests the wire fields
+// under `job.job` (`{ _metadata, job: { url, title, ... }, company, ... }`).
+// `job?.url` on that shape is always undefined. Falling back to `job?.url`
+// keeps this working for the (test-only) legacy case of a scraperFn that
+// returns flat job objects directly, per BaseScraper's documented bare-array
+// contract above.
+function urlForQuality(job) {
+    return job?.job?.url ?? job?.url;
+}
 
 function normalizeResult(result) {
     if (Array.isArray(result)) {
-        return { jobs: result, emptyConfirmed: false };
+        return { jobs: result, emptyConfirmed: false, upToDate: false };
     }
     if (result && Array.isArray(result.jobs)) {
-        return { jobs: result.jobs, emptyConfirmed: result.emptyConfirmed === true };
+        return {
+            jobs: result.jobs,
+            emptyConfirmed: result.emptyConfirmed === true,
+            upToDate: result.upToDate === true,
+        };
     }
     // Non-array / missing `jobs`, or null/undefined → bad/empty return
     // treated as UNCONFIRMED empty on purpose: it must surface loudly
     // via the zero-jobs path, never silently as a confirmed success.
-    return { jobs: [], emptyConfirmed: false };
+    return { jobs: [], emptyConfirmed: false, upToDate: false };
 }
 
 export class BaseScraper {
@@ -87,19 +102,47 @@ export class BaseScraper {
         this.log.info('Starting scrape', { jobTitle, location, sessionId });
         try {
             const raw = await this.scraperFn(jobTitle, location, sessionId, options);
-            const { jobs, emptyConfirmed } = normalizeResult(raw);
+            const { jobs, emptyConfirmed, upToDate } = normalizeResult(raw);
             const durationMs = Date.now() - start;
             const jobCount = jobs.length;
 
             try {
-                for (const job of jobs) {
-                    metrics.recordUrlQuality?.(this.platform, classifyUrl(job?.url));
+                const qualities = jobs.map((job) => classifyUrl(urlForQuality(job)));
+                for (const quality of qualities) {
+                    metrics.recordUrlQuality?.(this.platform, quality);
+                }
+                // Guard against a repeat of the 2026-08-20 incident: 6148/6148
+                // LinkedIn jobs classified 'empty' and nothing alerted, because
+                // the metric itself was reading the wrong field and so was
+                // ALWAYS 'empty' - a permanent false positive nobody could
+                // trust enough to page on. Now that the field is read
+                // correctly, a high empty ratio in one scrape's own batch is a
+                // real signal (a genuinely broken extractor), so it gets its
+                // own scraper_alert rather than only ever showing up as a
+                // counter someone has to remember to graph. Scoped to THIS
+                // scrape's jobs, not a rolling/global rate - a broken run must
+                // not be diluted by healthy ones on either side of it, and a
+                // healthy run must not inherit a stale streak from a bad one.
+                const quality = evaluateUrlQuality(qualities);
+                if (quality.degraded) {
+                    this.log.error('Most jobs this scrape carried no URL - suspected broken extractor', {
+                        jobCount: quality.jobCount,
+                        emptyCount: quality.emptyCount,
+                        emptyRatio: Number(quality.emptyRatio.toFixed(3)),
+                        scraper_alert: 'url_quality_degraded',
+                    });
                 }
             } catch (_e) {
                 // Observability must never crash the scraping path.
             }
 
-            if (jobCount === 0 && !emptyConfirmed) {
+            if (jobCount === 0 && upToDate) {
+                // The scraper reached posts it had already forwarded. LinkedIn
+                // served results, we simply hold all of them — the healthiest
+                // possible outcome for an incremental sweep, and emphatically
+                // not the zero-jobs block signature handled below.
+                this.log.info('Scrape complete (already up to date)', { jobCount: 0, durationMs });
+            } else if (jobCount === 0 && !emptyConfirmed) {
                 this.log.warn('Scrape returned 0 jobs (unconfirmed) — possible block / DOM change', {
                     durationMs,
                     scraper_alert: 'zero_jobs_unconfirmed',
@@ -124,7 +167,19 @@ export class BaseScraper {
             // `emptyConfirmed` is only meaningful when jobCount === 0. A non-empty
             // result is reported false so the backend never has to reason about
             // "confirmed empty but 12 jobs".
-            return { jobs, emptyConfirmed: jobCount === 0 && emptyConfirmed === true };
+            //
+            // `upToDate` reports as confirmed-empty ON THE WIRE deliberately.
+            // The wire flag answers one question for the backend — "is this
+            // zero trustworthy, or does it smell like a block?" — and a sweep
+            // that reached known ground is the most trustworthy zero there is.
+            // The two are kept distinct in the logs above, where the difference
+            // between "LinkedIn had nothing" and "we already had it all"
+            // actually matters to an operator.
+            return {
+                jobs,
+                emptyConfirmed: jobCount === 0 && (emptyConfirmed === true || upToDate === true),
+                upToDate: jobCount === 0 && upToDate === true,
+            };
         } catch (error) {
             const durationMs = Date.now() - start;
             const reason = classifyError(error);

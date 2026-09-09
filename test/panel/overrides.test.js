@@ -84,33 +84,16 @@ test('filterAllowed drops paused platforms from a candidate list', () => {
 // without a code deploy.
 
 test('intervalMinutes: platforms without a built-in default claim every cycle', () => {
+    // glassdoor and monster have no default and are not assigned to any host.
+    // dice/techfetch USED to be the example here; they now ship a 20-minute
+    // cadence because an uncapped browser platform pins a CloakBrowser seat.
     const o = new PlatformOverrides({ filePath: FILE, fs: fakeFs(), knownPlatforms: KNOWN, env: {} });
     assert.equal(o.intervalMinutes('glassdoor'), null);
 });
 
-test('the high-volume, low-yield boards ship with a 60-minute default sweep', () => {
-    // dice and techfetch joined indeed on 2026-08-08: measured over the prior
-    // 3 days they imported 2.2% and 1.0% of what they scraped, against
-    // indeed's 27.6% on an hourly cadence.
-    const o = new PlatformOverrides({
-        filePath: FILE,
-        fs: fakeFs(),
-        knownPlatforms: [...KNOWN, 'techfetch'],
-        env: {},
-    });
+test('indeed ships with a 60-minute default sweep', () => {
+    const o = new PlatformOverrides({ filePath: FILE, fs: fakeFs(), knownPlatforms: KNOWN, env: {} });
     assert.equal(o.intervalMinutes('indeed'), 60);
-    assert.equal(o.intervalMinutes('dice'), 60);
-    assert.equal(o.intervalMinutes('techfetch'), 60);
-});
-
-test('linkedin stays on every-cycle: candidate boolean queries trade on freshness', () => {
-    const o = new PlatformOverrides({
-        filePath: FILE,
-        fs: fakeFs(),
-        knownPlatforms: [...KNOWN, 'linkedin'],
-        env: {},
-    });
-    assert.equal(o.intervalMinutes('linkedin'), null);
 });
 
 test('env overrides the built-in default; the file overrides env', () => {
@@ -173,10 +156,43 @@ test('a garbage interval in the file is ignored, not fatal', () => {
     const fsImpl = fakeFs();
     const file = FILE;
     fsImpl.writeFileSync(file, JSON.stringify({
-        paused: [], intervals: { indeed: 'soon', dice: -5, nope: 60 },
+        paused: [], intervals: { indeed: 'soon', glassdoor: -5, nope: 60 },
     }));
     const o = new PlatformOverrides({ filePath: file, fs: fsImpl, knownPlatforms: KNOWN, env: {} });
     assert.equal(o.intervalMinutes('indeed'), 60, 'garbage ignored → falls back to the default');
-    assert.equal(o.intervalMinutes('dice'), 60, 'a negative value is garbage, not a deliberate 0');
-    assert.equal(o.intervalMinutes('glassdoor'), null, 'no default → still every cycle');
+    assert.equal(o.intervalMinutes('glassdoor'), null, 'garbage ignored → no default, every cycle');
+});
+
+// ── Browser platforms need a cadence too (production 2026-08-20) ───────────
+//
+// dice and techfetch shipped with no default cadence, so they re-claimed
+// continuously. While dice was being served empty pages it turned over a
+// session every ~1.3s (124 failed sessions in two minutes) and techfetch
+// relaunched its browser every ~3s; between them they held both CloakBrowser
+// seats, starving every other browser platform.
+test('every browser platform has a default sweep cadence', () => {
+    const o = new PlatformOverrides({
+        filePath: FILE, fs: fakeFs(), env: {},
+        knownPlatforms: ['dice', 'indeed', 'linkedin', 'techfetch'],
+    });
+
+    // The two that compete for CloakBrowser seats. An uncapped browser platform
+    // is the one that can pin a seat indefinitely.
+    assert.equal(o.intervalMinutes('dice'), 20);
+    assert.equal(o.intervalMinutes('techfetch'), 20);
+
+    // Unchanged.
+    assert.equal(o.intervalMinutes('indeed'), 60);
+    assert.equal(o.intervalMinutes('linkedin'), 30);
+});
+
+test('a deliberate operator 0 still wins over the new browser defaults', () => {
+    // Raising a default must never silently override a host where someone
+    // turned the cadence off on purpose.
+    const fs = fakeFs({ [FILE]: JSON.stringify({ paused: [], intervals: { dice: 0 } }) });
+    const o = new PlatformOverrides({
+        filePath: FILE, fs, env: {},
+        knownPlatforms: ['dice', 'indeed', 'linkedin', 'techfetch'],
+    });
+    assert.equal(o.intervalMinutes('dice'), null, 'a stored 0 means no cadence limit');
 });
