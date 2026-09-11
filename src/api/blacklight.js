@@ -73,8 +73,10 @@ export class BlacklightApiClient {
         );
     }
 
-    async checkActiveSession() {
-        return this.#request('GET', '/api/scraper/queue/current-session');
+    async checkActiveSession({ source = null } = {}) {
+        let path = '/api/scraper/queue/current-session';
+        if (source) path += `?source=${encodeURIComponent(source)}`;
+        return this.#request('GET', path);
     }
 
     async getNextRole({ platforms = null } = {}) {
@@ -100,6 +102,29 @@ export class BlacklightApiClient {
         }
         const result = await this.#request('GET', path);
         return result._empty ? null : result;
+    }
+
+    /**
+     * Claim the configured LinkedIn group source, when the backend supports it.
+     *
+     * A 204 means the source is disabled or not due. Older backend builds do
+     * not register this optional route and answer 404; that must be equivalent
+     * to no group work so ordinary queue polling keeps working during a rolling
+     * upgrade.
+     */
+    async claimLinkedInGroup() {
+        try {
+            // This is an optional capability probe during rolling upgrades.
+            // Keep an old backend's 404 (and an open queue circuit) from
+            // suppressing ordinary role polling.
+            const result = await this.#request(
+                'POST', '/api/scraper/groups/claim', undefined, { bypassCircuit: true },
+            );
+            return result?._empty ? null : result;
+        } catch (error) {
+            if (error instanceof NetworkError && error.statusCode === 404) return null;
+            throw error;
+        }
     }
 
     async checkCredentialAvailability() {
@@ -140,6 +165,13 @@ export class BlacklightApiClient {
         if (status === 'success' && jobs.length === 0 && typeof meta.emptyConfirmed === 'boolean') {
             body.empty_confirmed = meta.emptyConfirmed;
         }
+        // Group progress is accepted only for a group session. The backend
+        // derives that source from the session, so this carries no source id
+        // and cannot redirect a submission to another group.
+        const groupProgress = meta?.groupProgress ?? meta?.group_progress;
+        if (groupProgress !== undefined && groupProgress !== null) {
+            body.group_progress = groupProgress;
+        }
         // SCR-15: submit is exempt from the circuit breaker entirely.
         // Jobs are already scraped by this point — blocking the call on an
         // open circuit (opened by, say, a credentials-API outage) would
@@ -152,6 +184,8 @@ export class BlacklightApiClient {
             await spoolUndeliverableSubmission({
                 sessionId, platform, jobs, status, errorMessage,
                 deliveryError: error.message,
+                group: meta?.group ?? null,
+                groupProgress,
             });
             this.#recordSubmissionForPanel(sessionId, platform, jobs, 'failed', meta, error.message);
             throw error;

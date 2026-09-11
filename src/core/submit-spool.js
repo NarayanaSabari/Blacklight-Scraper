@@ -95,6 +95,8 @@ function safeSegment(value) {
  * @param {string} payload.status
  * @param {string|null} [payload.errorMessage]
  * @param {string} payload.deliveryError - message from the failed HTTP call
+ * @param {object|null} [payload.group] - source provenance for recovery
+ * @param {object|null} [payload.groupProgress] - proposed durable progress
  * @returns {Promise<string|null>} the spool file path, or null if the
  *   write itself failed (best-effort — never throws into the caller).
  */
@@ -111,6 +113,10 @@ export async function spoolUndeliverableSubmission(payload) {
         errorMessage: payload.errorMessage ?? null,
         deliveryError: payload.deliveryError,
         jobs: payload.jobs,
+        // Keep group provenance beside the payload. A failed submit must be
+        // replayable without guessing which source's checkpoint it carried.
+        group: payload.group ?? null,
+        groupProgress: payload.groupProgress ?? null,
     };
 
     try {

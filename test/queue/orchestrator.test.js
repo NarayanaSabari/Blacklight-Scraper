@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { QueueOrchestrator } from '../../src/queue/orchestrator.js';
-import { TimeoutError } from '../../src/core/errors.js';
+import { NetworkError, TimeoutError } from '../../src/core/errors.js';
 
 function fakeMetrics() {
     const calls = { allFailed: 0, queueCheck: [], jobsSubmitted: [] };
@@ -157,6 +157,45 @@ test('B: a claim that times out recovers and RESUMES the orphaned active session
     assert.ok(sub, 'orphaned session should be resumed — submitJobs called for its pending platform');
     assert.equal(sub.p, 'indeed');
     assert.deepEqual(c.calls.completeSession, ['sess-ORPHAN'], 'resumed session must be completed');
+});
+
+test('B: an ambiguous 5xx claim recovers a role orphan with a role-filtered lookup', async () => {
+    const m = fakeMetrics();
+    let activeSource;
+    const c = fakeClient({
+        checkCredentialAvailability: async () => ({ indeed: 1 }),
+        getNextRole: async () => {
+            throw new NetworkError('claim returned 503 after commit', { statusCode: 503 });
+        },
+        checkActiveSession: async ({ source } = {}) => {
+            activeSource = source;
+            return {
+                has_active_session: true,
+                session: {
+                    session_id: 'sess-ORPHAN-503',
+                    role_name: 'Backend Engineer',
+                    search_queries: ['backend engineer'],
+                    platforms: [{ id: 1, name: 'indeed' }],
+                },
+            };
+        },
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: m,
+        scraperResolver: () => ({
+            executeWithMeta: async () => ({ jobs: [{ id: 1 }], emptyConfirmed: false }),
+        }),
+    });
+    o._pollScheduled = true;
+
+    const result = await o.runOnce();
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(activeSource, 'role');
+    assert.deepEqual(result, { batched: 1, roles: ['Backend Engineer'] });
+    assert.deepEqual(c.calls.completeSession, ['sess-ORPHAN-503']);
 });
 
 test('O9: a platform returning 0 jobs still submits success but is recorded distinctly', async () => {

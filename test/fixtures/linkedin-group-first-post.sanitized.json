@@ -1,0 +1,19 @@
+{
+  "schema": "linkedin-group-dom-fixture-v1",
+  "capturedAt": "2026-09-11",
+  "groupId": "10472901",
+  "groupUrl": "https://www.linkedin.com/groups/10472901/",
+  "activityUrn": "urn:li:activity:7504081637186543616",
+  "activityId": "7504081637186543616",
+  "bodyText": "Hi All,\n\n📞 Recruitment agencies — add a free “Call Recruiter” button to your website.\nWith WebCallHub, candidates can call your recruiter directly from the browser — no app and no phone number sharing.\n✅ Easy website integration\n✅ Browser-to-browser voice call\n✅ Free plan available\n👉 Register free: webcallhub.com https://webcallhub.com/\nGive candidates an easier way to reach your recruiters.\n\n\nhashtag\n#Recruitment \nhashtag\n#ITRecruitment \nhashtag\n#HRTech \nhashtag\n#WebCallHub",
+  "timeText": "10m • 10 minutes ago • Visible to anyone on or off LinkedIn",
+  "selectors": {
+    "postContainer": ".occludable-update",
+    "postView": "[data-view-name=feed-full-update]",
+    "activity": "[data-urn]",
+    "body": ".update-components-update-v2__commentary",
+    "timestamp": ".update-components-actor__sub-description",
+    "expand": "button[aria-label^=see more]"
+  },
+  "htmlCapture": "truncated-by-browser-cli"
+}

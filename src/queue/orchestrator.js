@@ -18,18 +18,32 @@ import { getScraper } from '../scrapers/registry.js';
 import { Mutex } from './mutex.js';
 import { getMetrics } from '../metrics/registry.js';
 import { platformsOnCooldown } from '../core/platform-cooldowns.js';
-import { TimeoutError } from '../core/errors.js';
+import { NetworkError, TimeoutError } from '../core/errors.js';
 import { PLATFORM_NAMES } from '../scrapers/registry.js';
 import { getPlatformOverrides } from '../panel/overrides.js';
 import { SweepSchedule } from './sweep-schedule.js';
+import { createLinkedInGroupScraper } from '../scrapers/linkedin-group/scraper.js';
 
 const log = createLogger('orchestrator');
+
+// A claim can be committed before its HTTP response reaches the scraper.
+// Timeout and transport failures are therefore recoverable by asking the
+// backend for the matching recent session.  Preserve ordinary 4xx handling:
+// those responses identify a rejected request rather than an ambiguous claim.
+function isAmbiguousClaimFailure(error) {
+    if (error instanceof TimeoutError) return true;
+    if (!(error instanceof NetworkError)) return false;
+    return error.statusCode === null
+        || error.statusCode === undefined
+        || error.statusCode === 408
+        || error.statusCode >= 500;
+}
 
 export class QueueOrchestrator {
     constructor({
         blacklightConfig, queueConfig, defaultLocation,
         client = null, metrics = null, scraperResolver = null, cooldownCheck = null,
-        platformOverrides = null, sweepSchedule = null,
+        platformOverrides = null, sweepSchedule = null, groupScraper = null,
     }) {
         if (!client && !blacklightConfig) {
             throw new Error('QueueOrchestrator requires blacklightConfig');
@@ -47,6 +61,11 @@ export class QueueOrchestrator {
         // SCR-18 (#401): at most ONE follow-up poll may be pending at a time.
         // See #schedulePoll.
         this._pollScheduled = false;
+        // The group source shares LinkedIn's credential path with normal role
+        // work, so alternate which optional turn gets first refusal. This
+        // bounds group starvation when the role queue is continuously due,
+        // while a 204/404 group response immediately falls back to roles.
+        this._preferGroupNext = false;
         this._sweepSchedule = sweepSchedule;
         // Panel-only bookkeeping (read via snapshot()). Never consulted by the
         // workflow itself, so getting it wrong can't change scraping behavior.
@@ -61,6 +80,7 @@ export class QueueOrchestrator {
         // without live HTTP / the real scraper registry.
         this._metrics = metrics;
         this._resolveScraper = scraperResolver ?? getScraper;
+        this._groupScraper = groupScraper ?? createLinkedInGroupScraper();
         this._cooldownCheck = cooldownCheck ?? platformsOnCooldown;
         // Local pause/resume from the control panel. Injected the same way as
         // the other seams — tests supply a fake, production lazily resolves
@@ -187,7 +207,10 @@ export class QueueOrchestrator {
                 });
             });
         }
-        return { batched: assignments.length, roles: assignments.map((a) => a.role.name) };
+        return {
+            batched: assignments.length,
+            roles: assignments.map((a) => this.#assignmentLabel(a)),
+        };
     }
 
     startAutoChecker() {
@@ -233,6 +256,82 @@ export class QueueOrchestrator {
     }
 
     // ----- internals --------------------------------------------------------
+
+    #assignmentHasPlatform(assignment, platformName) {
+        const expected = String(platformName).toLowerCase();
+        return (assignment?.platforms ?? []).some((platform) => {
+            const name = typeof platform === 'string' ? platform : platform?.name;
+            return String(name ?? '').toLowerCase() === expected;
+        });
+    }
+
+    #assignmentLabel(assignment) {
+        if (assignment?.group?.id !== undefined && assignment?.group?.id !== null) {
+            return `LinkedIn group ${assignment.group.id}`;
+        }
+        return assignment?.role?.name ?? 'Unknown assignment';
+    }
+
+    #hasActivePlatform(platformName) {
+        const expected = String(platformName).toLowerCase();
+        for (const session of this._activeSessions.values()) {
+            if (session.platforms?.[expected] === 'pending') return true;
+        }
+        return false;
+    }
+
+    #hasActiveGroupPlatform(platformName) {
+        const expected = String(platformName).toLowerCase();
+        for (const session of this._activeSessions.values()) {
+            if (session.group === true && session.platforms?.[expected] === 'pending') return true;
+        }
+        return false;
+    }
+
+    #isValidGroupClaim(claim) {
+        const group = claim?.group;
+        const platforms = claim?.platforms;
+        return typeof claim?.session_id === 'string'
+            && claim.session_id.length > 0
+            && typeof group?.source_id === 'number'
+            && (typeof group.id === 'number' || typeof group.id === 'string')
+            && typeof group.url === 'string'
+            && group.url.length > 0
+            && group.checkpoint
+            && Array.isArray(platforms)
+            && this.#assignmentHasPlatform(claim, 'linkedin');
+    }
+
+    async #claimGroupAssignment() {
+        if (typeof this.client.claimLinkedInGroup !== 'function') return null;
+
+        let claim;
+        try {
+            claim = await this.client.claimLinkedInGroup();
+        } catch (error) {
+            // Group collection is an optional capability during a rolling
+            // upgrade. Its failure must leave normal queue work runnable.
+            if (isAmbiguousClaimFailure(error)) {
+                const recovered = await this.#recoverOrphanedSession('group');
+                if (recovered?.group) return recovered;
+            }
+            if (error instanceof NetworkError && error.statusCode === 404) return null;
+            log.warn('LinkedIn group claim unavailable; continuing normal queue work', {
+                err: error.message,
+                scraper_alert: 'group_claim_unavailable',
+            });
+            return null;
+        }
+
+        if (claim === null || claim === undefined) return null;
+        if (!this.#isValidGroupClaim(claim)) {
+            log.warn('LinkedIn group claim response was unrecognized; skipping it', {
+                scraper_alert: 'group_claim_unrecognized',
+            });
+            return null;
+        }
+        return { ...claim, role: null, group: claim.group };
+    }
 
     /**
      * Claim portion of a queue cycle. Returns the raw queue response
@@ -327,6 +426,13 @@ export class QueueOrchestrator {
             }
         }
 
+        // A group source has its own durable cadence in the backend. Keep its
+        // eligibility separate from the role sweep gate below, so a LinkedIn
+        // role sweep that is not due cannot starve the configured group feed.
+        // The normal role claim still honors the existing per-platform cadence.
+        const groupEligible = usablePlatforms.includes('linkedin')
+            && !this.#hasActivePlatform('linkedin');
+
         // Exclude platforms whose next SWEEP isn't due yet (see
         // ./sweep-schedule.js). A platform with no configured cadence is always
         // claimable, so this is inert for everything an operator hasn't
@@ -334,55 +440,128 @@ export class QueueOrchestrator {
         // for a 0.29% import rate; an hourly sweep drains the same queue in
         // ~1/12th of the sessions.
         const schedule = this.#schedule();
-        const notDue = usablePlatforms.filter((p) => !schedule.isClaimable(p));
+        let normalPlatforms = usablePlatforms.filter((p) => schedule.isClaimable(p));
+        const notDue = usablePlatforms.filter((p) => !normalPlatforms.includes(p));
         if (notDue.length > 0) {
             log.info('Platforms not due for a sweep — excluded from claim', { notDue });
-            usablePlatforms = usablePlatforms.filter((p) => !notDue.includes(p));
-            if (usablePlatforms.length === 0) {
-                log.info('No platform is due for a sweep — skipping claim');
-                metrics.recordQueueCheck('not_due');
-                return { assignments: [] };
-            }
         }
+
+        // A group session owns the LinkedIn credential path just like a normal
+        // LinkedIn assignment. Let unrelated platforms proceed, while keeping
+        // a normal LinkedIn role from overlapping the active group session.
+        if (this.#hasActiveGroupPlatform('linkedin')) {
+            normalPlatforms = normalPlatforms.filter((p) => p !== 'linkedin');
+        }
+
+        // A continuously due role queue must not win every LinkedIn turn.
+        // When the group turn is first, claim it before asking for normal
+        // LinkedIn work and remove LinkedIn from that role claim if it wins.
+        // A 204/404 falls through to the ordinary role claim in this cycle.
+        const canTryGroup = groupEligible && typeof this.client.claimLinkedInGroup === 'function';
+        let groupAssignment = null;
+        let groupAttempted = false;
+        if (canTryGroup && this._preferGroupNext) {
+            groupAttempted = true;
+            groupAssignment = await this.#claimGroupAssignment();
+            if (groupAssignment) normalPlatforms = normalPlatforms.filter((p) => p !== 'linkedin');
+        }
+
         // Open a sweep for any scheduled platform we're about to claim.
-        for (const platform of usablePlatforms) schedule.begin(platform);
+        for (const platform of normalPlatforms) schedule.begin(platform);
 
         let queueResult;
-        try {
-            queueResult = await this.client.getNextRole({ platforms: usablePlatforms });
-        } catch (error) {
-            metrics.recordQueueCheck('error');
-            // A claim that times out client-side may already have been
-            // COMMITTED by the backend (session + RPQ claim created before our
-            // HTTP read timed out). That orphans the session — the backend
-            // won't issue new work for those platforms until the 1-hour
-            // stale-session sweep. Recover by resuming our active session
-            // instead of stranding it. See incident 2026-06-23.
-            if (error instanceof TimeoutError) {
-                const recovered = await this.#recoverOrphanedSession();
-                if (recovered) return { assignments: [recovered] };
+        if (normalPlatforms.length === 0) {
+            queueResult = { assignments: [] };
+            if (notDue.length > 0) metrics.recordQueueCheck('not_due');
+        } else {
+            try {
+                queueResult = await this.client.getNextRole({ platforms: normalPlatforms });
+            } catch (error) {
+                metrics.recordQueueCheck('error');
+                // An ambiguous claim failure may already have been
+                // COMMITTED by the backend (session + RPQ claim created before our
+                // HTTP read timed out). That orphans the session — the backend
+                // won't issue new work for those platforms until the 1-hour
+                // stale-session sweep. Recover by resuming our active session
+                // instead of stranding it. See incident 2026-06-23.
+                if (isAmbiguousClaimFailure(error)) {
+                    const recovered = await this.#recoverOrphanedSession('role');
+                    if (recovered && !recovered.group) return { assignments: [recovered] };
+                }
+                throw error;
             }
-            throw error;
         }
 
-        const assignments = queueResult?.assignments || [];
+        let assignments = queueResult?.assignments || [];
+        const closeUnassignedNormalSweeps = () => {
+            const assignedNormalPlatforms = new Set(
+                assignments
+                    .filter((assignment) => !assignment.group)
+                    .flatMap((assignment) => (assignment.platforms ?? []).map((platform) => (
+                        typeof platform === 'string' ? platform : platform?.name
+                    )))
+                    .filter(Boolean)
+                    .map((platform) => String(platform).toLowerCase()),
+            );
+            for (const platform of normalPlatforms) {
+                if (assignedNormalPlatforms.has(String(platform).toLowerCase())) continue;
+                if (this.#hasActivePlatform(platform)) continue;
+                schedule.end(platform);
+            }
+        };
+        if (assignments.length === 0) {
+            // Nothing left for normal role work this pass — close only the
+            // normal sweep that was actually considered. A group claim below
+            // has no effect on this cadence state.
+            closeUnassignedNormalSweeps();
+            assignments = [];
+            metrics.recordQueueCheck('empty');
+        } else {
+            // A multi-platform claim can return only the pairs currently
+            // available. Close every sweep that was opened for this request
+            // but was not returned, unless an already-running session still
+            // owns that platform and needs to drain it.
+            closeUnassignedNormalSweeps();
+        }
+
+        // On the normal-first turn, give the optional group source its chance
+        // when no normal LinkedIn assignment was returned. This keeps the
+        // existing role-first behavior while bounding starvation through the
+        // alternating first-turn preference above.
+        const normalLinkedInAssigned = assignments.some(
+            (assignment) => this.#assignmentHasPlatform(assignment, 'linkedin'),
+        );
+        if (canTryGroup && !groupAttempted && !normalLinkedInAssigned) {
+            groupAttempted = true;
+            groupAssignment = await this.#claimGroupAssignment();
+        }
+        if (groupAssignment) assignments.push(groupAssignment);
+
+        if (canTryGroup) {
+            // If normal LinkedIn work consumed this turn, make the next
+            // eligible cycle group-first. A group turn, including a 204/404,
+            // hands the next cycle back to normal role work.
+            this._preferGroupNext = normalLinkedInAssigned && !groupAssignment;
+        }
+
         if (assignments.length === 0) {
             log.info('Queue empty');
-            metrics.recordQueueCheck('empty');
-            // Nothing left for these platforms this pass — the sweep has
-            // drained the queue, so close it and start the interval clock.
-            for (const platform of usablePlatforms) schedule.end(platform);
-            return queueResult;
+            // `normalPlatforms` was already ended above when it was queried.
+            // This second branch is for a group-only-ineligible cycle.
+            return { ...queueResult, assignments };
         }
         metrics.recordQueueCheck('job_found');
 
         log.info('Batch acquired', {
             count: assignments.length,
-            roles: assignments.map((a) => a.role.name),
-            totalPlatforms: assignments.reduce((sum, a) => sum + a.platforms.length, 0),
+            roles: assignments.map((a) => this.#assignmentLabel(a)),
+            totalPlatforms: assignments.reduce((sum, a) => sum + (a.platforms?.length ?? 0), 0),
         });
         for (const assignment of assignments) {
-            for (const platform of assignment.platforms) {
+            // Group sources have their own durable cadence in the backend and
+            // must not open or advance the normal role sweep clock.
+            if (assignment.group) continue;
+            for (const platform of assignment.platforms ?? []) {
                 // The claim response returns platforms as OBJECTS
                 // ({id, name, display_name}) while the gating path above works in
                 // plain strings. Passing the object straight through stringified
@@ -392,26 +571,26 @@ export class QueueOrchestrator {
                 schedule.record(platform?.name ?? platform, { roles: 1, sessions: 1 });
             }
         }
-        return queueResult;
+        return { ...queueResult, assignments };
     }
 
     /**
-     * Recover an orphaned in-progress session after a claim times out.
+     * Recover an orphaned in-progress session after an ambiguous claim failure.
      *
-     * When getNextRole times out, the backend may have already created the
-     * session + claim (the HTTP response was lost in transit). Ask the backend
-     * for our current active session; if it still has pending platforms,
+     * When a claim times out or returns an ambiguous transport/5xx error, the
+     * backend may already have created the session + claim. Ask the backend for
+     * the source-filtered current active session; if it still has pending platforms,
      * return it as an assignment so runOnce resumes it — finishing the work
      * rather than stranding it for the 1-hour stale-session sweep. Returns null
      * when there's nothing to resume (no active session, no pending platforms,
      * or the lookup itself fails). See incident 2026-06-23.
      */
-    async #recoverOrphanedSession() {
+    async #recoverOrphanedSession(source = null) {
         let active;
         try {
-            active = await this.client.checkActiveSession();
+            active = await this.client.checkActiveSession(source ? { source } : undefined);
         } catch (err) {
-            log.warn('Orphaned-session recovery check failed', { err: err.message });
+            log.warn('Orphaned-session recovery check failed', { source, err: err.message });
             return null;
         }
         const session = active?.has_active_session ? active.session : null;
@@ -419,16 +598,32 @@ export class QueueOrchestrator {
         if (!session || !Array.isArray(platforms) || platforms.length === 0) {
             return null;
         }
-        log.warn('Recovered orphaned session after claim timeout — resuming', {
+        const group = session.group ?? (
+            session.group_source_id !== undefined
+            && session.group_id !== undefined
+            && session.group_url
+                ? {
+                    source_id: session.group_source_id,
+                    id: session.group_id,
+                    url: session.group_url,
+                    checkpoint: session.group_checkpoint ?? null,
+                }
+                : null
+        );
+        const roleName = group ? `LinkedIn group ${group.id}` : session.role_name;
+        log.warn('Recovered orphaned session after ambiguous claim — resuming', {
             sessionId: session.session_id,
-            role: session.role_name,
+            role: roleName,
+            group: group?.id ?? null,
             platforms: platforms.map((p) => p.name),
             scraper_alert: 'orphan_recovered',
         });
         this.#metrics().recordQueueCheck('recovered_orphan');
         return {
             session_id: session.session_id,
-            role: { name: session.role_name, search_queries: session.search_queries ?? null },
+            ...(group
+                ? { role: null, group }
+                : { role: { name: session.role_name, search_queries: session.search_queries ?? null } }),
             // Carried through so a resumed candidate-query session re-runs the
             // recruiter's boolean rather than silently degrading to a role sweep
             // — the backend has already flagged that session to bypass the
@@ -444,16 +639,19 @@ export class QueueOrchestrator {
      * then complete the assignment's session.
      */
     async #runAssignment(assignment, metrics) {
-        const { session_id: sessionId, role, platforms } = assignment;
+        const { session_id: sessionId, role = null, group = null, platforms = [] } = assignment;
+        const isGroup = Boolean(group);
+        const roleName = this.#assignmentLabel(assignment);
         const location = this.defaultLocation;
         log.info('Assignment started', {
-            sessionId, role: role.name, location,
-            platforms: platforms.map((p) => p.name),
+            sessionId, role: roleName, group: group?.id ?? null, location,
+            platforms: platforms.map((p) => typeof p === 'string' ? p : p.name),
         });
 
         const results = {
             session_id: sessionId,
-            role: role.name,
+            role: roleName,
+            ...(isGroup ? { group } : {}),
             location,
             platforms: {},
             summary: {
@@ -468,9 +666,13 @@ export class QueueOrchestrator {
         // right now" without touching the workflow itself. Removed in the
         // `finally` below regardless of outcome.
         this._activeSessions.set(sessionId, {
-            role: role.name,
+            role: roleName,
+            group: isGroup,
             startedAt: Date.now(),
-            platforms: Object.fromEntries(platforms.map((p) => [p.name.toLowerCase(), 'pending'])),
+            platforms: Object.fromEntries(platforms.map((p) => {
+                const name = typeof p === 'string' ? p : p.name;
+                return [String(name).toLowerCase(), 'pending'];
+            })),
         });
 
         // Run platforms IN PARALLEL within an assignment. Most scrapers are
@@ -487,37 +689,51 @@ export class QueueOrchestrator {
         // already in flight, and the backend's in-flight filter excludes
         // platforms still mid-scrape — so over-claiming is impossible.
         const tasks = platforms.map(async (platformInfo) => {
-            const platformName = platformInfo.name.toLowerCase();
-            const scraper = this._resolveScraper(platformName);
+            const platformName = String(
+                typeof platformInfo === 'string' ? platformInfo : platformInfo.name,
+            ).toLowerCase();
+            const scraper = isGroup ? this._groupScraper : this._resolveScraper(platformName);
 
             const triggerNextPoll = () => this.#schedulePoll(platformName);
+            const failedSubmitMeta = isGroup ? { group } : {};
 
             if (!scraper) {
                 log.warn('Unknown platform', { platformName });
-                await this.#safeSubmit(sessionId, platformName, [], 'failed', 'Platform not supported');
+                await this.#safeSubmit(
+                    sessionId, platformName, [], 'failed', 'Platform not supported', failedSubmitMeta,
+                );
                 this.#markPlatform(sessionId, platformName, 'failed');
                 triggerNextPoll();
                 return { platformName, result: { success: false, error: 'Platform not supported' } };
             }
 
             try {
-                // Pass AI-generated LinkedIn search queries (if any)
-                // through to the scraper. Only LinkedIn looks at it
-                // today; others ignore the extra option.
-                //
-                // `candidateQuery` is a recruiter-authored boolean for ONE
-                // candidate and, when present, is the exact string to search —
-                // it wins over the role's random variant pick. LinkedIn-only,
-                // because it is the only platform that takes a free-text query.
-                const { jobs, emptyConfirmed } = await scraper.executeWithMeta(
-                    role.name, location, sessionId, {
+                // Role scrapers receive the existing search context. Group
+                // collection receives source provenance and no fabricated role
+                // or query, so it cannot accidentally use content-search.
+                const executeOptions = isGroup
+                    ? { group }
+                    : {
                         searchQueries: role.search_queries || null,
                         candidateQuery: assignment.candidate_query?.query || null,
-                    },
+                    };
+                const output = await scraper.executeWithMeta(
+                    isGroup ? null : role.name,
+                    location,
+                    sessionId,
+                    executeOptions,
                 );
+                const jobs = Array.isArray(output?.jobs) ? output.jobs : [];
+                const emptyConfirmed = output?.emptyConfirmed === true;
+                const groupProgress = output?.groupProgress ?? output?.group_progress ?? null;
                 const formatted = jobs.map((job) => formatJobForBlacklight(job, platformName));
+                const submitMeta = { emptyConfirmed };
+                if (isGroup) {
+                    submitMeta.group = group;
+                    submitMeta.groupProgress = groupProgress;
+                }
                 const submitResponse = await this.client.submitJobs(
-                    sessionId, platformName, formatted, 'success', null, { emptyConfirmed },
+                    sessionId, platformName, formatted, 'success', null, submitMeta,
                 );
 
                 if (formatted.length === 0) {
@@ -533,6 +749,7 @@ export class QueueOrchestrator {
                         {
                             platform: platformName,
                             sessionId,
+                            group: group?.id ?? null,
                             emptyConfirmed,
                             // Keep the alert tag ONLY for the suspicious case; a
                             // confirmed empty is normal and must not page anyone.
@@ -542,6 +759,7 @@ export class QueueOrchestrator {
                 } else {
                     log.info('Jobs submitted', {
                         platform: platformName,
+                        group: group?.id ?? null,
                         jobCount: formatted.length,
                         progress: submitResponse.progress,
                     });
@@ -568,11 +786,19 @@ export class QueueOrchestrator {
                     log.info('Platform skipped — no credentials (race with pre-flight)', {
                         platform: platformName,
                     });
-                    await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message);
+                    const groupProgress = error.groupProgress ?? error.group_progress ?? null;
+                    await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message, {
+                        ...failedSubmitMeta,
+                        ...(groupProgress ? { groupProgress } : {}),
+                    });
                     metrics.recordJobsSubmitted(platformName, 'no_creds', 0);
                 } else {
                     log.error('Platform scrape failed', { platform: platformName, err: error.message });
-                    await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message);
+                    const groupProgress = error.groupProgress ?? error.group_progress ?? null;
+                    await this.#safeSubmit(sessionId, platformName, [], 'failed', error.message, {
+                        ...failedSubmitMeta,
+                        ...(groupProgress ? { groupProgress } : {}),
+                    });
                     metrics.recordJobsSubmitted(platformName, 'failed', 0);
                 }
                 this.#markPlatform(sessionId, platformName, 'failed');
@@ -604,7 +830,8 @@ export class QueueOrchestrator {
             if (results.summary.total_platforms > 0 && results.summary.successful === 0) {
                 log.error('All platforms failed for assignment — completing session anyway (backend coordination)', {
                     sessionId,
-                    role: role.name,
+                    role: roleName,
+                    group: group?.id ?? null,
                     totalPlatforms: results.summary.total_platforms,
                     scraper_alert: 'session_all_failed',
                 });
@@ -616,7 +843,8 @@ export class QueueOrchestrator {
                 results.completion = completion;
                 log.info('Session completed', {
                     sessionId,
-                    role: role.name,
+                    role: roleName,
+                    group: group?.id ?? null,
                     durationSec: completion.duration_seconds,
                     imported: completion.jobs?.total_imported,
                     found: completion.jobs?.total_found,
@@ -642,9 +870,9 @@ export class QueueOrchestrator {
         if (session) session.platforms[platformName] = state;
     }
 
-    async #safeSubmit(sessionId, platform, jobs, status, errorMessage) {
+    async #safeSubmit(sessionId, platform, jobs, status, errorMessage, meta = {}) {
         try {
-            await this.client.submitJobs(sessionId, platform, jobs, status, errorMessage);
+            await this.client.submitJobs(sessionId, platform, jobs, status, errorMessage, meta);
         } catch (error) {
             log.error('Failed to report platform result', { platform, err: error.message });
         }

@@ -1,0 +1,23 @@
+{
+  "schema": "linkedin-group-pagination-fixture-v1",
+  "capturedAt": "2026-09-11",
+  "groupId": "10472901",
+  "request": {
+    "method": "GET",
+    "path": "/voyager/api/graphql",
+    "queryId": "voyagerFeedDashGroupsUpdates.42b722995f2477fa5a9e6797dbd28281",
+    "variables": {
+      "start": 32,
+      "count": 10,
+      "groupId": "10472901",
+      "paginationToken": "<opaque-pagination-token>"
+    },
+    "status": 200
+  },
+  "paging": {
+    "totalLoadedAfterBoundedScroll": 30,
+    "hasMoreAtCapturePoint": "unknown",
+    "endSignalObserved": false,
+    "cursorResumeShape": "variables=(start:<n>,count:<n>,groupId:10472901,paginationToken:<opaque>)"
+  }
+}

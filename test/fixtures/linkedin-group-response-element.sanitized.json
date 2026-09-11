@@ -1,0 +1,68 @@
+{
+  "schema": "linkedin-group-pagination-response-element-v1",
+  "capturedAt": "2026-09-11",
+  "groupId": "10472901",
+  "data": {
+    "feedDashGroupsUpdatesByGroupsFeed": {
+      "elements": [
+        {
+          "entityUrn": "urn:li:fsd_update:(urn:li:activity:7504055760767811584,PUBLIC_GROUP_FEED,DEBUG_REASON,DEFAULT,false)",
+          "metadata": {
+            "backendUrn": "urn:li:activity:7504055760767811584",
+            "shareUrn": "urn:li:groupPost:10472901-7504055759815708672"
+          },
+          "commentary": {
+            "numLines": 3,
+            "_type": "com.linkedin.voyager.dash.feed.component.commentary.CommentaryComponent",
+            "translation": null,
+            "navigationContext": null,
+            "metadataText": null,
+            "text": {
+              "textDirection": "FIRST_STRONG",
+              "_type": "com.linkedin.voyager.dash.common.text.TextViewModel",
+              "text": "We’re Hiring for US | Enterprise Presales Consultant\n\n Location: USA\n Experience: 8+ Years\n Domain: Telecom | CPaaS | Network APIs | Enterprise Solutions\n\nRole Overview:\nWe are looking for an Enterprise Presales Consultant to drive end-to-end presales activities for enterprise customers. The role will work closely with Sales, Product, Engineering, Delivery, and customers to design and present scalable communication and network solutions.\n\nKey Responsibilities:\n· Own the end-to-end enterprise presales cycle, from discovery to solution               design and deal closure.\n· Understand customer requirements, use cases, technical expectations, and business objectives.\n· Design end-to-end solution architectures aligned with customer needs and network constraints.\n· Present and position CPaaS solutions, including SMS, Voice, WhatsApp, OTP, and APIs.\n· Work with Network APIs / NaaS capabilities such as Identity, Location, QoS, Authentication, and Charging.\n· Conduct customer workshops, product demonstrations, solution walkthroughs, RFPs and RFIs.\n· Engage with CXOs, IT Heads, Digital teams, and enterprise stakeholders.\n· Collaborate with Sales, Product, Engineering, and Delivery teams to develop customer solutions.\n· Prepare BoQs, solution costing, pricing inputs, technical commercials, and proposals.\n· Provide customer and market feedback to Product teams and track competitor offerings.\n\nRequired Skills:\n· 8+ years of experience in Enterprise Presales, Solution Consulting, or Solution Architecture.\n· Strong experience in Telecom / CPaaS / Digital Communications.\n· Hands-on understanding of APIs, Messaging, Voice, WhatsApp Business, OTP, and enterprise communication workflows.\n· Knowledge of telecom networks, cloud platforms, APIs, and enterprise IT integrations.\n· Experience with BoQ, solution costing, RFP/RFI responses, workshops, and demos.\n· Exposure to Network APIs / NaaS is highly desirable.\n· Excellent communication, presentation, stakeholder management, and       enterprise relationship-building skills.\n\nBachelor’s degree in Engineering / Telecom / IT / Computer Science or equivalent.\n\nInterested candidates can DM me for further discussion and or share there updated CV at: [public email redacted]\n\n#USA #NorthUSA",
+              "attributesV2": [],
+              "_recipeType": "com.linkedin.7335a897043ba81085b6a30544cb48fa",
+              "accessibilityTextAttributesV2": [],
+              "accessibilityText": null
+            },
+            "_recipeType": "com.linkedin.7fba0a8197dcf93f7c5488baf2e6de3a"
+          }
+        }
+      ],
+      "paging": {
+        "count": 10,
+        "start": 2,
+        "_type": "com.linkedin.restli.common.CollectionMetadata",
+        "total": 10,
+        "_recipeType": "com.linkedin.b6ce4973633d57391e6aa1e2c753056d"
+      },
+      "metadata": {
+        "paginationToken": "<opaque-pagination-token>",
+        "paginationTokenExpiryTime": 1789119144331
+      }
+    }
+  },
+  "captureMeta": {
+    "httpStatus": 200,
+    "contentType": "application/json; charset=UTF-8",
+    "selectedElementIndex": 0,
+    "paginationTokenLength": 57,
+    "tokenExpiresInSecondsAtCapture": 3456,
+    "metadataUrnPaths": [
+      {
+        "path": "$.data.feedDashGroupsUpdatesByGroupsFeed.elements[0].metadata.backendUrn",
+        "urn": "urn:li:activity:7504055760767811584"
+      },
+      {
+        "path": "$.data.feedDashGroupsUpdatesByGroupsFeed.elements[0].metadata.shareUrn",
+        "urn": "urn:li:groupPost:10472901-7504055759815708672"
+      }
+    ],
+    "redactions": [
+      "public contact values in commentary text",
+      "cursor value",
+      "author-like fields"
+    ]
+  }
+}
