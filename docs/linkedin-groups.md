@@ -1,8 +1,9 @@
 # LinkedIn group collection
 
-The scraper recognizes LinkedIn group `10472901` at
-`https://www.linkedin.com/groups/10472901/` as an explicit backend source.
-It never supplies a role name or search query for this source.
+Each configured LinkedIn group is an explicit backend source.
+The collector uses the group ID and canonical URL from its backend assignment,
+including `https://www.linkedin.com/groups/10472901/` and additional configured groups.
+It never supplies a role name or search query for these sources.
 
 The collector reuses the LinkedIn credential lease, the credential's profile
 and proxy, and the existing browser-pool seat.
@@ -58,6 +59,23 @@ The source remains backend-controlled and disabled until an operator enables
 it after authenticated feed verification.
 
 
+## Managing multiple groups
+
+In CentralD, open **Scraper Monitoring → LinkedIn Groups**.
+Add a LinkedIn group URL or numeric group ID and choose its collection interval.
+New groups are disabled by default; enable them explicitly when ready to collect.
+The list supports enabling/disabling groups and changing each interval, with the last collection result and import/skip counts shown per group.
+Duplicate group URLs and IDs refer to the same source and cannot create a second schedule.
+
+Each source retains its own checkpoint, lease, and next collection time.
+Adding or editing one source never resets another source's progress.
+Group collection shares the existing LinkedIn account capacity and visits configured groups as they become due.
+Disabling a group prevents new claims and preserves its history and accepted work.
+
+The PM-admin API is `GET/POST /api/pm/linkedin-groups` and `PATCH /api/pm/linkedin-groups/<source_id>`.
+Create requests accept `group`, `interval_minutes`, and `enabled`; updates accept only `interval_minutes` and `enabled`.
+Group IDs and HTTPS LinkedIn group URLs are canonicalized server-side.
+
 ## Operation
 
 The source retains the existing US, staffing, age, and non-job eligibility filters.
@@ -75,7 +93,7 @@ python scripts/configure_linkedin_group.py --group-id 10472901
 ```
 
 The command is a dry run unless `--commit` is supplied.
-An operator can explicitly enable or disable collection:
+The CLI also accepts different IDs, so an operator can configure multiple groups one at a time or enable/disable an existing source:
 
 ```bash
 python scripts/configure_linkedin_group.py --group-id 10472901 --interval-minutes 30 --enable --commit

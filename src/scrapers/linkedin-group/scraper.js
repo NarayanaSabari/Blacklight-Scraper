@@ -33,7 +33,16 @@ const DEFAULT_GROUP_TIME_BUDGET_MS = 240_000;
 const GROUP_PAGE_COUNT = 10;
 const MAX_EXPAND_BUTTONS = 50;
 
-function groupRequest(url) {
+function validateGroupSource(group) {
+    const id = String(group?.id ?? '');
+    if (!/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id))
+        || group?.url !== `https://www.linkedin.com/groups/${id}/`) {
+        throw new ValidationError('Invalid LinkedIn group source or canonical URL', { platform: 'linkedin' });
+    }
+    return id;
+}
+
+function groupRequest(url, groupId = GROUP_ID) {
     let parsed;
     try { parsed = new URL(url, GROUP_URL); }
     catch { return null; }
@@ -41,20 +50,21 @@ function groupRequest(url) {
         || parsed.pathname !== '/voyager/api/graphql') return null;
     if (parsed.searchParams.get('queryId') !== GROUP_QUERY_ID) return null;
     const variables = parsed.searchParams.get('variables') ?? '';
-    if (!/(?:^|[(,])groupId:(?:["'])?10472901(?:["'])?(?:[,)]|$)/.test(variables)) return null;
+    const ids = [...variables.matchAll(/(?:^|[(,])groupId:(?:["'])?(\d+)(?:["'])?(?=[,)]|$)/g)];
+    if (ids.length !== 1 || ids[0][1] !== String(groupId)) return null;
     return parsed;
 }
 
-function requestCursor(url) {
-    const parsed = groupRequest(url);
+function requestCursor(url, groupId = GROUP_ID) {
+    const parsed = groupRequest(url, groupId);
     if (!parsed) return null;
     const variables = parsed.searchParams.get('variables') ?? '';
     const match = variables.match(/(?:^|[(,])paginationToken:([^,)]*)/);
     return match?.[1] || null;
 }
 
-function requestStart(url) {
-    const parsed = groupRequest(url);
+function requestStart(url, groupId = GROUP_ID) {
+    const parsed = groupRequest(url, groupId);
     if (!parsed) return null;
     const variables = parsed.searchParams.get('variables') ?? '';
     const match = variables.match(/(?:^|[(,])start:(\d+)/);
@@ -90,11 +100,11 @@ function encodeGroupCursor(token, start = null, expiresAt = null, skip = 0) {
     return JSON.stringify(cursor);
 }
 
-function buildGroupPaginationUrl(cursor, start = null) {
+function buildGroupPaginationUrl(cursor, start = null, groupId = GROUP_ID) {
     const details = decodeGroupCursor(cursor);
     const effectiveStart = Number.isInteger(start) && start >= 0 ? start : details.start;
     if (!details.token || !Number.isInteger(effectiveStart)) return null;
-    const variables = `(start:${effectiveStart},count:${GROUP_PAGE_COUNT},groupId:${GROUP_ID},paginationToken:${details.token})`;
+    const variables = `(start:${effectiveStart},count:${GROUP_PAGE_COUNT},groupId:${groupId},paginationToken:${details.token})`;
     return `https://www.linkedin.com/voyager/api/graphql?variables=${encodeURIComponent(variables)}&queryId=${GROUP_QUERY_ID}`;
 }
 
@@ -126,9 +136,9 @@ function explicitlyExpiredCursor(body) {
         || /(?:expired|invalid|stale)[^\n]{0,80}(?:pagination|page|feed)\s*(?:token|cursor)/.test(text);
 }
 
-async function replayGroupCursor(page, cursor, cookies, { start = null } = {}) {
+async function replayGroupCursor(page, cursor, cookies, { start = null, groupId = GROUP_ID } = {}) {
     if (!cursor || typeof page?.evaluate !== 'function') return null;
-    const url = buildGroupPaginationUrl(cursor, start);
+    const url = buildGroupPaginationUrl(cursor, start, groupId);
     if (!url) return null;
     const csrf = cookies?.find?.((cookie) => cookie.name === 'JSESSIONID')?.value ?? null;
     const result = await page.evaluate(async ({ requestUrl, csrfToken }) => {
@@ -153,12 +163,12 @@ async function replayGroupCursor(page, cursor, cookies, { start = null } = {}) {
     return {
         url,
         status,
-        parsed: parseGroupGraphqlResponse(result.body, { groupId: GROUP_ID }),
+        parsed: parseGroupGraphqlResponse(result.body, { groupId }),
     };
 }
 
-export function groupPaginationCursor(url) {
-    return requestCursor(url);
+export function groupPaginationCursor(url, groupId = GROUP_ID) {
+    return requestCursor(url, groupId);
 }
 
 function hasRecognizedFeed(markup) {
@@ -242,9 +252,7 @@ export async function collectObservedGroupDom({
     scrollWaitMs = DEFAULT_SCROLL_WAIT_MS,
     now = () => Date.now(),
 } = {}) {
-    if (!group || String(group.id) !== String(GROUP_ID) || group.url !== GROUP_URL) {
-        throw new ValidationError('Unsupported LinkedIn group source', { platform: 'linkedin' });
-    }
+    const groupId = validateGroupSource(group);
     const checkpoint = normalizeGroupCheckpoint(rawCheckpoint);
 
     return session.withCookies(sessionId, async (cookies, lease) => {
@@ -272,12 +280,12 @@ export async function collectObservedGroupDom({
         };
         const captureRequest = (request, { responseOnly = false } = {}) => {
             const url = request?.url?.();
-            if (!url || !groupRequest(url)) return null;
+            if (!url || !groupRequest(url, groupId)) return null;
             if (requestSequenceByUrl.has(url)) {
                 if (!responseOnly) responseOnlyRequests.delete(url);
                 return requestSequenceByUrl.get(url);
             }
-            const start = requestStart(url);
+            const start = requestStart(url, groupId);
             requestStarts.set(url, start);
             let insertAt = requestOrder.length;
             if (responseOnly && Number.isInteger(start)) {
@@ -300,7 +308,7 @@ export async function collectObservedGroupDom({
         };
         const captureResponse = (response) => {
             const url = response?.url?.();
-            if (!url || !groupRequest(url)) return;
+            if (!url || !groupRequest(url, groupId)) return;
             if (capturedResponseUrls.has(url)) return;
             capturedResponseUrls.add(url);
             captureRequest(response, { responseOnly: true });
@@ -471,8 +479,8 @@ export async function collectObservedGroupDom({
                     if (!responsePage?.ready) break;
                     consumedResponses += 1;
                     if (consumedDirectReplayUrls.has(responsePage.url)) continue;
-                    const inputToken = requestCursor(responsePage.url);
-                    const inputCursor = encodeGroupCursor(inputToken, requestStart(responsePage.url));
+                    const inputToken = requestCursor(responsePage.url, groupId);
+                    const inputCursor = encodeGroupCursor(inputToken, requestStart(responsePage.url, groupId));
                     const merged = consumeParsed(responsePage.parsed, {
                         source: responsePage.source ?? 'head',
                         inputCursor,
@@ -509,12 +517,13 @@ export async function collectObservedGroupDom({
                         break;
                     }
                     const replayStart = replayDetails.start ?? headCursorStart;
-                    const replayUrl = buildGroupPaginationUrl(replayCursor, replayStart);
+                    const replayUrl = buildGroupPaginationUrl(replayCursor, replayStart, groupId);
                     if (!replayUrl) break;
                     replayUrls.add(replayUrl);
                     try {
                         const replay = await replayGroupCursor(page, replayCursor, cookies, {
                             start: replayStart,
+                            groupId,
                         });
                         if (replay?.expired) {
                             expiredResponseUrls.add(replay.url);
@@ -617,7 +626,7 @@ export async function collectObservedGroupDom({
                 const requestAdded = requests.length - requestCount;
                 if (resumeCursor && requests
                     .slice(requestCount)
-                    .some((url) => requestCursor(url) === resumeToken)) {
+                    .some((url) => requestCursor(url, groupId) === resumeToken)) {
                     resumedPastCursor = true;
                 }
                 if (afterMerged.truncated) {
@@ -695,16 +704,7 @@ export async function collectGroupFeed({
     timeBudgetMs = 420_000,
     now,
 } = {}) {
-    if (!group || String(group.id) !== String(GROUP_ID)) {
-        throw new ValidationError(`Unsupported LinkedIn group source: ${group?.id ?? 'missing'}`, {
-            platform: 'linkedin',
-        });
-    }
-    if (group.url !== GROUP_URL) {
-        throw new ValidationError('LinkedIn group URL does not match the canonical source', {
-            platform: 'linkedin',
-        });
-    }
+    validateGroupSource(group);
     if (typeof fetchPage !== 'function') {
         // Do not silently treat a page obtained through an unverified path as a
         // complete history scan.  The transport is supplied by the live-feed
