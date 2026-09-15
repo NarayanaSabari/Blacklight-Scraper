@@ -25,6 +25,7 @@ import {
 } from './feed.js';
 
 export const GROUP_QUERY_ID = 'voyagerFeedDashGroupsUpdates.42b722995f2477fa5a9e6797dbd28281';
+const GROUP_QUERY_ID_PATTERN = /^voyagerFeedDashGroupsUpdates\.[a-f0-9]{32}$/;
 const DEFAULT_SCROLL_WAIT_MS = 750;
 // CloakBrowser seats are reclaimed after five minutes. Keep a live group walk
 // below that lease boundary even if the feed keeps producing continuation
@@ -48,11 +49,15 @@ function groupRequest(url, groupId = GROUP_ID) {
     catch { return null; }
     if (parsed.origin !== 'https://www.linkedin.com'
         || parsed.pathname !== '/voyager/api/graphql') return null;
-    if (parsed.searchParams.get('queryId') !== GROUP_QUERY_ID) return null;
+    if (!GROUP_QUERY_ID_PATTERN.test(parsed.searchParams.get('queryId') ?? '')) return null;
     const variables = parsed.searchParams.get('variables') ?? '';
     const ids = [...variables.matchAll(/(?:^|[(,])groupId:(?:["'])?(\d+)(?:["'])?(?=[,)]|$)/g)];
     if (ids.length !== 1 || ids[0][1] !== String(groupId)) return null;
     return parsed;
+}
+
+function requestQueryId(url, groupId = GROUP_ID) {
+    return groupRequest(url, groupId)?.searchParams.get('queryId') ?? null;
 }
 
 function requestCursor(url, groupId = GROUP_ID) {
@@ -100,12 +105,13 @@ function encodeGroupCursor(token, start = null, expiresAt = null, skip = 0) {
     return JSON.stringify(cursor);
 }
 
-function buildGroupPaginationUrl(cursor, start = null, groupId = GROUP_ID) {
+function buildGroupPaginationUrl(cursor, start = null, groupId = GROUP_ID, queryId = GROUP_QUERY_ID) {
     const details = decodeGroupCursor(cursor);
     const effectiveStart = Number.isInteger(start) && start >= 0 ? start : details.start;
-    if (!details.token || !Number.isInteger(effectiveStart)) return null;
+    if (!details.token || !Number.isInteger(effectiveStart)
+        || !GROUP_QUERY_ID_PATTERN.test(queryId)) return null;
     const variables = `(start:${effectiveStart},count:${GROUP_PAGE_COUNT},groupId:${groupId},paginationToken:${details.token})`;
-    return `https://www.linkedin.com/voyager/api/graphql?variables=${encodeURIComponent(variables)}&queryId=${GROUP_QUERY_ID}`;
+    return `https://www.linkedin.com/voyager/api/graphql?variables=${encodeURIComponent(variables)}&queryId=${queryId}`;
 }
 
 function responseStatus(response) {
@@ -113,21 +119,37 @@ function responseStatus(response) {
     return Number.isFinite(Number(status)) ? Number(status) : null;
 }
 
-function errorForGroupResponse(status) {
+function errorForGroupResponse(status, {
+    phase = 'browser_observed_response',
+    queryIdSource = 'browser_observed',
+    queryId = null,
+} = {}) {
+    let error;
     if (status === 401) {
-        return new AuthError('LinkedIn group feed requires authentication', {
+        error = new AuthError('LinkedIn group feed requires authentication', {
             platform: 'linkedin', code: 'NEEDS_RELOGIN',
         });
-    }
-    if (status === 403) {
-        return new BlockedError('LinkedIn group feed access was denied', {
+    } else if (status === 403) {
+        error = new BlockedError('LinkedIn group feed access was denied', {
             platform: 'linkedin', kind: 'access_denied',
         });
+    } else {
+        const diagnostic = [
+            `phase=${phase}`,
+            `query_id_source=${queryIdSource}`,
+            ...(GROUP_QUERY_ID_PATTERN.test(queryId ?? '') ? [`query_id=${queryId}`] : []),
+        ].join(' ');
+        error = new NetworkError(
+            `LinkedIn group GraphQL response returned ${status ?? 'an unknown status'} [${diagnostic}]`,
+            { platform: 'linkedin', statusCode: status },
+        );
     }
-    return new NetworkError(
-        `LinkedIn group GraphQL response returned ${status ?? 'an unknown status'}`,
-        { platform: 'linkedin', statusCode: status },
-    );
+    // Keep operational context bounded and safe for delivery logs. Do not add
+    // URLs, variables, opaque cursors, cookies, CSRF tokens, or response text.
+    error.graphqlPhase = phase;
+    error.graphqlQueryIdSource = queryIdSource;
+    if (GROUP_QUERY_ID_PATTERN.test(queryId ?? '')) error.graphqlQueryId = queryId;
+    return error;
 }
 
 function explicitlyExpiredCursor(body) {
@@ -136,9 +158,11 @@ function explicitlyExpiredCursor(body) {
         || /(?:expired|invalid|stale)[^\n]{0,80}(?:pagination|page|feed)\s*(?:token|cursor)/.test(text);
 }
 
-async function replayGroupCursor(page, cursor, cookies, { start = null, groupId = GROUP_ID } = {}) {
+async function replayGroupCursor(page, cursor, cookies, {
+    start = null, groupId = GROUP_ID, queryId = GROUP_QUERY_ID, queryIdSource = 'hardcoded_fallback',
+} = {}) {
     if (!cursor || typeof page?.evaluate !== 'function') return null;
-    const url = buildGroupPaginationUrl(cursor, start, groupId);
+    const url = buildGroupPaginationUrl(cursor, start, groupId, queryId);
     if (!url) return null;
     const csrf = cookies?.find?.((cookie) => cookie.name === 'JSESSIONID')?.value ?? null;
     const result = await page.evaluate(async ({ requestUrl, csrfToken }) => {
@@ -159,7 +183,11 @@ async function replayGroupCursor(page, cursor, cookies, { start = null, groupId 
     if ((status === 400 || status === 404) && explicitlyExpiredCursor(result.body)) {
         return { url, expired: true, status };
     }
-    if (status < 200 || status >= 300) throw errorForGroupResponse(status);
+    if (status < 200 || status >= 300) {
+        throw errorForGroupResponse(status, {
+            phase: 'cursor_replay', queryIdSource, queryId,
+        });
+    }
     return {
         url,
         status,
@@ -272,6 +300,12 @@ export async function collectObservedGroupDom({
         const requestSequenceByUrl = new Map();
         const responseSlotsByUrl = new Map();
         const replayUrls = new Set();
+        const replayQueryContexts = new Map();
+        // Before a successful observed group response is available, retain the
+        // historical query ID. There is no safe dynamic value to replay yet,
+        // and its 400 remains a non-advancing NETWORK_ERROR.
+        let observedQueryId = GROUP_QUERY_ID;
+        let observedQueryIdSource = 'hardcoded_fallback';
         let consumedResponses = 0;
 
         const refreshRequestSequences = () => {
@@ -327,12 +361,21 @@ export async function collectObservedGroupDom({
             const task = Promise.resolve().then(async () => {
                 const status = responseStatus(response);
                 if (status !== null && (status < 200 || status >= 300)) {
-                    throw errorForGroupResponse(status);
+                    const replayContext = replayQueryContexts.get(url);
+                    throw errorForGroupResponse(status, replayContext ?? {
+                        phase: 'browser_observed_response',
+                        queryIdSource: 'browser_observed',
+                        queryId: requestQueryId(url, groupId),
+                    });
                 }
                 const body = await response.json();
                 responsePage.status = status;
                 responsePage.source = replayUrls.has(url) ? 'replay' : 'head';
                 responsePage.parsed = parseGroupGraphqlResponse(body, { groupId: group.id });
+                if (!replayUrls.has(url)) {
+                    observedQueryId = requestQueryId(url, groupId) ?? observedQueryId;
+                    observedQueryIdSource = 'browser_observed';
+                }
                 responsePage.ready = true;
             }).catch((error) => {
                 responsePage.status = responseStatus(response);
@@ -517,13 +560,22 @@ export async function collectObservedGroupDom({
                         break;
                     }
                     const replayStart = replayDetails.start ?? headCursorStart;
-                    const replayUrl = buildGroupPaginationUrl(replayCursor, replayStart, groupId);
+                    const replayUrl = buildGroupPaginationUrl(
+                        replayCursor, replayStart, groupId, observedQueryId,
+                    );
                     if (!replayUrl) break;
                     replayUrls.add(replayUrl);
+                    replayQueryContexts.set(replayUrl, {
+                        phase: 'cursor_replay',
+                        queryIdSource: observedQueryIdSource,
+                        queryId: observedQueryId,
+                    });
                     try {
                         const replay = await replayGroupCursor(page, replayCursor, cookies, {
                             start: replayStart,
                             groupId,
+                            queryId: observedQueryId,
+                            queryIdSource: observedQueryIdSource,
                         });
                         if (replay?.expired) {
                             expiredResponseUrls.add(replay.url);

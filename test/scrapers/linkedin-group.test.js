@@ -44,11 +44,13 @@ const PROGRESS = {
     posts_seen: 2,
 };
 
-function observedGroupUrl({ token = 'input-token', start = 2, count = 10 } = {}) {
+function observedGroupUrl({
+    token = 'input-token', start = 2, count = 10, groupId = GROUP.id, queryId = GROUP_QUERY_ID,
+} = {}) {
     const variables = encodeURIComponent(
-        `(start:${start},count:${count},groupId:10472901,paginationToken:${token})`,
+        `(start:${start},count:${count},groupId:${groupId},paginationToken:${token})`,
     );
-    return `https://www.linkedin.com/voyager/api/graphql?variables=${variables}&queryId=${GROUP_QUERY_ID}`;
+    return `https://www.linkedin.com/voyager/api/graphql?variables=${variables}&queryId=${queryId}`;
 }
 
 test('the sanitized live capture keeps the activity id distinct from the group id', async () => {
@@ -452,16 +454,17 @@ test('the durable cursor replay follows observed paging offsets through the back
 test('a generic cursor HTTP 400 is failed without silently restarting from the head', async () => {
     const checkpoint = {
         ...GROUP.checkpoint,
-        cursor: JSON.stringify({ token: 'resume-token', start: 12 }),
+        cursor: JSON.stringify({ token: 'resume-token-secret', start: 12 }),
     };
     let contentCalls = 0;
+    let replayUrl;
     await assert.rejects(
         () => collectObservedGroupDom({
             group: GROUP,
             checkpoint,
             sessionId: 'group-session',
             session: {
-                withCookies: async (_id, fn) => fn([{ name: 'JSESSIONID', value: 'csrf' }], { credential: {} }),
+                withCookies: async (_id, fn) => fn([{ name: 'JSESSIONID', value: 'csrf-secret' }], { credential: {} }),
             },
             browserLauncher: async () => ({
                 newPage: async () => ({
@@ -470,9 +473,11 @@ test('a generic cursor HTTP 400 is failed without silently restarting from the h
                     goto: async () => {},
                     content: async () => { contentCalls += 1; return '<div class="occludable-update"></div>'; },
                     url: () => GROUP.url,
-                    evaluate: async (_fn, args) => args?.requestUrl
-                        ? { status: 400, body: { error: 'bad start parameter' } }
-                        : undefined,
+                    evaluate: async (_fn, args) => {
+                        if (!args?.requestUrl) return undefined;
+                        replayUrl = args.requestUrl;
+                        return { status: 400, body: { error: 'body-secret' } };
+                    },
                     waitForTimeout: async () => {},
                 }),
                 close: async () => {},
@@ -482,9 +487,234 @@ test('a generic cursor HTTP 400 is failed without silently restarting from the h
         }),
         (error) => {
             assert.equal(error.code, 'NETWORK_ERROR');
+            assert.equal(error.statusCode, 400);
+            assert.equal(
+                error.message,
+                `LinkedIn group GraphQL response returned 400 [phase=cursor_replay query_id_source=hardcoded_fallback query_id=${GROUP_QUERY_ID}]`,
+            );
+            assert.equal(error.graphqlPhase, 'cursor_replay');
+            assert.equal(error.graphqlQueryIdSource, 'hardcoded_fallback');
+            assert.equal(error.graphqlQueryId, GROUP_QUERY_ID);
+            const safeContext = JSON.stringify({
+                message: error.message,
+                graphqlPhase: error.graphqlPhase,
+                graphqlQueryIdSource: error.graphqlQueryIdSource,
+                graphqlQueryId: error.graphqlQueryId,
+            });
+            assert.doesNotMatch(safeContext, /resume-token-secret|csrf-secret|body-secret/);
             assert.equal(error.groupProgress.stop_reason, 'failed');
             assert.deepEqual(error.groupProgress.checkpoint, checkpoint);
             assert.equal(contentCalls, 0);
+            return true;
+        },
+    );
+    assert.equal(new URL(replayUrl).searchParams.get('queryId'), GROUP_QUERY_ID);
+});
+
+test('a browser-observed group response 400 has safe response provenance', async () => {
+    const currentQueryId = 'voyagerFeedDashGroupsUpdates.ef9036a027a94081bc9d52d4a19f760b';
+    let responseHandler;
+    await assert.rejects(
+        () => collectObservedGroupDom({
+            group: GROUP,
+            sessionId: 'group-session',
+            session: { withCookies: async (_id, fn) => fn([], { credential: {} }) },
+            browserLauncher: async () => ({
+                newPage: async () => ({
+                    locator: () => ({ count: async () => 0 }),
+                    on: (event, handler) => { if (event === 'response') responseHandler = handler; },
+                    goto: async () => responseHandler({
+                        url: () => observedGroupUrl({ token: 'response-token-secret', queryId: currentQueryId }),
+                        status: () => 400,
+                        json: async () => ({ error: 'body-secret' }),
+                    }),
+                    content: async () => '<div class="occludable-update"></div>',
+                    url: () => GROUP.url,
+                    evaluate: async () => {},
+                    waitForTimeout: async () => {},
+                }),
+                close: async () => {},
+            }),
+            maxScrolls: 1,
+            timeBudgetMs: 0,
+        }),
+        (error) => {
+            assert.equal(error.code, 'NETWORK_ERROR');
+            assert.equal(error.statusCode, 400);
+            assert.equal(
+                error.message,
+                `LinkedIn group GraphQL response returned 400 [phase=browser_observed_response query_id_source=browser_observed query_id=${currentQueryId}]`,
+            );
+            assert.equal(error.graphqlPhase, 'browser_observed_response');
+            assert.equal(error.graphqlQueryIdSource, 'browser_observed');
+            assert.equal(error.graphqlQueryId, currentQueryId);
+            assert.doesNotMatch(JSON.stringify({
+                message: error.message,
+                graphqlPhase: error.graphqlPhase,
+                graphqlQueryIdSource: error.graphqlQueryIdSource,
+                graphqlQueryId: error.graphqlQueryId,
+            }), /response-token-secret|body-secret/);
+            return true;
+        },
+    );
+});
+
+test('a malformed or wrong-group observed query cannot replace the replay query ID', async () => {
+    const checkpoint = {
+        ...GROUP.checkpoint,
+        cursor: JSON.stringify({ token: 'resume-token', start: 12 }),
+    };
+    for (const observedUrl of [
+        observedGroupUrl({ queryId: 'not-a-group-query' }),
+        observedGroupUrl({ queryId: 'voyagerFeedDashGroupsUpdates.aabbccddeeff001122334455667788' }),
+        observedGroupUrl({ queryId: 'voyagerFeedDashGroupsOther.ef9036a027a94081bc9d52d4a19f760b' }),
+        observedGroupUrl({
+            queryId: 'voyagerFeedDashGroupsUpdates.ef9036a027a94081bc9d52d4a19f760b',
+        }).replace('https://www.linkedin.com', 'https://evil.example'),
+        observedGroupUrl({
+            groupId: 99999999,
+            queryId: 'voyagerFeedDashGroupsUpdates.ef9036a027a94081bc9d52d4a19f760b',
+        }),
+    ]) {
+        let responseHandler;
+        let replayUrl;
+        await assert.rejects(
+            () => collectObservedGroupDom({
+                group: GROUP,
+                checkpoint,
+                sessionId: 'group-session',
+                session: {
+                    withCookies: async (_id, fn) => fn([{ name: 'JSESSIONID', value: 'csrf' }], { credential: {} }),
+                },
+                browserLauncher: async () => ({
+                    newPage: async () => ({
+                        locator: () => ({ count: async () => 0 }),
+                        on: (event, handler) => { if (event === 'response') responseHandler = handler; },
+                        goto: async () => responseHandler({
+                            url: () => observedUrl,
+                            status: () => 200,
+                            json: async () => ({}),
+                        }),
+                        content: async () => '<div class="occludable-update"></div>',
+                        url: () => GROUP.url,
+                        evaluate: async (_fn, args) => {
+                            if (!args?.requestUrl) return undefined;
+                            replayUrl = args.requestUrl;
+                            return { status: 400, body: { error: 'bad request' } };
+                        },
+                        waitForTimeout: async () => {},
+                    }),
+                    close: async () => {},
+                }),
+                maxScrolls: 1,
+                timeBudgetMs: 0,
+            }),
+            (error) => error.code === 'NETWORK_ERROR',
+        );
+        assert.equal(new URL(replayUrl).searchParams.get('queryId'), GROUP_QUERY_ID);
+    }
+});
+
+test('a resumed cursor replays with the current query ID observed from the group page', async () => {
+    const capture = JSON.parse(await readFile(
+        path.join(process.cwd(), 'test/fixtures/linkedin-group-response-element.sanitized.json'),
+        'utf8',
+    ));
+    const currentQueryId = 'voyagerFeedDashGroupsUpdates.ef9036a027a94081bc9d52d4a19f760b';
+    const checkpoint = {
+        ...GROUP.checkpoint,
+        cursor: JSON.stringify({ token: 'resume-token', start: 12 }),
+    };
+    let responseHandler;
+    let replayUrl;
+    await collectObservedGroupDom({
+        group: GROUP,
+        checkpoint,
+        sessionId: 'group-session',
+        session: {
+            withCookies: async (_id, fn) => fn([{ name: 'JSESSIONID', value: 'csrf' }], { credential: {} }),
+        },
+        browserLauncher: async () => ({
+            newPage: async () => ({
+                locator: () => ({ count: async () => 0 }),
+                on: (event, handler) => { if (event === 'response') responseHandler = handler; },
+                goto: async () => responseHandler({
+                    url: () => observedGroupUrl({ queryId: currentQueryId }),
+                    status: () => 200,
+                    json: async () => capture,
+                }),
+                content: async () => '<div class="occludable-update"></div>',
+                url: () => GROUP.url,
+                evaluate: async (_fn, args) => {
+                    if (!args?.requestUrl) return undefined;
+                    replayUrl = args.requestUrl;
+                    return new URL(replayUrl).searchParams.get('queryId') === GROUP_QUERY_ID
+                        ? { status: 400, body: { error: 'bad request' } }
+                        : { status: 200, body: capture };
+                },
+                waitForTimeout: async () => {},
+            }),
+            close: async () => {},
+        }),
+        maxScrolls: 1,
+        timeBudgetMs: 0,
+    });
+    assert.equal(new URL(replayUrl).searchParams.get('queryId'), currentQueryId);
+});
+
+test('a replay response event retains the browser-observed query provenance', async () => {
+    const capture = JSON.parse(await readFile(
+        path.join(process.cwd(), 'test/fixtures/linkedin-group-response-element.sanitized.json'),
+        'utf8',
+    ));
+    const currentQueryId = 'voyagerFeedDashGroupsUpdates.ef9036a027a94081bc9d52d4a19f760b';
+    const checkpoint = {
+        ...GROUP.checkpoint,
+        cursor: JSON.stringify({ token: 'resume-token', start: 12 }),
+    };
+    let responseHandler;
+    await assert.rejects(
+        () => collectObservedGroupDom({
+            group: GROUP,
+            checkpoint,
+            sessionId: 'group-session',
+            session: {
+                withCookies: async (_id, fn) => fn([{ name: 'JSESSIONID', value: 'csrf-secret' }], { credential: {} }),
+            },
+            browserLauncher: async () => ({
+                newPage: async () => ({
+                    locator: () => ({ count: async () => 0 }),
+                    on: (event, handler) => { if (event === 'response') responseHandler = handler; },
+                    goto: async () => responseHandler({
+                        url: () => observedGroupUrl({ queryId: currentQueryId }),
+                        status: () => 200,
+                        json: async () => capture,
+                    }),
+                    content: async () => '<div class="occludable-update"></div>',
+                    url: () => GROUP.url,
+                    evaluate: async (_fn, args) => {
+                        if (!args?.requestUrl) return undefined;
+                        responseHandler({
+                            url: () => args.requestUrl,
+                            status: () => 400,
+                            json: async () => ({ error: 'body-secret' }),
+                        });
+                        return { status: 200, body: capture };
+                    },
+                    waitForTimeout: async () => {},
+                }),
+                close: async () => {},
+            }),
+            maxScrolls: 1,
+            timeBudgetMs: 0,
+        }),
+        (error) => {
+            assert.equal(error.code, 'NETWORK_ERROR');
+            assert.equal(
+                error.message,
+                `LinkedIn group GraphQL response returned 400 [phase=cursor_replay query_id_source=browser_observed query_id=${currentQueryId}]`,
+            );
+            assert.doesNotMatch(error.message, /resume-token|csrf-secret|body-secret/);
             return true;
         },
     );
@@ -743,6 +973,32 @@ test('group claim is scheduled through the existing queue cycle', async () => {
     assert.equal(group.calls.length, 1);
     assert.deepEqual(client.calls.submits[0].meta.groupProgress, PROGRESS);
     assert.deepEqual(client.calls.completes, ['group-session']);
+});
+
+test('a group GraphQL diagnostic suffix reaches the persisted failed session error', async () => {
+    const errorMessage = `LinkedIn group GraphQL response returned 400 [phase=cursor_replay query_id_source=browser_observed query_id=${GROUP_QUERY_ID}]`;
+    const client = fakeQueueClient();
+    const group = groupScraper();
+    group.executeWithMeta = async () => {
+        throw new NetworkError(errorMessage, { statusCode: 400 });
+    };
+    const orchestrator = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1000, startupDelayMs: 1000 },
+        client,
+        metrics: metrics(),
+        groupScraper: group,
+        platformOverrides: { pausedList: () => [], intervalMinutes: () => null },
+        cooldownCheck: () => [],
+    });
+    orchestrator._preferGroupNext = true;
+
+    await orchestrator.runOnce();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(client.calls.submits.length, 1);
+    assert.equal(client.calls.submits[0].status, 'failed');
+    assert.equal(client.calls.submits[0].errorMessage, errorMessage);
+    assert.doesNotMatch(client.calls.submits[0].errorMessage, /resume-token|csrf-secret|body-secret/);
 });
 
 test('a normal LinkedIn assignment suppresses a same-cycle group claim', async () => {
