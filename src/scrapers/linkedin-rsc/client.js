@@ -124,7 +124,7 @@ export function buildHeaders(template, cookies, params) {
  * it surfaces as AuthError (cool the credential, rotate). A 429 is the platform
  * pushing back, so it surfaces as BlockedError.
  */
-export async function fetchPage({ template, cookies, params, fetchImpl = fetch }) {
+export async function fetchPage({ template, cookies, params, fetchImpl = fetch, onResponse = null }) {
     const headers = buildHeaders(template, cookies, params);
     const body = buildPaginationBody(template, params);
 
@@ -137,23 +137,38 @@ export async function fetchPage({ template, cookies, params, fetchImpl = fetch }
         });
     }
 
+    // Status remains the first decision. Do not read an error body merely for
+    // diagnostics: that changes the original error path and may block on an
+    // endpoint that never finishes streaming a rejected response.
     if (response.status === 403) {
+        try { onResponse?.({ httpStatus: response.status, utf8Bytes: null }); } catch { /* observational only */ }
         throw new AuthError(
             'LinkedIn rejected the RSC request (403) — session cookies dead, needs re-login',
             { platform: 'linkedin', code: 'NEEDS_RELOGIN' },
         );
     }
     if (response.status === 429) {
+        try { onResponse?.({ httpStatus: response.status, utf8Bytes: null }); } catch { /* observational only */ }
         throw new BlockedError('LinkedIn rate-limited the RSC endpoint (429)', {
             platform: 'linkedin', kind: 'rate_limit',
         });
     }
     if (response.status < 200 || response.status >= 300) {
+        try { onResponse?.({ httpStatus: response.status, utf8Bytes: null }); } catch { /* observational only */ }
         throw new NetworkError(`LinkedIn RSC request returned ${response.status}`, {
             platform: 'linkedin', statusCode: response.status,
         });
     }
-    return response.text();
+    // Preserve the old rejection semantics: a failed text read rejects the
+    // request. Only successful reads produce a byte-count observation.
+    const responseBody = await response.text();
+    try {
+        onResponse?.({
+            httpStatus: response.status,
+            utf8Bytes: Buffer.byteLength(responseBody, 'utf8'),
+        });
+    } catch { /* diagnostics must not alter transport behaviour */ }
+    return responseBody;
 }
 
 // Jittered pause between requests. Uniform back-to-back requests are a
@@ -190,6 +205,10 @@ export async function paginate({
     delay = defaultDelay,
     rng = Math.random,
     now = () => Date.now(),
+    // Observational seam used by the normal scraper's bounded runtime logs.
+    // It receives aggregates only, never the body or request values.
+    onPage = null,
+    onHttpResponse = null,
 }) {
     const posts = [];
     const seen = new Set();
@@ -202,6 +221,7 @@ export async function paginate({
     let sawKnownPost = false;
     let reachedKnownGround = false;
     let newestSeen = null;
+    let stopReason = 'page_cap';
     // NOT `startedAt` — the loop body declares its own `startedAt` for per-page
     // latency, and shadowing it puts this reference in the temporal dead zone.
     const runStartedAt = now();
@@ -211,16 +231,22 @@ export async function paginate({
         // us issuing more work, and a partial result is still worth returning.
         if (timeBudgetMs > 0 && now() - runStartedAt >= timeBudgetMs) {
             budgetExhausted = true;
+            stopReason = 'time_budget';
             break;
         }
         if (page > 0) await delay(nextPause(rng));
 
         const startedAt = Date.now();
+        let responseMeta = { httpStatus: null, utf8Bytes: null };
         const body = await fetchPage({
             template,
             cookies,
             params: { keywords, datePosted, startIndex: page * count, count },
             fetchImpl,
+            onResponse: (meta) => {
+                responseMeta = meta;
+                try { onHttpResponse?.({ pageIndex: page + 1, ...meta }); } catch { /* observational only */ }
+            },
         });
 
         if (isConfirmedEmpty(body)) sawNoResultsSignal = true;
@@ -252,10 +278,21 @@ export async function paginate({
         pages.push({
             page: page + 1,
             start_index: page * count,
-            bytes: body.length,
+            bytes: responseMeta.utf8Bytes ?? Buffer.byteLength(body, 'utf8'),
             latency_ms: Date.now() - startedAt,
             posts_added: added,
         });
+
+        try {
+            onPage?.({
+                pageIndex: page + 1,
+                httpStatus: responseMeta.httpStatus,
+                utf8Bytes: responseMeta.utf8Bytes ?? Buffer.byteLength(body, 'utf8'),
+                extractedCount: pageRows,
+                addedCount: added,
+                confirmedEmptySignal: isConfirmedEmpty(body),
+            });
+        } catch { /* diagnostics must not alter pagination */ }
 
         // LinkedIn re-serves overlapping windows; a page adding nothing means the
         // result set is exhausted. With a mark set, a page that returned rows
@@ -263,8 +300,12 @@ export async function paginate({
         // whole point of the mark, and where the request saving comes from.
         if (added === 0) {
             if (sinceActivityId && pageRows > 0) reachedKnownGround = true;
+            stopReason = pageRows === 0
+                ? 'extracted_zero'
+                : (sinceActivityId ? 'known_ground' : 'duplicate_window');
             break;
         }
+        if (posts.length >= maxPosts) stopReason = 'post_cap';
     }
 
     return {
@@ -285,5 +326,6 @@ export async function paginate({
         // out. The caller alerts on this: it should never happen in practice,
         // and if it does the result is silently incomplete.
         budgetExhausted,
+        stopReason,
     };
 }

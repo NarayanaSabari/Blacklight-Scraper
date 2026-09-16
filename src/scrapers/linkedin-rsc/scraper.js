@@ -27,6 +27,7 @@ import { SearchQuotaTracker, applyQuotaPause } from './search-quota.js';
 import * as linkedinCooldown from '../../core/linkedin-cooldown.js';
 import { getMetrics } from '../../metrics/registry.js';
 import { titleFromPost, locationFromPost, companyFromPost } from './post-fields.js';
+import { safeErrorDetails, scrapeCorrelation } from './observability.js';
 
 // One tracker per process: streaks are per-credential inside it, and the
 // canary's whole job is to observe across consecutive scrapes.
@@ -42,6 +43,7 @@ export function searchQuotaStatus() {
 }
 
 const log = createLogger('linkedin-rsc');
+const MAX_PAGE_DETAIL_LOGS = 8;
 
 // A candidate query runs to EXHAUSTION — no post ceiling. A recruiter asked for
 // this specific search, and stopping at 100 threw away most of it: measured on
@@ -208,14 +210,45 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
     // they exist to notice new postings, which is exactly what the mark tracks.
     const sinceActivityId = scoped ? null : highWater?.get?.(keywords, datePosted) ?? null;
 
-    log.info('Starting RSC scrape', {
-        jobTitle, keywords, datePosted, count,
-        maxPosts: scoped ? 'uncapped' : maxPosts,
-        candidateScoped: scoped,
-    });
-
     return session.withCookies(sessionId, async (cookies, lease) => {
+        const correlation = scrapeCorrelation({
+            sessionId, lease, query: keywords, datePosted, candidateScoped: scoped,
+        });
+        const pageLogState = { emitted: 0, suppressed: 0, announcedTruncation: false };
+        const logPage = (page) => {
+            if (pageLogState.emitted < MAX_PAGE_DETAIL_LOGS) {
+                pageLogState.emitted += 1;
+                log.info('RSC page response', { ...correlation, ...page });
+                return;
+            }
+            pageLogState.suppressed += 1;
+            if (!pageLogState.announcedTruncation) {
+                pageLogState.announcedTruncation = true;
+                log.warn('RSC page detail log cap reached - suppressing further page details', {
+                    ...correlation, pageDetailCap: MAX_PAGE_DETAIL_LOGS,
+                });
+            }
+        };
+
+        log.info('RSC scrape started', {
+            ...correlation,
+            requestCount: count,
+            maxPosts: scoped ? null : maxPosts,
+            maxPages: effectiveMaxPages ?? null,
+            timeBudgetMs,
+        });
         const requestTemplate = template ?? await session.template();
+        const templateStatus = typeof session.templateStatus === 'function' ? session.templateStatus() : null;
+        log.info('RSC template health decision', {
+            ...correlation,
+            decision: templateStatus
+                ? (templateStatus.stale ? 'stale' : (templateStatus.liveUnknown ? 'live_version_unknown' : 'healthy'))
+                : 'not_available',
+            templateAgeMs: templateStatus?.ageMs ?? null,
+            versionLag: templateStatus?.lag ?? null,
+            templateBuild: templateStatus?.captured ?? null,
+            liveVersionUnknown: templateStatus?.liveUnknown ?? null,
+        });
 
         // Is this session actually authenticated? Read BEFORE the scrape, so a
         // failure during the walk cannot retroactively change the answer.
@@ -252,6 +285,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
 
         const {
             posts, emptyConfirmed, upToDate, newestActivityId: newestSeen, pages, budgetExhausted,
+            stopReason = null,
         } = await paginateImpl({
             template: requestTemplate,
             cookies,
@@ -263,6 +297,13 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             timeBudgetMs,
             sinceActivityId,
             fetchImpl: boundFetch,
+            onHttpResponse: (page) => {
+                // Successful responses are logged with extraction aggregates by
+                // onPage below. Failures throw before extraction, so record their
+                // status and byte count here without exposing the response body.
+                if (page.httpStatus < 200 || page.httpStatus >= 300) logPage(page);
+            },
+            onPage: logPage,
         });
 
         if (budgetExhausted) {
@@ -271,7 +312,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             // scrape is approaching the backend's 600s orphan window, which
             // would let a second scraper claim the same platform.
             log.error('Candidate query hit its time budget — result is incomplete', {
-                keywords,
+                ...correlation,
                 posts: posts.length,
                 requests: pages?.length ?? 0,
                 budgetMs: CANDIDATE_TIME_BUDGET_MS,
@@ -287,15 +328,21 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         if (!scoped && newestSeen) highWater?.advance?.(keywords, datePosted, newestSeen);
 
         log.info('RSC scrape complete', {
+            ...correlation,
             posts: posts.length,
+            jobsFormatted: jobs.length,
+            jobsAwaitingSubmission: jobs.length,
             withText: posts.filter((p) => (p.text_length ?? 0) > 80).length,
             withEmail: posts.filter((p) => (p.contact_emails ?? []).length > 0).length,
             requests: pages?.length ?? 0,
             emptyConfirmed,
+            extractedZero: posts.length === 0,
             upToDate: Boolean(upToDate),
-            sinceActivityId,
-            candidateScoped: scoped,
             budgetExhausted,
+            stopReason: stopReason ?? (budgetExhausted ? 'time_budget' : 'unknown'),
+            highWaterPresent: sinceActivityId !== null,
+            pageDetailLogs: pageLogState.emitted,
+            pageDetailSuppressed: pageLogState.suppressed,
         });
 
         // Shadow-ban canary. Three things prove the account is being served
@@ -356,6 +403,11 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         const searchServed = jobs.length > 0 || upToDate;
         if (searchServed) {
             quotaTracker.recordServed();
+            log.info('LinkedIn search quota detector observed served search', {
+                ...correlation,
+                searchServed: true,
+                servedBy: jobs.length > 0 ? 'extracted_posts' : 'known_ground',
+            });
         } else if (sessionAlive === false) {
             // A DEAD SESSION IS NOT A QUOTA WINDOW.
             //
@@ -384,20 +436,37 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
             // detection, which is the same rule the canary's
             // `verifyRequestHealth` gate follows.
             log.warn('Zero-yield scrape on a dead session — not counting it toward the search quota', {
-                keywords,
+                ...correlation,
+                sessionAlive: false,
+                sessionAliveSource: 'cache_ttl_derived_not_proven_auth_failure',
+                quotaDecision: 'skipped_dead_session',
                 scraper_alert: 'linkedin_quota_skipped_dead_session',
             });
         } else {
             const { tripped, pauseMs, streak } = quotaTracker.recordEmpty();
+            const quotaSnapshot = quotaTracker.snapshot?.() ?? null;
+            log.info('LinkedIn search quota detector evaluated zero-yield scrape', {
+                ...correlation,
+                searchServed: false,
+                sessionAlive,
+                consecutiveEmpty: streak,
+                threshold: quotaSnapshot?.threshold ?? null,
+                tripped,
+                requestedPauseMs: tripped ? pauseMs : 0,
+            });
             if (tripped) {
+                const pauseRequestedAt = new Date();
                 const paused = applyQuotaPauseImpl({
                     cooldown: quotaCooldown,
                     pauseMs,
-                    now: new Date(),
+                    now: pauseRequestedAt,
                 });
                 log.error('LinkedIn is refusing search platform-wide — pausing to let the quota recover', {
+                    ...correlation,
                     consecutiveEmpty: streak,
-                    pauseMinutes: Math.round(pauseMs / 60000),
+                    threshold: quotaSnapshot?.threshold ?? null,
+                    requestedPauseMs: pauseMs,
+                    requestedUntil: new Date(pauseRequestedAt.getTime() + pauseMs).toISOString(),
                     markerWritten: paused,
                     scraper_alert: 'linkedin_search_quota',
                 });
@@ -427,14 +496,29 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         let canaryVerdict = null;
         if (searchServed || refusedRepeat) {
             canaryTracker.recordHealthy(lease);
-        } else if (canaryTracker.recordEmpty(lease)) {
-            canaryVerdict = await runCanaryImpl({
-                tracker: canaryTracker,
-                lease,
-                template: requestTemplate,
-                cookies,
-                paginateImpl,
-                fetchImpl: boundFetch,
+            log.info('LinkedIn canary detector reset as healthy', {
+                ...correlation,
+                healthReason: searchServed ? 'served_search' : 'confirmed_repeat_refusal',
+                refusedRepeat,
+            });
+        } else {
+            const probeDue = canaryTracker.recordEmpty(lease);
+            const canarySnapshot = canaryTracker.snapshot?.(lease) ?? null;
+            log.info('LinkedIn canary detector evaluated zero-yield scrape', {
+                ...correlation,
+                emptyConfirmed,
+                broadControlVerdict: probeDue ? 'probe_due' : 'not_yet_due',
+                ...canarySnapshot,
+            });
+            if (probeDue) {
+                canaryVerdict = await runCanaryImpl({
+                    tracker: canaryTracker,
+                    lease,
+                    template: requestTemplate,
+                    cookies,
+                    paginateImpl,
+                    fetchImpl: boundFetch,
+                    diagnostics: correlation,
                 // Before blaming the ACCOUNT, rule out our own request. A
                 // template that has fallen behind LinkedIn's client version
                 // makes every search answer "no results", which is exactly the
@@ -450,10 +534,15 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
                 // its previous behaviour — treating "cannot ask" as "request is
                 // broken" would silently disable ban detection everywhere the
                 // capability is absent.
-                verifyRequestHealth: typeof session.isRequestHealthy === 'function'
-                    ? () => session.isRequestHealthy()
-                    : undefined,
-            });
+                    verifyRequestHealth: typeof session.isRequestHealthy === 'function'
+                        ? () => session.isRequestHealthy()
+                        : undefined,
+                });
+                log.warn('LinkedIn canary control verdict completed', {
+                    ...correlation,
+                    broadControlVerdict: canaryVerdict,
+                });
+            }
         }
 
         // Per-role liveness against the held lease, as the DOM path does.
@@ -476,8 +565,9 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
                 await lease?.reportSuccess?.(`RSC scrape: ${posts.length} posts`);
             } catch (error) {
                 log.warn('Liveness ping failed — scrape result kept', {
-                    err: error?.message,
-                    posts: posts.length,
+                    ...correlation,
+                    jobsAwaitingSubmission: jobs.length,
+                    ...safeErrorDetails(error),
                 });
             }
         }

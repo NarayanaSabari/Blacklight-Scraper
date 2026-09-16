@@ -34,6 +34,7 @@
 
 import { createLogger } from '../../logger/index.js';
 import { getMetrics } from '../../metrics/registry.js';
+import { querySha256, safeErrorDetails } from './observability.js';
 
 const log = createLogger('linkedin-rsc:canary');
 
@@ -260,6 +261,16 @@ export class CanaryTracker {
     streak(lease) {
         return this._streaks.get(keyFor(lease)) ?? 0;
     }
+
+    snapshot(lease) {
+        return {
+            consecutiveEmpty: this.streak(lease),
+            suspicionStrikes: this.suspicion(lease),
+            emptyThreshold: this._threshold,
+            probeIntervalMs: this._probeIntervalMs,
+            corroborationIntervalMs: this._corroborationIntervalMs,
+        };
+    }
 }
 
 // Consecutive EMPTY probes, each with a different control query, before a ban
@@ -301,6 +312,9 @@ export async function runCanary({
     // answer, and so a caller with no template context can pass null to keep
     // the previous behaviour.
     verifyRequestHealth = null,
+    // Correlation from the normal RSC run. Kept optional for test and utility
+    // callers that invoke the canary directly.
+    diagnostics = {},
 }) {
     tracker.noteProbe(lease);
     const streak = tracker.streak(lease);
@@ -319,12 +333,12 @@ export async function runCanary({
         }));
     } catch (error) {
         log.warn('Canary probe errored — verdict inconclusive', {
-            streak, err: error?.message,
+            ...diagnostics, streak, ...safeErrorDetails(error),
         });
         // Nothing was learned, so refund most of the budget — but back off if
         // this keeps happening (see noteInconclusive).
         const retryMs = tracker.noteInconclusive(lease);
-        log.warn('Canary retry scheduled after inconclusive probe', { retryMs });
+        log.warn('Canary retry scheduled after inconclusive probe', { ...diagnostics, retryMs });
         return 'inconclusive';
     }
 
@@ -334,7 +348,7 @@ export async function runCanary({
         // The account can see results; the empty streak was honest thin
         // queries. Full reset so the next probe needs a fresh streak.
         log.info('Canary found posts — account healthy, streak was genuine empties', {
-            streak, canaryPosts: posts.length, canaryQuery,
+            ...diagnostics, streak, canaryPosts: posts.length, canaryQuerySha256: querySha256(canaryQuery),
         });
         tracker.reset(lease);
         return 'healthy';
@@ -345,7 +359,7 @@ export async function runCanary({
     const strike = tracker.recordSuspicion(lease);
     if (strike < strikes) {
         log.warn('Canary probe empty — suspected, awaiting corroboration', {
-            streak, canaryQuery, strike, strikesNeeded: strikes,
+            ...diagnostics, streak, canaryQuerySha256: querySha256(canaryQuery), strike, strikesNeeded: strikes,
             scraper_alert: 'linkedin_shadow_ban_suspected',
         });
         return 'suspected';
@@ -382,7 +396,7 @@ export async function runCanary({
             // a genuinely banned account simply gets convicted on the next
             // probe instead.
             log.warn('Could not verify request health — deferring the ban verdict', {
-                err: err?.message,
+                ...diagnostics, ...safeErrorDetails(err),
             });
             requestHealthy = false;
         }
@@ -390,8 +404,9 @@ export async function runCanary({
             log.error(
                 'Canary empty BUT our request looks stale/refused — NOT banning the account',
                 {
+                    ...diagnostics,
                     streak,
-                    canaryQuery,
+                    canaryQuerySha256: querySha256(canaryQuery),
                     strike,
                     scraper_alert: 'linkedin_request_refused_not_ban',
                 },
@@ -411,21 +426,28 @@ export async function runCanary({
     // Corroborated across independent probes with different control queries,
     // and our request is known-good: shadow-ban confirmed.
     log.error('Canary returned empty — LinkedIn account is shadow-banned', {
+        ...diagnostics,
         streak,
-        canaryQuery,
+        canaryQuerySha256: querySha256(canaryQuery),
         strike,
-        cooldownMinutes,
+        strikesNeeded: strikes,
+        requestedCooldownMinutes: cooldownMinutes,
         scraper_alert: 'linkedin_shadow_ban',
     });
     try {
-        await lease?.reportFailure?.(
-            `Shadow-ban canary: "${canaryQuery}" returned 0 posts after `
-            + `${streak} consecutive zero-yield scrapes (${strike} corroborating probes)`,
+        const report = await lease?.reportFailure?.(
+            `Shadow-ban canary confirmed after ${streak} zero-yield scrapes (${strike} corroborating probes)`,
             cooldownMinutes,
         );
+        log.warn('Shadow-ban credential failure report completed', {
+            ...diagnostics,
+            requestedCooldownMinutes: cooldownMinutes,
+            backendAcknowledged: report?.ok === true,
+            persistedCooldownConfirmed: false,
+        });
     } catch (error) {
         log.error('Failed to report shadow-banned credential to the pool', {
-            err: error?.message,
+            ...diagnostics, ...safeErrorDetails(error),
         });
     }
 

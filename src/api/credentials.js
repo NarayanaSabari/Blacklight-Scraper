@@ -32,6 +32,27 @@ const log = createLogger('credentials');
 // circuit for submitJobs/completeSession traffic, and vice versa.
 const CIRCUIT_KEY = 'credentials';
 
+function leaseLogMeta(lease) {
+    const rawId = lease?.id ?? null;
+    const credentialId = typeof rawId === 'number' && Number.isFinite(rawId)
+        ? rawId
+        : (typeof rawId === 'string' && /^\d+$/.test(rawId) ? Number(rawId) : null);
+    return {
+        platform: lease?.platform ?? null,
+        credentialId,
+        sessionId: lease?.sessionId ?? null,
+    };
+}
+
+function safeErrorMeta(error) {
+    const status = error?.statusCode ?? error?.status ?? null;
+    return {
+        errorType: error?.name ?? 'Error',
+        errorCode: error?.code ?? null,
+        httpStatus: Number.isInteger(status) ? status : null,
+    };
+}
+
 // Pure decision for the cookie-jar write-back (handoff §3/§4). No I/O.
 // Mirrors the backend's reject rules so we never POST a guaranteed-400:
 // local → no-op; jar must be a non-empty array containing a non-empty
@@ -300,21 +321,38 @@ export class CredentialsClient {
             return { ok: false, reason: 'no_lease' };
         }
         if (this.isLocal || String(lease.id).startsWith('local-')) {
+            log.warn('Credential failure report handled locally', {
+                ...leaseLogMeta(lease), cooldownMinutes, authDead,
+                backendAcknowledged: false,
+                persistedCooldownConfirmed: false,
+            });
             this.#forgetLease(lease);
             return;
         }
         try {
+            log.warn('Credential failure report requested', {
+                ...leaseLogMeta(lease), cooldownMinutes, authDead,
+            });
             await this.#postLeaseAction(lease, 'failure', {
                 ...planFailureBody({ errorMessage, cooldownMinutes, authDead }),
                 lease_token: lease.leaseToken ?? null,
                 session_id: lease.sessionId ?? null,
             });
-            log.warn('Credential marked failed', { platform: lease.platform, cooldownMinutes, authDead });
+            // The API acknowledges receipt, but its response does not prove the
+            // backend's persisted cooldown or auth-dead state. Keep that
+            // distinction explicit in diagnostics.
+            log.warn('Credential failure report acknowledged by backend', {
+                ...leaseLogMeta(lease), cooldownMinutes, authDead,
+                backendAcknowledged: true,
+                persistedCooldownConfirmed: false,
+            });
             return { ok: true };
         } catch (error) {
             const lost = this.#markLeaseLost(lease, 'failure', error);
             if (lost) return lost;
-            log.error('Failed to report credential failure', { platform: lease.platform, err: error.message });
+            log.error('Credential failure report was not acknowledged', {
+                ...leaseLogMeta(lease), cooldownMinutes, authDead, ...safeErrorMeta(error),
+            });
             return { ok: false, reason: 'error', error };
         } finally {
             this.#forgetLease(lease);

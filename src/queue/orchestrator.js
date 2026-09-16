@@ -735,6 +735,23 @@ export class QueueOrchestrator {
                 const submitResponse = await this.client.submitJobs(
                     sessionId, platformName, formatted, 'success', null, submitMeta,
                 );
+                // submitJobs resolving proves only that the backend acknowledged
+                // this delivery. It does not establish a final importer outcome,
+                // so retain both facts rather than presenting a queued/accepted
+                // count as an imported count.
+                log.info('Platform submission acknowledged', {
+                    sessionId,
+                    platform: platformName,
+                    candidateQueryId: assignment.candidate_query?.id ?? null,
+                    submittedCount: formatted.length,
+                    status: 'success',
+                    emptyConfirmed,
+                    backendAcknowledged: true,
+                    finalImportConfirmed: false,
+                    backendProgressImported: Number.isFinite(submitResponse?.progress?.imported)
+                        ? submitResponse.progress.imported
+                        : null,
+                });
 
                 if (formatted.length === 0) {
                     // SCR-20 (#403): the wire status stays 'success', but it now

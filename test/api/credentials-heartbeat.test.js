@@ -82,6 +82,28 @@ test('terminal failure exposes that the lease was released', async (t) => {
     assert.equal(client._hasActiveLease(lease.leaseKey), false);
 });
 
+test('failure report logs requested versus backend acknowledgement without the error text', async (t) => {
+    const lines = [];
+    t.mock.method(console, 'warn', (line) => lines.push(String(line)));
+    const client = new CredentialsClient({ apiUrl: 'https://blacklight.example.com', apiKey: 'key-1' });
+    const lease = await acquireLease(t, client);
+    mockFetch(t, () => jsonResponse({ status: 'ok', credential_id: 42 }));
+
+    const result = await lease.reportFailure('PRIVATE FAILURE MESSAGE', 60, { authDead: true });
+
+    assert.deepEqual(result, { ok: true });
+    const output = lines.join('\n');
+    assert.match(output, /Credential failure report requested/);
+    assert.match(output, /Credential failure report acknowledged by backend/);
+    assert.match(output, /"credentialId":42/);
+    assert.match(output, /"sessionId":"sess-1"/);
+    assert.match(output, /"cooldownMinutes":60/);
+    assert.match(output, /"authDead":true/);
+    assert.match(output, /"backendAcknowledged":true/);
+    assert.match(output, /"persistedCooldownConfirmed":false/);
+    assert.doesNotMatch(output, /PRIVATE FAILURE MESSAGE/);
+});
+
 test('heartbeat on 409 drops the lease locally and reports superseded', async (t) => {
     const client = new CredentialsClient({ apiUrl: 'https://blacklight.example.com', apiKey: 'key-1' });
     const lease = await acquireLease(t, client);

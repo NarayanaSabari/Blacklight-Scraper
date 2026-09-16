@@ -285,7 +285,8 @@ export function applyQuotaPause({ cooldown, pauseMs, now = new Date() }) {
         return true;
     } catch (err) {
         log.error('Failed to write LinkedIn quota cooldown marker — scraping will continue into the block', {
-            err: err?.message,
+            errorType: err?.name ?? 'Error',
+            errorCode: err?.code ?? null,
         });
         return false;
     }

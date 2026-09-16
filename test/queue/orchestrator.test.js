@@ -238,6 +238,60 @@ test('O9: a platform returning 0 jobs still submits success but is recorded dist
     );
 });
 
+test('post-submit log correlates backend acknowledgement without claiming final import', async (t) => {
+    const lines = [];
+    t.mock.method(console, 'log', (line) => lines.push(String(line)));
+    t.mock.method(console, 'error', (line) => lines.push(String(line)));
+    let served = false;
+    let complete;
+    const completed = new Promise((resolve) => { complete = resolve; });
+    const privateQuery = 'PRIVATE CANDIDATE QUERY DO NOT LOG';
+    const c = fakeClient({
+        checkCredentialAvailability: async () => ({ linkedin: 1 }),
+        getNextRole: async () => {
+            if (served) return { assignments: [] };
+            served = true;
+            return {
+                assignments: [{
+                    session_id: 'sess-submit-log',
+                    role: { name: 'private role', search_queries: null },
+                    candidate_query: { id: 71, query: privateQuery },
+                    platforms: [{ name: 'linkedin' }],
+                }],
+            };
+        },
+        submitJobs: async () => ({ progress: { imported: 1 } }),
+        completeSession: async () => { complete(); return { duration_seconds: 1, jobs: {} }; },
+    });
+    const o = new QueueOrchestrator({
+        queueConfig: { checkIntervalMs: 1, startupDelayMs: 1 },
+        client: c,
+        metrics: fakeMetrics(),
+        cooldownCheck: () => [],
+        platformOverrides: { pausedList: () => [], intervalMinutes: () => null },
+        sweepSchedule: { isClaimable: () => true, begin: () => {}, end: () => {}, record: () => {} },
+        scraperResolver: () => ({
+            executeWithMeta: async () => ({ jobs: [{ id: 'PRIVATE_JOB_DO_NOT_LOG' }], emptyConfirmed: false }),
+        }),
+    });
+
+    await o.runOnce();
+    await completed;
+
+    const line = lines.find((entry) => entry.includes('Platform submission acknowledged'));
+    assert.ok(line, 'post-submit acknowledgement must be logged');
+    assert.match(line, /"sessionId":"sess-submit-log"/);
+    assert.match(line, /"platform":"linkedin"/);
+    assert.match(line, /"candidateQueryId":71/);
+    assert.match(line, /"submittedCount":1/);
+    assert.match(line, /"status":"success"/);
+    assert.match(line, /"emptyConfirmed":false/);
+    assert.match(line, /"backendAcknowledged":true/);
+    assert.match(line, /"finalImportConfirmed":false/);
+    assert.match(line, /"backendProgressImported":1/);
+    assert.doesNotMatch(lines.join('\n'), /PRIVATE CANDIDATE QUERY DO NOT LOG|PRIVATE_JOB_DO_NOT_LOG/);
+});
+
 // SCR-10: prod 2026-06-14 burned ~185 zero-result sessions/min because the
 // local-cooldown filter sat inside `if (Array.isArray(usablePlatforms))` —
 // when the availability pre-flight threw, usablePlatforms became null, the

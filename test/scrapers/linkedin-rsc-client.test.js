@@ -165,6 +165,55 @@ test('fetchPage: other non-2xx becomes NetworkError carrying the status', async 
     );
 });
 
+test('fetchPage: a 2xx body-read failure still rejects and emits no false response aggregate', async () => {
+    const readFailure = new Error('stream broke');
+    const details = [];
+    await assert.rejects(
+        () => fetchPage({
+            template: TEMPLATE,
+            cookies: COOKIES,
+            params: { keywords: 'x' },
+            fetchImpl: async () => ({ status: 200, text: async () => { throw readFailure; } }),
+            onResponse: (detail) => details.push(detail),
+        }),
+        (error) => error === readFailure,
+    );
+    assert.deepEqual(details, []);
+});
+
+for (const [status, ErrorType] of [[403, AuthError], [429, BlockedError]]) {
+    test(`fetchPage: ${status} does not read an error body and reports null bytes`, async () => {
+        let textRead = false;
+        const details = [];
+        await assert.rejects(
+            () => fetchPage({
+                template: TEMPLATE,
+                cookies: COOKIES,
+                params: { keywords: 'x' },
+                fetchImpl: async () => ({
+                    status,
+                    text: async () => { textRead = true; throw new Error('must not read'); },
+                }),
+                onResponse: (detail) => details.push(detail),
+            }),
+            ErrorType,
+        );
+        assert.equal(textRead, false);
+        assert.deepEqual(details, [{ httpStatus: status, utf8Bytes: null }]);
+    });
+}
+
+test('fetchPage: a throwing response observer never changes a successful result', async () => {
+    const body = await fetchPage({
+        template: TEMPLATE,
+        cookies: COOKIES,
+        params: { keywords: 'x' },
+        fetchImpl: async () => okResponse('1:{"ok":true}\n'),
+        onResponse: () => { throw new Error('diagnostics sink down'); },
+    });
+    assert.equal(body, '1:{"ok":true}\n');
+});
+
 // --- paginate ---------------------------------------------------------------
 
 // Minimal flight payload containing one card with a permalink and a body.

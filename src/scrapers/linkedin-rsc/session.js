@@ -19,6 +19,7 @@ import { getCredentialsAPIClient } from '../../api/credentials.js';
 import { AuthError, NetworkError } from '../../core/errors.js';
 import { linkedInProfileDir, profileDirFor, hasLiAt } from '../../core/linkedin-profile.js';
 import * as linkedinCooldown from '../../core/linkedin-cooldown.js';
+import { leaseCorrelation, safeErrorDetails } from './observability.js';
 import * as defaultTemplateHealth from './template-health.js';
 import { captureTemplate as captureTemplateImpl } from './capture-template.js';
 import { getMetrics } from '../../metrics/registry.js';
@@ -253,7 +254,7 @@ export class LinkedInRscSession {
             }
         } catch (err) {
             log.warn('Template freshness check failed — keeping the current template', {
-                err: err?.message,
+                ...safeErrorDetails(err),
             });
             return;
         }
@@ -283,7 +284,7 @@ export class LinkedInRscSession {
             // canary starts reporting phantom bans.
             this.#metric((m) => m.recordLinkedInTemplateRecapture('failed'));
             log.error('LinkedIn RSC template re-capture FAILED — scrapes may return phantom empties', {
-                err: err?.message,
+                ...safeErrorDetails(err),
                 scraper_alert: 'linkedin_template_recapture_failed',
             });
         }
@@ -380,7 +381,7 @@ export class LinkedInRscSession {
             }
             this._cookies.set(key, jar);
             this._cookiesAt.set(key, this._now());
-            log.info('Read LinkedIn session cookies from profile', { cookies: jar.length });
+            log.info('Read LinkedIn session cookies from profile', { cookieCount: jar.length });
             return jar;
         })();
         this._refreshing.set(key, refresh);
@@ -419,7 +420,9 @@ export class LinkedInRscSession {
 
     // Best-effort platform pause. A marker-write failure must never mask the
     // auth error the caller is about to see.
-    #pausePlatform() {
+    #pausePlatform(correlation = {}) {
+        const now = new Date();
+        const requestedCooldownMs = this._cooldown.cooldownMs();
         try {
             this._cooldown.writeCooldownMarker({
                 writeFile: this._cooldown.defaultWriteFile(),
@@ -427,16 +430,21 @@ export class LinkedInRscSession {
                 // Extend, never truncate: a search-quota pause may already
                 // hold a longer claim on this same marker file.
                 readFile: this._cooldown.defaultReadFile(),
-                now: new Date(),
-                cooldownMs: this._cooldown.cooldownMs(),
+                now,
+                cooldownMs: requestedCooldownMs,
                 path: this._cooldown.cooldownPath(),
             });
             log.warn('LinkedIn session dead — platform cooled down; run `npm run linkedin:login` to recover', {
+                ...correlation,
                 platform: this._platform,
+                trigger: 'auth_failure',
+                requestedCooldownMs,
+                requestedUntil: new Date(now.getTime() + requestedCooldownMs).toISOString(),
+                markerWriteCompleted: true,
                 scraper_alert: 'linkedin_auth_cooldown',
             });
         } catch (err) {
-            log.error('Cooldown marker write failed', { err: err?.message });
+            log.error('Cooldown marker write failed', { ...correlation, ...safeErrorDetails(err) });
         }
     }
 
@@ -482,7 +490,7 @@ export class LinkedInRscSession {
                 // heartbeat() swallows its own errors; this is belt-and-braces
                 // so an unexpected throw can never surface as an unhandled
                 // rejection from a bare timer callback.
-                log.warn('Lease heartbeat threw (ignored)', { err: err?.message });
+                log.warn('Lease heartbeat threw (ignored)', { ...safeErrorDetails(err) });
             } finally {
                 inFlight = false;
             }
@@ -517,12 +525,18 @@ export class LinkedInRscSession {
             throw err;
         }
         const stopHeartbeat = this.#startHeartbeat(lease);
+        const correlation = leaseCorrelation({ sessionId, lease });
         try {
             const profileKey = lease.credential?.profile_key ?? null;
             const cookies = await this.#refreshCookies(profileKey);
             return await fn(cookies, lease);
         } catch (err) {
             if (err instanceof AuthError && err.code !== 'NEEDS_TEMPLATE') {
+                log.error('LinkedIn credential auth failure detected', {
+                    ...correlation,
+                    trigger: 'auth_failure',
+                    ...safeErrorDetails(err),
+                });
                 // A dead session must not be reused by the next role...
                 this.invalidateCookies(lease.credential?.profile_key ?? null);
                 // ...and the BACKEND has to know, or it keeps the credential
@@ -531,10 +545,19 @@ export class LinkedInRscSession {
                 // already been burned by the former LinkedIn path (PR #310).
                 // Best-effort: never mask the original error with a report failure.
                 try {
-                    await lease.reportFailure?.(err.message, 0, { authDead: true });
+                    const reportAttempted = typeof lease.reportFailure === 'function';
+                    const report = await lease.reportFailure?.(err.message, 0, { authDead: true });
+                    log.warn('Auth-dead credential failure report attempted', {
+                        ...correlation,
+                        requestedCooldownMinutes: 0,
+                        requestedAuthDead: true,
+                        reportAttempted,
+                        backendAcknowledged: report?.ok === true,
+                        persistedCooldownConfirmed: false,
+                    });
                 } catch (reportErr) {
                     log.error('Failed to report LinkedIn credential as auth-dead', {
-                        err: reportErr?.message,
+                        ...correlation, ...safeErrorDetails(reportErr),
                     });
                 }
                 // LOCAL (single-account) storm protection, carried over from the
@@ -543,7 +566,7 @@ export class LinkedInRscSession {
                 // fires a role every cycle that instantly 403s. In REMOTE mode the
                 // pool rotates, so pausing all of LinkedIn would be self-inflicted
                 // downtime — cool the account only.
-                if (this.isLocal) this.#pausePlatform();
+                if (this.isLocal) this.#pausePlatform(correlation);
             }
             throw err;
         } finally {
@@ -555,7 +578,9 @@ export class LinkedInRscSession {
             try {
                 await lease.release?.();
             } catch (releaseErr) {
-                log.warn('Failed to release LinkedIn credential lease', { err: releaseErr?.message });
+                log.warn('Failed to release LinkedIn credential lease', {
+                    ...correlation, ...safeErrorDetails(releaseErr),
+                });
             }
         }
     }
