@@ -27,6 +27,7 @@ const COOKIES = [
 function fakeSession(lease) {
     return {
         isAlive: () => true,
+        isRequestHealthy: async () => 'version_current',
         templateStatus: () => ({ stale: false, lag: 0, ageMs: 100, liveUnknown: false }),
         async withCookies(_sessionId, fn) { return fn(COOKIES, lease); },
     };

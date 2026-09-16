@@ -35,6 +35,14 @@ const DEFAULT_COOKIE_TTL_MS = 30 * 60 * 1000; // 30 min
 const DEFAULT_HEARTBEAT_MS = 2 * 60 * 1000;
 const REAPER_TIMEOUT_MS = 10 * 60 * 1000;
 
+// This is evidence about the REQUEST, not the credential. In particular, an
+// unreadable live version is unknown, never an implied version-current result.
+export const REQUEST_HEALTH = Object.freeze({
+    VERSION_CURRENT: 'version_current',
+    REQUEST_REFUSED: 'request_refused',
+    UNKNOWN: 'unknown',
+});
+
 function cacheKey(profileKey) {
     return profileKey || null;
 }
@@ -314,31 +322,43 @@ export class LinkedInRscSession {
      * healthy credential four hours offline. One extra page fetch is trivial
      * against that.
      *
-     * @returns {Promise<boolean>} false when the template looks stale/refused
+     * @returns {Promise<'version_current'|'request_refused'|'unknown'>}
      */
     async isRequestHealthy() {
-        if (!this._templateHealth) return true;      // no checker → no opinion
+        if (!this._templateHealth) return REQUEST_HEALTH.UNKNOWN;
         if (!this._template) {
             try {
                 this._template = this._loadTemplate();
             } catch {
-                return true;    // cannot assess; do not block the caller
+                return REQUEST_HEALTH.UNKNOWN;
             }
         }
-        const { assessTemplate, fetchLiveClientVersion } = this._templateHealth;
-        const liveVersion = await fetchLiveClientVersion({
-            userAgent: this._template?.headers?.['user-agent'],
-        });
-        // Could not read LinkedIn's version at all. Report HEALTHY so a
-        // network blip cannot indefinitely block a genuine ban verdict: the
-        // canary must still be able to do its job when this check is blind.
-        if (liveVersion === null) return true;
-
-        const verdict = assessTemplate({
-            template: this._template,
-            liveVersion,
-            now: this._now(),
-        });
+        let verdict;
+        try {
+            const { assessTemplate, fetchLiveClientVersion } = this._templateHealth;
+            if (typeof assessTemplate !== 'function' || typeof fetchLiveClientVersion !== 'function') {
+                return REQUEST_HEALTH.UNKNOWN;
+            }
+            const liveVersion = await fetchLiveClientVersion({
+                userAgent: this._template?.headers?.['user-agent'],
+            });
+            if (liveVersion === null || liveVersion === undefined) {
+                log.warn('LinkedIn request health is unknown', {
+                    reason: 'live_version_unavailable', versionKnown: false,
+                });
+                return REQUEST_HEALTH.UNKNOWN;
+            }
+            verdict = assessTemplate({
+                template: this._template,
+                liveVersion,
+                now: this._now(),
+            });
+        } catch (err) {
+            log.warn('LinkedIn request health is unknown', {
+                reason: 'health_checker_failed', versionKnown: false, ...safeErrorDetails(err),
+            });
+            return REQUEST_HEALTH.UNKNOWN;
+        }
         if (verdict.stale) {
             log.error('Request template is stale — LinkedIn is refusing our request, not the account', {
                 capturedVersion: verdict.captured,
@@ -351,9 +371,19 @@ export class LinkedInRscSession {
             // stamp is reset so the interval gate cannot skip it.
             this._templateCheckedAt = null;
             await this.#ensureTemplateFresh();
-            return false;
+            return REQUEST_HEALTH.REQUEST_REFUSED;
         }
-        return true;
+        // A non-null live value alone is not evidence the versions compare.
+        // `assessTemplate` intentionally returns lag:null for malformed or
+        // missing captured versions, and fresh age cannot promote that blind
+        // observation into a version-current request verdict.
+        if (!Number.isFinite(verdict.lag)) {
+            log.warn('LinkedIn request health is unknown', {
+                reason: 'version_not_comparable', versionKnown: false,
+            });
+            return REQUEST_HEALTH.UNKNOWN;
+        }
+        return REQUEST_HEALTH.VERSION_CURRENT;
     }
 
     #cookiesFresh(profileKey) {

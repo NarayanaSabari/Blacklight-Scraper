@@ -134,6 +134,31 @@ function keyFor(lease) {
     return c?.profile_key || c?.name || 'default';
 }
 
+// Canary callers pass a scrape correlation, never request material. Keep that
+// boundary here too because these logs occur precisely when an empty response
+// is most tempting to inspect.
+export function safeCanaryDiagnostics(diagnostics = {}) {
+    const credentialId = diagnostics?.credentialId;
+    return {
+        sessionId: typeof diagnostics?.sessionId === 'string' ? diagnostics.sessionId : null,
+        credentialId: Number.isFinite(credentialId) ? credentialId : null,
+        querySha256: /^[a-f0-9]{64}$/i.test(diagnostics?.querySha256 ?? '')
+            ? diagnostics.querySha256
+            : null,
+        datePosted: typeof diagnostics?.datePosted === 'string' ? diagnostics.datePosted : null,
+        candidateScoped: Boolean(diagnostics?.candidateScoped),
+    };
+}
+
+function requestHealthState(result) {
+    // Boolean support preserves the only established positive evidence contract
+    // for direct utility callers. Everything else, including no capability,
+    // is unknown and cannot convict a credential.
+    if (result === true || result === 'version_current') return 'version_current';
+    if (result === false || result === 'request_refused') return 'request_refused';
+    return 'unknown';
+}
+
 export class CanaryTracker {
     constructor({
         threshold = emptyThreshold(),
@@ -155,6 +180,7 @@ export class CanaryTracker {
         this._streaks = new Map();   // key -> consecutive zero-yield scrapes
         this._probedAt = new Map();  // key -> last canary attempt (ms)
         this._suspicions = new Map(); // key -> consecutive empty canary probes
+        this._requestHealthUncertain = new Map(); // key -> non-credential probe evidence
         this._inconclusive = new Map(); // key -> consecutive inconclusive probes
     }
 
@@ -164,6 +190,7 @@ export class CanaryTracker {
     recordHealthy(lease) {
         this._streaks.delete(keyFor(lease));
         this._suspicions.delete(keyFor(lease));
+        this._requestHealthUncertain.delete(keyFor(lease));
         this._inconclusive.delete(keyFor(lease));
     }
 
@@ -179,6 +206,19 @@ export class CanaryTracker {
         return this._suspicions.get(keyFor(lease)) ?? 0;
     }
 
+    /** Remove account-only evidence without disturbing uncertain probe timing. */
+    clearSuspicion(lease) {
+        this._suspicions.delete(keyFor(lease));
+    }
+
+    /** Probe evidence that supports a platform pause, never a credential ban. */
+    recordRequestHealthUncertain(lease) {
+        const key = keyFor(lease);
+        const n = (this._requestHealthUncertain.get(key) ?? 0) + 1;
+        this._requestHealthUncertain.set(key, n);
+        return n;
+    }
+
     /** Count one zero-yield scrape. @returns {boolean} probe due now */
     recordEmpty(lease) {
         const key = keyFor(lease);
@@ -189,7 +229,8 @@ export class CanaryTracker {
         const last = this._probedAt.get(key);
         // A credential already carrying a strike is one probe from a verdict,
         // so it waits the short corroboration floor rather than the full one.
-        const floor = (this._suspicions.get(key) ?? 0) > 0
+        const floor = ((this._suspicions.get(key) ?? 0) > 0
+            || (this._requestHealthUncertain.get(key) ?? 0) > 0)
             ? this._corroborationIntervalMs
             : this._probeIntervalMs;
         const probeDue = n >= this._threshold
@@ -255,6 +296,7 @@ export class CanaryTracker {
         this._streaks.delete(key);
         this._probedAt.delete(key);
         this._suspicions.delete(key);
+        this._requestHealthUncertain.delete(key);
         this._inconclusive.delete(key);
     }
 
@@ -266,6 +308,7 @@ export class CanaryTracker {
         return {
             consecutiveEmpty: this.streak(lease),
             suspicionStrikes: this.suspicion(lease),
+            requestHealthUncertain: this._requestHealthUncertain.get(keyFor(lease)) ?? 0,
             emptyThreshold: this._threshold,
             probeIntervalMs: this._probeIntervalMs,
             corroborationIntervalMs: this._corroborationIntervalMs,
@@ -293,7 +336,7 @@ export function suspicionStrikes(env = process.env) {
  * that triggered it already succeeded on the wire, and a probe failure must
  * not turn a healthy zero into a failed session.
  *
- * @returns {Promise<'healthy'|'shadow_banned'|'suspected'|'inconclusive'|'request_refused'>}
+ * @returns {Promise<'healthy'|'shadow_banned'|'suspected'|'inconclusive'|'request_refused'|'request_unknown'>}
  */
 export async function runCanary({
     tracker, lease, template, cookies, paginateImpl,
@@ -307,6 +350,9 @@ export async function runCanary({
     // could convict a healthy account on the strength of a request it never
     // would have made itself.
     fetchImpl = undefined,
+    // Probes are real LinkedIn searches. They must reserve the same per-lease
+    // clock as the normal scrape they are judging.
+    pacer = undefined,
     // Asks "is our REQUEST the problem?" before blaming the account. See the
     // block below for why this gate exists. Injected so tests can drive either
     // answer, and so a caller with no template context can pass null to keep
@@ -316,11 +362,13 @@ export async function runCanary({
     // callers that invoke the canary directly.
     diagnostics = {},
 }) {
+    const safeDiagnostics = safeCanaryDiagnostics(diagnostics);
     tracker.noteProbe(lease);
     const streak = tracker.streak(lease);
     const canaryQuery = pickCanaryQuery(rng);
     let posts;
     try {
+        await pacer?.pace?.(lease);
         ({ posts } = await paginateImpl({
             template,
             cookies,
@@ -333,12 +381,12 @@ export async function runCanary({
         }));
     } catch (error) {
         log.warn('Canary probe errored — verdict inconclusive', {
-            ...diagnostics, streak, ...safeErrorDetails(error),
+            ...safeDiagnostics, streak, ...safeErrorDetails(error),
         });
         // Nothing was learned, so refund most of the budget — but back off if
         // this keeps happening (see noteInconclusive).
         const retryMs = tracker.noteInconclusive(lease);
-        log.warn('Canary retry scheduled after inconclusive probe', { ...diagnostics, retryMs });
+        log.warn('Canary retry scheduled after inconclusive probe', { ...safeDiagnostics, retryMs });
         return 'inconclusive';
     }
 
@@ -348,24 +396,18 @@ export async function runCanary({
         // The account can see results; the empty streak was honest thin
         // queries. Full reset so the next probe needs a fresh streak.
         log.info('Canary found posts — account healthy, streak was genuine empties', {
-            ...diagnostics, streak, canaryPosts: posts.length, canaryQuerySha256: querySha256(canaryQuery),
+            ...safeDiagnostics, streak, canaryPosts: posts.length, canaryQuerySha256: querySha256(canaryQuery),
         });
         tracker.reset(lease);
         return 'healthy';
     }
 
-    // Zero posts on a query that always has posts. Suspicious — but a single
-    // empty probe is not enough to take a credential offline for hours.
-    const strike = tracker.recordSuspicion(lease);
-    if (strike < strikes) {
-        log.warn('Canary probe empty — suspected, awaiting corroboration', {
-            ...diagnostics, streak, canaryQuerySha256: querySha256(canaryQuery), strike, strikesNeeded: strikes,
-            scraper_alert: 'linkedin_shadow_ban_suspected',
-        });
-        return 'suspected';
-    }
+    // Zero posts on a query that always has posts is suspicious. Check request
+    // health on every probe: two unknown/refused probes are platform evidence
+    // even though neither is account-failure evidence.
+    const existingStrike = tracker.suspicion(lease);
 
-    // LAST GATE BEFORE CONVICTING THE ACCOUNT.
+    // GATE BEFORE USING THE PROBE AS CREDENTIAL EVIDENCE.
     //
     // Everything above measures the account through OUR request. If the request
     // itself is being refused, every observation feeding this verdict is
@@ -386,47 +428,69 @@ export async function runCanary({
     // budget) and its remedy is automatic, whereas a wrong ban verdict is
     // expensive and self-inflicted. Only convict the account when the request
     // is known-good.
-    if (verifyRequestHealth) {
-        let requestHealthy = true;
+    {
+        // Direct utility callers historically supplied no verifier. Preserve
+        // that behavior there, while scraper.js always supplies an explicit
+        // unknown result when its session lacks the capability.
+        let requestHealth = typeof verifyRequestHealth === 'function' ? 'unknown' : 'version_current';
+        const gateInvoked = typeof verifyRequestHealth === 'function';
         try {
-            requestHealthy = await verifyRequestHealth();
+            if (gateInvoked) requestHealth = requestHealthState(await verifyRequestHealth());
         } catch (err) {
-            // Could not tell. Treat as inconclusive rather than guessing:
-            // failing toward "do not ban" is the recoverable direction, since
-            // a genuinely banned account simply gets convicted on the next
-            // probe instead.
-            log.warn('Could not verify request health — deferring the ban verdict', {
-                ...diagnostics, ...safeErrorDetails(err),
+            log.warn('Canary request-health gate failed closed', {
+                ...safeDiagnostics, gateInvoked, gateResult: 'unknown',
+                reason: 'checker_threw', versionKnown: false, ...safeErrorDetails(err),
             });
-            requestHealthy = false;
         }
-        if (!requestHealthy) {
-            log.error(
-                'Canary empty BUT our request looks stale/refused — NOT banning the account',
-                {
-                    ...diagnostics,
-                    streak,
-                    canaryQuerySha256: querySha256(canaryQuery),
-                    strike,
-                    scraper_alert: 'linkedin_request_refused_not_ban',
-                },
-            );
+        const versionKnown = requestHealth !== 'unknown';
+        log.info('Canary request-health gate evaluated', {
+            ...safeDiagnostics, gateInvoked, gateResult: requestHealth,
+            reason: requestHealth, versionKnown,
+        });
+        if (requestHealth !== 'version_current') {
+            log.warn('Canary empty without current request-version evidence — NOT banning the account', {
+                ...safeDiagnostics,
+                streak,
+                canaryQuerySha256: querySha256(canaryQuery),
+                strike: existingStrike,
+                gateInvoked,
+                gateResult: requestHealth,
+                reason: requestHealth,
+                versionKnown,
+                scraper_alert: requestHealth === 'request_refused'
+                    ? 'linkedin_request_refused_not_ban'
+                    : 'linkedin_request_health_unknown_not_ban',
+            });
             // Each increment is one false shadow-ban prevented, which is the
             // clearest measure of whether this gate is earning its keep.
             try { getMetrics()?.recordLinkedInRequestRefused?.(); } catch { /* never break a scrape */ }
-            // Clear the evidence. It was gathered through a request LinkedIn
-            // was refusing, so it says nothing about this credential, and
-            // keeping it would convict the account the moment the template is
-            // fixed and a thin query happens to land first.
-            tracker.reset(lease);
-            return 'request_refused';
+            // This probe cannot support an account-policy suspicion. Preserve
+            // only the separate uncertain clock, which retains the existing
+            // short corroboration interval for the bounded platform-pause path.
+            tracker.clearSuspicion(lease);
+            tracker.recordRequestHealthUncertain(lease);
+            return requestHealth === 'request_refused' ? 'request_refused' : 'request_unknown';
         }
     }
 
+    // Only a version-current request contributes account-policy evidence.
+    const strike = tracker.recordSuspicion(lease);
+
+    // A version-current request still needs two independent empty probes before
+    // it can support a credential cooldown.
+    if (strike < strikes) {
+        log.warn('Canary probe empty — suspected, awaiting corroboration', {
+            ...safeDiagnostics, streak, canaryQuerySha256: querySha256(canaryQuery), strike, strikesNeeded: strikes,
+            scraper_alert: 'linkedin_shadow_ban_suspected',
+        });
+        return 'suspected';
+    }
+
     // Corroborated across independent probes with different control queries,
-    // and our request is known-good: shadow-ban confirmed.
-    log.error('Canary returned empty — LinkedIn account is shadow-banned', {
-        ...diagnostics,
+    // and our request is known-good: the shadow-ban policy threshold is met.
+    // This remains a policy suspicion, not proof of an account ban.
+    log.error('Canary policy suspicion reached - account may be shadow-banned', {
+        ...safeDiagnostics,
         streak,
         canaryQuerySha256: querySha256(canaryQuery),
         strike,
@@ -436,18 +500,18 @@ export async function runCanary({
     });
     try {
         const report = await lease?.reportFailure?.(
-            `Shadow-ban canary confirmed after ${streak} zero-yield scrapes (${strike} corroborating probes)`,
+            `Shadow-ban canary policy suspicion after ${streak} zero-yield scrapes (${strike} corroborating probes)`,
             cooldownMinutes,
         );
-        log.warn('Shadow-ban credential failure report completed', {
-            ...diagnostics,
+        log.warn('Shadow-ban policy credential failure report completed', {
+            ...safeDiagnostics,
             requestedCooldownMinutes: cooldownMinutes,
             backendAcknowledged: report?.ok === true,
             persistedCooldownConfirmed: false,
         });
     } catch (error) {
         log.error('Failed to report shadow-banned credential to the pool', {
-            ...diagnostics, ...safeErrorDetails(error),
+            ...safeDiagnostics, ...safeErrorDetails(error),
         });
     }
 

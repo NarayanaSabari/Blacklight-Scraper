@@ -79,6 +79,11 @@ export const DEFAULT_MAX_PAUSE_MS = 4 * 60 * 60 * 1000;
 // previous pause was too short.
 export const DEFAULT_ESCALATION_FACTOR = 2;
 
+// Two broad probes that cannot establish whether our request is current are
+// enough to stop issuing searches briefly, but not enough to punish one
+// credential. This counter is intentionally separate from quota escalation.
+export const DEFAULT_REQUEST_HEALTH_UNCERTAIN_THRESHOLD = 2;
+
 // A clean run this long retires the escalation when NOTHING has been served in
 // the meantime — a quiet host that simply stopped tripping.
 //
@@ -127,6 +132,7 @@ export class SearchQuotaTracker {
         maxPause = maxPauseMs(),
         escalationFactor = DEFAULT_ESCALATION_FACTOR,
         escalationDecayMs = DEFAULT_ESCALATION_DECAY_MS,
+        requestHealthUncertainThreshold = DEFAULT_REQUEST_HEALTH_UNCERTAIN_THRESHOLD,
         now = () => Date.now(),
     } = {}) {
         this._threshold = threshold;
@@ -134,6 +140,7 @@ export class SearchQuotaTracker {
         this._maxPause = maxPause;
         this._escalationFactor = escalationFactor;
         this._escalationDecayMs = escalationDecayMs;
+        this._requestHealthUncertainThreshold = requestHealthUncertainThreshold;
         this._now = now;
 
         this._consecutiveEmpty = 0;
@@ -146,6 +153,8 @@ export class SearchQuotaTracker {
         // module, and coupling two components to agree on that timing is how
         // they end up disagreeing.
         this._pausedUntil = null;
+        this._consecutiveRequestHealthUncertain = 0;
+        this._requestHealthPausedUntil = null;
     }
 
     /**
@@ -181,6 +190,8 @@ export class SearchQuotaTracker {
         // Search is flowing, so whatever pause was in force is over.
         this._pausedUntil = null;
         this._consecutiveTrips = 0;
+        this._consecutiveRequestHealthUncertain = 0;
+        this._requestHealthPausedUntil = null;
     }
 
     /**
@@ -226,6 +237,38 @@ export class SearchQuotaTracker {
     }
 
     /**
+     * Record a canary verdict that could not establish request-version health.
+     *
+     * This writes the same bounded base pause as quota detection, but leaves
+     * quota streaks and escalation untouched. An uncertain probe must not erase
+     * a concurrent quota signal or turn into a per-credential cooldown.
+     */
+    recordRequestHealthUncertain() {
+        const now = this._now();
+        if (this._requestHealthPausedUntil !== null && now >= this._requestHealthPausedUntil) {
+            this._requestHealthPausedUntil = null;
+            this._consecutiveRequestHealthUncertain = 0;
+        }
+        if (this._requestHealthPausedUntil !== null && now < this._requestHealthPausedUntil) {
+            return {
+                tripped: false,
+                pauseMs: 0,
+                streak: this._consecutiveRequestHealthUncertain,
+            };
+        }
+
+        this._consecutiveRequestHealthUncertain += 1;
+        const streak = this._consecutiveRequestHealthUncertain;
+        if (streak !== this._requestHealthUncertainThreshold) {
+            return { tripped: false, pauseMs: 0, streak };
+        }
+
+        const pauseMs = this._basePause;
+        this._requestHealthPausedUntil = now + pauseMs;
+        return { tripped: true, pauseMs, streak };
+    }
+
+    /**
      * Re-arm after a pause expires.
      *
      * Normally automatic (see recordEmpty). Exposed for the operator path where
@@ -251,6 +294,10 @@ export class SearchQuotaTracker {
                 this._basePause * (this._escalationFactor ** this._consecutiveTrips),
                 this._maxPause,
             ),
+            consecutiveRequestHealthUncertain: this._consecutiveRequestHealthUncertain,
+            requestHealthPausedUntil: this._requestHealthPausedUntil === null
+                ? null
+                : new Date(this._requestHealthPausedUntil).toISOString(),
         };
     }
 }

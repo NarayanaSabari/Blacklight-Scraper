@@ -518,6 +518,7 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
                     cookies,
                     paginateImpl,
                     fetchImpl: boundFetch,
+                    pacer,
                     diagnostics: correlation,
                 // Before blaming the ACCOUNT, rule out our own request. A
                 // template that has fallen behind LinkedIn's client version
@@ -525,23 +526,54 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
                 // evidence the canary treats as proof of a ban (2026-08-18:
                 // both credentials falsely cooled, five hours at zero).
                 //
-                // Checked lazily and only at the point of conviction, so the
-                // ordinary healthy path never pays for it.
+                // Checked only for a due canary probe, so ordinary healthy
+                // scrapes never pay for it.
                 //
-                // Passed as undefined when the session cannot answer, rather
-                // than as a function that throws. A session without this
-                // capability means NO OPINION, and the canary must fall back to
-                // its previous behaviour — treating "cannot ask" as "request is
-                // broken" would silently disable ban detection everywhere the
-                // capability is absent.
-                    verifyRequestHealth: typeof session.isRequestHealthy === 'function'
-                        ? () => session.isRequestHealthy()
-                        : undefined,
+                    // A missing capability is explicitly unknown, not silently
+                    // version-current. It cannot support a credential cooldown.
+                    verifyRequestHealth: () => (typeof session.isRequestHealthy === 'function'
+                        ? session.isRequestHealthy()
+                        : 'unknown'),
                 });
                 log.warn('LinkedIn canary control verdict completed', {
                     ...correlation,
                     broadControlVerdict: canaryVerdict,
                 });
+
+                if (canaryVerdict === 'request_unknown' || canaryVerdict === 'request_refused') {
+                    const uncertainty = quotaTracker.recordRequestHealthUncertain?.() ?? {
+                        tripped: false, pauseMs: 0, streak: null,
+                    };
+                    log.warn('LinkedIn canary request-health uncertainty evaluated', {
+                        ...correlation,
+                        gateResult: canaryVerdict,
+                        reason: canaryVerdict,
+                        versionKnown: canaryVerdict === 'request_refused',
+                        consecutiveRequestHealthUncertain: uncertainty.streak,
+                        tripped: uncertainty.tripped,
+                        requestedPauseMs: uncertainty.tripped ? uncertainty.pauseMs : 0,
+                    });
+                    if (uncertainty.tripped) {
+                        const pauseRequestedAt = new Date();
+                        const markerWritten = applyQuotaPauseImpl({
+                            cooldown: quotaCooldown,
+                            pauseMs: uncertainty.pauseMs,
+                            now: pauseRequestedAt,
+                        });
+                        log.warn('LinkedIn request health remains uncertain — applying bounded platform pause', {
+                            ...correlation,
+                            gateResult: canaryVerdict,
+                            reason: canaryVerdict,
+                            versionKnown: canaryVerdict === 'request_refused',
+                            consecutiveRequestHealthUncertain: uncertainty.streak,
+                            requestedPauseMs: uncertainty.pauseMs,
+                            requestedUntil: new Date(pauseRequestedAt.getTime() + uncertainty.pauseMs).toISOString(),
+                            markerWritten,
+                            markerMode: 'extend_only',
+                            scraper_alert: 'linkedin_request_health_uncertain_pause',
+                        });
+                    }
+                }
             }
         }
 
@@ -550,7 +582,10 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
         // the credential failed with a cooldown, and that report released the
         // lease — a success ping here would land on the dead lease and, worse,
         // contradict the verdict.
-        if (canaryVerdict !== 'shadow_banned') {
+        const uncertainCanaryVerdict = canaryVerdict === 'request_unknown'
+            || canaryVerdict === 'request_refused'
+            || canaryVerdict === 'inconclusive';
+        if (canaryVerdict !== 'shadow_banned' && !uncertainCanaryVerdict) {
             // Best-effort. The jobs are ALREADY SCRAPED by this point, and the
             // caller submits them after we return, so letting a failed liveness
             // ping propagate would discard completed work over a bookkeeping
@@ -570,6 +605,16 @@ export async function scrapeLinkedInRsc(jobTitle, location, sessionId = null, op
                     ...safeErrorDetails(error),
                 });
             }
+        } else if (uncertainCanaryVerdict) {
+            // withCookies still calls release() in finally. The backend currently
+            // accounts that release as success, so this is not neutral accounting;
+            // do not add a made-up release mode here.
+            log.info('Skipped explicit credential success report after uncertain canary verdict', {
+                ...correlation,
+                broadControlVerdict: canaryVerdict,
+                leaseCleanup: 'withCookies_finally_release',
+                releaseAccounting: 'backend_preexisting_success_semantics',
+            });
         }
 
         return { jobs, emptyConfirmed, upToDate: Boolean(upToDate) };

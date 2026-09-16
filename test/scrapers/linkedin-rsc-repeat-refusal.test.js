@@ -32,6 +32,7 @@ const TEMPLATE = { url: 'https://x', headers: {}, postData: '{}' };
 
 function fakeSession(lease) {
     return {
+        isRequestHealthy: async () => 'version_current',
         async withCookies(_sessionId, fn) {
             return fn(
                 [{ name: 'li_at', value: 'x' }, { name: 'JSESSIONID', value: '"ajax:1"' }],

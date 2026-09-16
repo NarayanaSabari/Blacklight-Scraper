@@ -250,11 +250,11 @@ describe('the canary must not blame the account for a refused request', () => {
             });
         }
 
-        assert.equal(verdict, 'request_refused');
+        assert.equal(verdict, 'request_unknown');
         assert.deepEqual(failures(), []);
     });
 
-    it('clears the streak so a fixed template does not convict on old evidence', async () => {
+    it('keeps refused-request evidence out of later credential conviction', async () => {
         // The evidence was gathered through a refused request, so it says
         // nothing about the credential. Left in place, it would convict the
         // account as soon as the template was fixed and a thin query landed.
@@ -273,8 +273,9 @@ describe('the canary must not blame the account for a refused request', () => {
             });
         }
 
-        assert.equal(tracker.streak(lease), 0, 'streak must be cleared');
-        assert.equal(tracker.suspicion(lease), 0, 'strikes must be cleared');
+        assert.equal(tracker.suspicion(lease), 0, 'refused requests must not create account strikes');
+        assert.equal(tracker.snapshot(lease).requestHealthUncertain, 2,
+            'the same probes remain available only to the bounded platform-pause path');
     });
 
     it('preserves the old behaviour when no verifier is supplied', async () => {
@@ -299,7 +300,7 @@ describe('the canary must not blame the account for a refused request', () => {
         assert.equal(failures().length, 1);
     });
 
-    it('a session that cannot answer means NO OPINION, not "request refused"', async () => {
+    it('direct callers without a verifier retain the legacy utility behavior', async () => {
         // Caught by an existing end-to-end test during development: wiring the
         // verifier as an always-present closure over an absent method made every
         // ban verdict throw, get caught as "cannot verify", and downgrade to
@@ -326,33 +327,32 @@ describe('the canary must not blame the account for a refused request', () => {
             });
         }
 
-        assert.equal(verdict, 'shadow_banned', 'detection must not be disabled by a missing capability');
+        assert.equal(verdict, 'shadow_banned');
         assert.equal(failures().length, 1);
     });
 });
 
 describe('session.isRequestHealthy', () => {
-    it('reports false and heals when the template is stale', async () => {
+    it('reports request_refused and heals when the template is stale', async () => {
         const { session, captures } = makeSession({
             template: templateWith(STALE_VERSION),
             liveVersion: LIVE_VERSION,
         });
 
-        assert.equal(await session.isRequestHealthy(), false);
+        assert.equal(await session.isRequestHealthy(), 'request_refused');
         assert.equal(captures(), 1, 'detecting the problem must also fix it');
     });
 
-    it('reports true for a current template', async () => {
+    it('reports version_current for a current template', async () => {
         const { session } = makeSession({
             template: templateWith(LIVE_VERSION, new Date().toISOString()),
             liveVersion: LIVE_VERSION,
         });
 
-        assert.equal(await session.isRequestHealthy(), true);
+        assert.equal(await session.isRequestHealthy(), 'version_current');
     });
 
-    it('reports true (no opinion) when LinkedIn version is unreadable', async () => {
-        // Must not block a genuine ban verdict just because this check is blind.
+    it('reports unknown when LinkedIn version is unreadable', async () => {
         const session = new LinkedInRscSession({
             apiClient: { isLocal: false },
             templateLoader: () => templateWith(STALE_VERSION),
@@ -363,6 +363,6 @@ describe('session.isRequestHealthy', () => {
             scheduler: { setInterval: () => null, clearInterval: () => {} },
         });
 
-        assert.equal(await session.isRequestHealthy(), true);
+        assert.equal(await session.isRequestHealthy(), 'unknown');
     });
 });
