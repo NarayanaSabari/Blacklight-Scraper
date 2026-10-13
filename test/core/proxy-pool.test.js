@@ -72,13 +72,17 @@ test('reportOk: clears an IP cooldown early', () => {
     assert.equal(pool.stats().cooled, 0);
 });
 
-test('all cooled → reuses soonest-recovering rather than returning null', () => {
+test('all cooled refuses a proxy until recovery, never returning a direct fallback', () => {
     let t = 0;
     const pool = new ProxyPool(P(2), { cooldownMs: 1000, now: () => t });
     pool.acquire('a'); pool.reportBlocked('a');   // ip0 cooled
     pool.acquire('b'); pool.reportBlocked('b');   // ip1 cooled
-    const got = pool.acquire('c');
-    assert.ok(got && got.server, 'still returns a proxy when all cooled');
+    assert.equal(pool.isCoolingDown('dice'), true);
+    assert.throws(() => pool.acquire('c'), (error) => error.code === 'PROXY_COOLDOWN');
+    assert.equal(pool.snapshot().leased, 2, 'refusal does not assign another proxy');
+    t += 1000;
+    assert.equal(pool.isCoolingDown('dice'), false);
+    assert.ok(pool.acquire('c').server);
 });
 
 test('snapshot: read-only detail for the control panel — total/leased/cooling', () => {

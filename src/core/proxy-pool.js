@@ -20,6 +20,7 @@
 
 import fs from 'node:fs';
 import { createLogger } from '../logger/index.js';
+import { ScraperError } from './errors.js';
 
 const log = createLogger('proxy-pool');
 
@@ -93,6 +94,10 @@ export class ProxyPool {
 
     get size() { return this._proxies.length; }
     _healthy(p) { const u = this._cooledUntil.get(p.id); return !u || u <= this._now(); }
+    isCoolingDown(platform = null) {
+        if (platform && this._excluded.has(String(platform).toLowerCase())) return false;
+        return this._proxies.length > 0 && !this._proxies.some((p) => this._healthy(p));
+    }
     _playwright(p) {
         const o = { server: p.server };
         if (p.username) o.username = p.username;
@@ -111,9 +116,8 @@ export class ProxyPool {
     }
 
     // Returns a Playwright proxy object {server,username?,password?} or null
-    // (empty pool). Round-robin, skipping cooled-down IPs; if every IP is
-    // cooled, returns the one recovering soonest so we keep trying rather than
-    // falling back to the (blocked) datacenter IP.
+    // (empty pool). Refuse when every configured IP is cooling down, rather
+    // than reusing a blocked proxy or silently switching to direct traffic.
     acquire(platform = null) {
         // Opted out for this platform → run direct, as if no pool were configured.
         if (platform && this._excluded.has(String(platform).toLowerCase())) return null;
@@ -125,11 +129,9 @@ export class ProxyPool {
             if (this._healthy(p)) { chosen = p; this._rr = (this._rr + i + 1) % n; break; }
         }
         if (!chosen) {
-            chosen = [...this._proxies].sort(
-                (a, b) => (this._cooledUntil.get(a.id) ?? 0) - (this._cooledUntil.get(b.id) ?? 0),
-            )[0];
-            this._rr = (this._rr + 1) % n;
-            log.warn('All proxies cooled down — reusing soonest-recovering', { proxy: chosen.id });
+            throw new ScraperError('All configured proxies are cooling down; wait before scraping', {
+                code: 'PROXY_COOLDOWN', platform,
+            });
         }
         if (platform) this._lastByPlatform.set(platform, chosen.id);
         return this._playwright(chosen);

@@ -7,6 +7,7 @@ import {
     AuthError,
     TimeoutError,
     NetworkError,
+    ScraperError,
 } from '../../src/core/errors.js';
 
 test('BlockedError classifies as "blocked"', () => {
@@ -15,6 +16,10 @@ test('BlockedError classifies as "blocked"', () => {
 
 test('DomChangedError classifies as "dom_changed"', () => {
     assert.equal(classifyError(new DomChangedError('no containers')), 'dom_changed');
+});
+
+test('proxy cooldown is rate limited, not a new block that extends its timer', () => {
+    assert.equal(classifyError(new ScraperError('cooling down', { code: 'PROXY_COOLDOWN' })), 'rate_limited');
 });
 
 test('existing mappings are unchanged', () => {

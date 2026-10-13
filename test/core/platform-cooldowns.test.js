@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { platformsOnCooldown, cooldownSnapshot } from '../../src/core/platform-cooldowns.js';
+import { ProxyPool } from '../../src/core/proxy-pool.js';
 
 const NOW = new Date('2026-06-14T12:00:00.000Z');
 
@@ -21,6 +22,18 @@ test('platformsOnCooldown: returns only the platforms with an active cooldown', 
 test('platformsOnCooldown: none active → empty array', () => {
     const mods = { monster: fakeModule(false), indeed: fakeModule(false), glassdoor: fakeModule(false) };
     assert.deepEqual(platformsOnCooldown(NOW, mods), []);
+});
+
+test('a fully cooled proxy pool excludes proxied platforms from claims, preserving direct exclusions', () => {
+    let time = 0;
+    const pool = new ProxyPool([{ id: 'proxy', server: 'http://example:80' }], {
+        now: () => time, cooldownMs: 1000, excluded: new Set(['monster']),
+    });
+    pool.acquire('indeed');
+    pool.reportBlocked('indeed');
+    assert.deepEqual(platformsOnCooldown(NOW, {}, pool).sort(), ['dice', 'glassdoor', 'indeed', 'techfetch']);
+    time = 1000;
+    assert.deepEqual(platformsOnCooldown(NOW, {}, pool), []);
 });
 
 test('platformsOnCooldown: a throwing module is isolated, never breaks the result', () => {

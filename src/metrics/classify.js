@@ -38,6 +38,7 @@ const PATTERNS = [
 
 export function classifyError(error) {
     if (!error) return REASONS.UNKNOWN;
+    if (error.code === 'PROXY_COOLDOWN') return REASONS.RATE_LIMITED;
 
     if (error instanceof BlockedError) return REASONS.BLOCKED;
     if (error instanceof DomChangedError) return REASONS.DOM_CHANGED;

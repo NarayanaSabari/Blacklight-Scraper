@@ -10,9 +10,10 @@ import * as indeed from './indeed-cooldown.js';
 import * as glassdoor from './glassdoor-cooldown.js';
 import * as techfetch from './techfetch-cooldown.js';
 import * as linkedin from './linkedin-cooldown.js';
+import { getProxyPool } from './proxy-pool.js';
 
 // Platform name → its cooldown module. Only platforms with a cooldown marker
-// appear here; others (dice) are never cooled-down. LinkedIn cools down on
+// appear here; shared proxy exhaustion is checked separately below. LinkedIn cools down on
 // auth/cookie-expiry (set in the LinkedIn RSC session) so the orchestrator stops
 // claiming it while the session is dead, instead of storming concurrent
 // re-establish failures until the operator re-runs `npm run linkedin:login`.
@@ -20,7 +21,7 @@ const MODULES = Object.freeze({ monster, indeed, glassdoor, techfetch, linkedin 
 
 // Returns the platform names whose local cooldown marker is currently active.
 // Each check is isolated — a cooldown-read failure must never break the claim.
-export function platformsOnCooldown(now = new Date(), modules = MODULES) {
+export function platformsOnCooldown(now = new Date(), modules = MODULES, proxyPool = getProxyPool()) {
     const cooled = [];
     for (const [platform, mod] of Object.entries(modules)) {
         try {
@@ -31,6 +32,9 @@ export function platformsOnCooldown(now = new Date(), modules = MODULES) {
             });
             if (mod.isOnCooldown(marker, now)) cooled.push(platform);
         } catch { /* never let a cooldown check break the claim cycle */ }
+    }
+    for (const platform of ['dice', 'monster', 'indeed', 'glassdoor', 'techfetch']) {
+        if (proxyPool.isCoolingDown(platform) && !cooled.includes(platform)) cooled.push(platform);
     }
     return cooled;
 }
