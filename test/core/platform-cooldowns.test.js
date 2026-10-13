@@ -31,7 +31,9 @@ test('a fully cooled proxy pool excludes proxied platforms from claims, preservi
     });
     pool.acquire('indeed');
     pool.reportBlocked('indeed');
-    assert.deepEqual(platformsOnCooldown(NOW, {}, pool).sort(), ['dice', 'glassdoor', 'indeed', 'techfetch']);
+    const cooled = platformsOnCooldown(NOW, {}, pool);
+    assert.deepEqual(cooled.sort(), ['glassdoor', 'indeed', 'techfetch']);
+    assert.ok(!cooled.includes('dice'), 'Dice is direct and must remain claimable');
     time = 1000;
     assert.deepEqual(platformsOnCooldown(NOW, {}, pool), []);
 });

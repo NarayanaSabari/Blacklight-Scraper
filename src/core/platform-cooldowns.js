@@ -33,7 +33,7 @@ export function platformsOnCooldown(now = new Date(), modules = MODULES, proxyPo
             if (mod.isOnCooldown(marker, now)) cooled.push(platform);
         } catch { /* never let a cooldown check break the claim cycle */ }
     }
-    for (const platform of ['dice', 'monster', 'indeed', 'glassdoor', 'techfetch']) {
+    for (const platform of ['monster', 'indeed', 'glassdoor', 'techfetch']) {
         if (proxyPool.isCoolingDown(platform) && !cooled.includes(platform)) cooled.push(platform);
     }
     return cooled;

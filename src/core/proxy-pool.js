@@ -1,6 +1,5 @@
-// Proxy pool for the 5 anti-bot-gated scrapers (dice/monster/indeed/glassdoor/
-// techfetch). LinkedIn does NOT use this — it runs on a logged-in profile,
-// direct.
+// Proxy pool for Monster, Indeed, Glassdoor, and TechFetch. Dice and
+// LinkedIn run direct and do not consume this pool.
 //
 // Goal: spread scrape traffic across a handful of static residential / ISP IPs
 // so no single IP trips per-site velocity limits, and route AROUND an IP that
